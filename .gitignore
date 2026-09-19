@@ -11,3 +11,11 @@ managed_components/
 /.agents/skills/passport-build
 /.agents/skills/passport-device-test
 /.agents/skills/passport-debug
+
+# 本地网络凭据覆盖(见 main/pet_config.h), 不要提交
+main/pet_config_local.h
+# macOS 目录元数据
+.DS_Store
+# 工具在本地产生的临时文件与状态目录, 不是源码
+.tmp/
+.workbuddy/
