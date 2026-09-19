@@ -18,6 +18,7 @@ This directory contains AI Passport engineering rules and reusable workflows, gr
 - [firmware-layout.md](engineering/firmware-layout.md): default and user-defined partition layouts and merged-artifact validation.
 - [coding-conventions.md](engineering/coding-conventions.md): source-code and resource conventions, including Chinese font integration, blank/boxed text troubleshooting, and display acceptance.
 - [lvgl-chinese-fonts.md](engineering/lvgl-chinese-fonts.md): step-by-step CJK configuration, font generation/linking, fallback examples, glyph checks, and troubleshooting.
+- [codex-pet.md](engineering/codex-pet.md): the Codex Pet application (v2 atlas format and generation, animation driver, state→animation mapping, wire protocol, the Mac-side Pet Bridge, configuration and flashing).
 - [wifi-provisioning.md](engineering/wifi-provisioning.md): Bluetooth-based Wi-Fi setup using the BLUFI reference branch, the companion mini program, and integration checks.
 
 ## CI
