@@ -15,9 +15,14 @@
 #endif
 #endif
 
+// 编译期默认 SSID 的占位符。设备用它判断"这台机器还没配过网": 只要实际生效的
+// SSID 仍等于这个占位符, 开机就进入蓝牙配网等 Mac 下发凭据; 一旦在
+// pet_config_local.h 里填了真实 SSID, 就照旧直接联网, 行为与从前一致。
+#define PET_WIFI_PLACEHOLDER_SSID "your-2g-ssid"
+
 // 设备只支持 2.4 GHz Wi-Fi —— ESP32-C3 没有 5 GHz 射频。
 #ifndef PET_WIFI_SSID
-#define PET_WIFI_SSID "your-2g-ssid"
+#define PET_WIFI_SSID PET_WIFI_PLACEHOLDER_SSID
 #endif
 
 #ifndef PET_WIFI_PASSWORD
@@ -51,3 +56,17 @@
 
 // 电量轮询间隔。CW2017 走 I2C, 放在独立任务里读, 不要占用 LVGL 渲染任务。
 #define PET_BATTERY_POLL_MS 5000
+
+// --- 蓝牙配网 ---
+// 配网窗口最长开多久(毫秒)。到点自动关掉广播回到睡眠态, 免得设备一直可被扫到;
+// 长按下键可以重新打开。
+#define PET_PROVISION_WINDOW_MS 180000
+
+// 配对码连续错几次就断开这次连接, 并换一个新配对码重来。
+// 注意配对码本身是长期存 NVS 的(见 pet_settings_save_pin), 不随连接或开窗变动;
+// 只有用尽这个次数才会换 —— 所以这个上限是"稳定的码"得以安全的前提, 别调大。
+#define PET_PROVISION_MAX_ATTEMPTS 3
+
+// 收到 Wi-Fi 参数后最多等多久拿到 IP(毫秒)。超过就判定这次配网失败,
+// 但参数已经存进 NVS 了, 下次开机还会照它重试。
+#define PET_PROVISION_APPLY_TIMEOUT_MS 25000

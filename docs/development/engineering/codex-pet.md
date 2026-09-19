@@ -197,6 +197,8 @@ Connection parameters live in `main/pet_config.h`. To keep credentials out of th
 
 These values are only compile-time defaults. NVS wins when it holds a complete explicit override, and the defaults are deliberately **not** written back to NVS — otherwise changing `pet_config.h` and reflashing would still leave the old SSID in force.
 
+You do not have to put a real SSID here at all. Leaving the placeholder in place makes the device come up unprovisioned and offer Bluetooth pairing instead — see [Bluetooth provisioning](#bluetooth-provisioning).
+
 ```bash
 source ~/esp/esp-idf-v5.5.3/export.sh
 ./tools/validate.sh --static      # repo checks + host tests (pet state machine / protocol / atlas / font coverage)
@@ -208,6 +210,30 @@ esptool.py -p /dev/tty.usbmodem* write_flash 0x0 build/FoloToy-AI-Passport-full.
 ```
 
 The merged image lands in `build/FoloToy-AI-Passport-full.bin` and can be written in one shot from `0x0` (bootloader, partition table, and application are all inside).
+
+## Bluetooth provisioning
+
+Values in `pet_config_local.h` are a build-time constant: change networks and you have to edit the file, rebuild, and reflash. The device can instead take its Wi-Fi parameters over BLE from the menu bar app, which reads them off the Mac it is already running on.
+
+How the pieces fit together:
+
+- The firmware ships with the placeholder SSID (`PET_WIFI_PLACEHOLDER_SSID`). `pet_settings_is_configured()` treats that placeholder as "never provisioned", so the device opens the provisioning window at boot and starts advertising. A real SSID in `pet_config_local.h` still connects directly, exactly as before; either way, long-press **DOWN** toggles the window — pressing it again while the window is up closes it, which is what the hint along the bottom of the provisioning screen promises. That window is opaque, covers the whole screen, and deliberately ignores every other key while it is up, so a window that cannot be closed reads as a dead device; the hint and the handler have to change together (`tests/test_pet_button_semantics.py` pins them together).
+- The screen shows a 4-digit pairing code. It is **long-lived**: generated once, then kept in NVS and reused across windows, reconnects, and reboots (`pet_settings_load_pin()`). Only after `PET_PROVISION_MAX_ATTEMPTS` wrong entries does it rotate and drop the link — that is no longer a typo, it is someone trying. The code guards against a neighbouring machine casually grabbing the device, and it is printed on the screen anyway, so rotating per connection only forces the user to walk over and copy it again.
+- The attempt counter does **not** reset per connection. A stable code plus three free tries per connection is a code that can be ground down; the counter goes back to its maximum only when the window opens, a pairing succeeds, or the code rotates.
+- Only once the code is accepted will the device store anything. Commands are single-key JSON lines — `{"pin":"1234"}`, `{"ssid":"…"}`, `{"pass":"…"}`, `{"host":"…"}`, `{"port":8765}`, `{"commit":true}`, `{"forget":true}` — sent one field at a time so each can be acknowledged separately and a failure points at one field.
+- `{"commit":true}` saves to NVS and rebuilds the bridge link, then reports the IP the device obtained. The password is never echoed back in any status message. On success the device shows that address for `PROV_CLOSE_AFTER_DONE_MS` (3 s) and then **leaves the provisioning screen on its own**; on failure the error stays on screen so it can be read or retried. The teardown must go through `pet_provision_stop()` — just deleting the task leaves `s_running` true and never emits `PET_PROV_OFF`, so the provisioning screen would stay on top of the pet forever.
+- `{"forget":true}` clears the **connection parameters** in NVS and returns the device to the unprovisioned state. The pairing code is not part of that: it decides who may talk to the device, which is a different question from which network it joins.
+
+The pairing code is an application-layer check, not BLE-layer encryption: it keeps a nearby bystander from pushing credentials, and nothing more. Treat provisioning as a convenience on a trusted LAN, not as an authorization scheme.
+
+`pet_provision_parse.c` holds the parsing and status-building logic and deliberately does not depend on NimBLE, so `tests/test_pet_provision.c` exercises it on the host — command framing, field length limits, and the rejection paths. Two bugs have already been caught there: the status writer escaping its own JSON structural quotes, and UUID parsing that ran before `nimble_port_init()` (see below).
+
+The Mac side talks to the device with CoreBluetooth (`tools/menubar/Sources/ProvisionClient.swift`), so the app keeps its zero-third-party-dependency property. The first use triggers the usual macOS Bluetooth permission prompt.
+
+Two ordering constraints are easy to get wrong:
+
+- UUID parsing must happen **after** `nimble_port_init()`. `ble_uuid_from_str()` reaches `ble_uuid_base_init()`, which allocates 16 bytes through the NimBLE allocator; call it earlier and it returns `BLE_HS_ENOMEM`, so every UUID "fails to parse" — intermittently, which makes it look like a bad UUID string rather than a call-order problem.
+- `pet_settings_load()` must run before the provisioning window opens, because the window decides from the loaded SSID whether the device is unconfigured.
 
 ## Chinese fonts
 

@@ -3,6 +3,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -10,6 +11,7 @@
 #define PET_SETTINGS_SSID_MAX 33
 #define PET_SETTINGS_PASS_MAX 65
 #define PET_SETTINGS_HOST_MAX 64
+#define PET_SETTINGS_PIN_MAX 8
 
 typedef struct {
     char     ssid[PET_SETTINGS_SSID_MAX];
@@ -27,5 +29,19 @@ esp_err_t pet_settings_load(pet_settings_t *out);
 // 覆盖写入连接参数。凭据只进 NVS, 不写日志。
 esp_err_t pet_settings_save(const pet_settings_t *in);
 
-// 清空存档, 下次启动重新使用编译期默认值。
+// 清空连接参数, 下次启动重新使用编译期默认值。
+// 配对码**不在**清空范围内 —— 它管的是"哪台机器能连上设备", 跟网络参数是两件事,
+// 顺手换掉会逼用户再跑到设备跟前抄一遍码。
 esp_err_t pet_settings_clear(void);
+
+// 配对码。存下来是为了让它**稳定**: 每连一次就换一个码, 用户每次都要对着设备
+// 屏幕重抄, 而配对码要防的只是"旁边别的机器顺手连上", 固定的一串四位数字就够用。
+//
+// 返回 false 表示还没存过(调用方生成一个再 save)或读失败。
+bool pet_settings_load_pin(char *out, size_t size);
+esp_err_t pet_settings_save_pin(const char *pin);
+
+// 这组参数是否已经"配过网"。SSID 为空、或仍等于 pet_config.h 里的占位符
+// (PET_WIFI_PLACEHOLDER_SSID)时为 false —— 设备据此决定开机要不要进蓝牙配网,
+// 所以 pet_config_local.h 里填了真实 SSID 的老用法不受影响。
+bool pet_settings_is_configured(const pet_settings_t *settings);

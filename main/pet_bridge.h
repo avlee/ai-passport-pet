@@ -45,3 +45,7 @@ esp_err_t pet_bridge_notify_battery(int soc_percent);
 
 // 当前是否已连接(供 UI 查询)。
 bool pet_bridge_is_online(void);
+
+// 取当前拿到的 IPv4 地址(点分十进制)。还没拿到 IP 时返回 false。
+// 蓝牙配网用它判断"新凭据到底连上没有"。
+bool pet_bridge_local_ip(char *out, size_t size);

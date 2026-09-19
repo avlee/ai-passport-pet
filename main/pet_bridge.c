@@ -422,6 +422,9 @@ esp_err_t pet_bridge_prepare(const pet_settings_t *settings)
                 sizeof(config.sta.ssid));
         strlcpy((char *)config.sta.password, s_settings.password,
                 sizeof(config.sta.password));
+        // 先把"已拿到 IP"清掉: 换凭据之后旧地址就不再有效, 否则配网流程会拿着
+        // 上一个网络的地址误判成连接成功。
+        xEventGroupClearBits(s_events, BIT_GOT_IP);
         esp_wifi_disconnect();
         esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &config);
         if (err == ESP_OK) err = esp_wifi_connect();
@@ -526,4 +529,16 @@ esp_err_t pet_bridge_stop(void)
 bool pet_bridge_is_online(void)
 {
     return atomic_load(&s_online);
+}
+
+bool pet_bridge_local_ip(char *out, size_t size)
+{
+    if (out == NULL || size == 0 || s_netif == NULL) return false;
+
+    esp_netif_ip_info_t info;
+    if (esp_netif_get_ip_info(s_netif, &info) != ESP_OK) return false;
+    if (info.ip.addr == 0) return false;   // 还没 DHCP 到地址
+
+    snprintf(out, size, IPSTR, IP2STR(&info.ip));
+    return true;
 }

@@ -16,6 +16,8 @@ idf_component_register(
          "pet_fonts.c"
          "pet_strings.c"
          "pet_bridge.c"
+         "pet_provision.c"
+         "pet_provision_parse.c"
          "demo_menu.c"
          "demo_navigation.c"
          "ui_pixel.c"

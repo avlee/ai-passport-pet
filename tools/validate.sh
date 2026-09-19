@@ -82,7 +82,21 @@ run_static_checks() {
         main/pet_atlas_sophie_portrait.c \
         -o "${test_dir}/test_pet_atlas"
     "${test_dir}/test_pet_atlas"
+    # 蓝牙配网: 命令解析与状态拼装是纯字符串逻辑。这一层的错误只会表现成"界面一直
+    # 停在等待配对", 所以在主机上把边界和拒绝路径钉死。
+    # -Itests/host_stubs 给出 pet_settings.h 需要的 esp_err.h 替身(只在这一条命令里,
+    # 不会影响固件编译)。
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain -Itests/host_stubs \
+        tests/test_pet_provision.c main/pet_provision_parse.c \
+        -o "${test_dir}/test_pet_provision"
+    "${test_dir}/test_pet_provision"
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_pet_font_coverage.py
+    # 字库覆盖只保证"不缺字", 不保证"放得下": 配网状态区只有 200px, 文案长几个像素
+    # 就会折行。这条用与 LVGL 相同的算法量宽度。
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_pet_ui_text_fit.py
+    # 配网页写着"长按下键退出配网", 而那条分支曾经只开不关 —— 用户按提示去关却关不掉,
+    # 满屏被配网页盖住, 看起来就是死机。这条把提示语和按键处理钉在一起。
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_pet_button_semantics.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_pet_bridge.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_deep_sleep_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_check_repo.py

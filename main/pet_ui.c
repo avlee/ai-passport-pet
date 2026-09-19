@@ -127,6 +127,28 @@ _Static_assert(PLAT_TEXT_W == PLAT_W - 28,
 #define INFO_W      220
 #define INFO_H      250
 
+// 蓝牙配网页。同样只写字面量: tools/preview_pet_screen.py 会读这些值出预览图,
+// 编辑器里看不到屏幕, 预览就是唯一能"眼见为实"的途径。
+#define PROV_TITLE_Y     26
+#define PROV_NAME_Y      56
+#define PROV_CARD_X      30
+#define PROV_CARD_Y      88
+#define PROV_CARD_W     180
+#define PROV_CARD_H      86
+#define PROV_PIN_LABEL_Y 10
+#define PROV_PIN_Y       36
+#define PROV_STATUS_X    20
+#define PROV_STATUS_Y   192
+#define PROV_STATUS_W   200
+#define PROV_STATUS_H    62
+#define PROV_HINT_Y     268
+
+_Static_assert(PROV_CARD_Y + PROV_CARD_H < PROV_STATUS_Y,
+               "配对码卡片不能压到状态文字");
+_Static_assert(PROV_STATUS_Y + PROV_STATUS_H < PROV_HINT_Y,
+               "状态文字不能压到底部提示");
+_Static_assert(PROV_HINT_Y + 32 <= SCR_H, "底部提示要给屏幕圆角留出余量");
+
 // 信息面板的行: 顺序与 INFO_ROW_* 一致。
 enum {
     INFO_ROW_FIRMWARE = 0,
@@ -161,12 +183,25 @@ static lv_obj_t *s_info_scrim;
 static lv_obj_t *s_info_panel;
 static lv_obj_t *s_info_value[INFO_ROW_COUNT];
 
+// 配网页: 一个不透明的全屏覆盖层。它盖住宠物舞台是故意的 —— 设备还没联网时
+// 宠物本来就在睡觉, 这时候让配对码成为画面上唯一焦点更好读。
+static lv_obj_t *s_prov_scrim;
+static lv_obj_t *s_prov_name;
+static lv_obj_t *s_prov_pin;
+static lv_obj_t *s_prov_status;
+
 static lv_timer_t *s_anim_timer;
 
 static pet_state_t       s_state;
 static pet_settings_t    s_settings;
 static bool              s_settings_ok;
 static int               s_battery;
+
+static char     s_prov_device[24];
+static char     s_prov_pin_text[8];
+static char     s_prov_status_text[80];
+static uint32_t s_prov_tone = COL_INK;
+static bool     s_prov_visible;
 
 static pet_anim_t s_playing = PET_ANIM_COUNT;  // 当前装载的动作; COUNT = 尚未装载
 static uint16_t   s_frame;
@@ -403,7 +438,8 @@ static void load_anim(pet_anim_t anim)
 static void anim_tick(lv_timer_t *timer)
 {
     (void)timer;
-    if (s_screen == NULL) return;
+    // 配网页是不透明的, 底下的宠物没人看得见 —— 别再逐帧重绘它, 省 CPU 也省电。
+    if (s_screen == NULL || s_prov_visible) return;
 
     const pet_pose_t pose = pet_state_pose(&s_state);
     const pet_anim_t want = s_override ? s_override_anim : pose.anim;
@@ -572,6 +608,97 @@ static void build_info(void)
     lv_obj_add_flag(s_info_scrim, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ---------------------------------------------------------------------------
+// 蓝牙配网页
+// ---------------------------------------------------------------------------
+static void build_provision(void)
+{
+    s_prov_scrim = make_box(s_screen, 0, 0, SCR_W, SCR_H, COL_BG, 0);
+
+    lv_obj_t *title = make_label(s_prov_scrim, PET_STR_PROV_TITLE,
+                                 pet_font_title(), COL_INK);
+    lv_obj_set_width(title, SCR_W);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(title, 0, PROV_TITLE_Y);
+
+    // 设备名要让用户能和 Mac 上扫到的那个对上, 否则家里有两个同类设备时不知道
+    // 该连哪个。
+    s_prov_name = make_label(s_prov_scrim, "", pet_font_body(), COL_MUTED);
+    lv_obj_set_width(s_prov_name, SCR_W);
+    lv_obj_set_style_text_align(s_prov_name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_prov_name, 0, PROV_NAME_Y);
+
+    lv_obj_t *card = make_box(s_prov_scrim, PROV_CARD_X, PROV_CARD_Y,
+                              PROV_CARD_W, PROV_CARD_H, COL_CARD, 16);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(COL_ACCENT), 0);
+
+    lv_obj_t *pin_label = make_label(card, PET_STR_PROV_PIN_LABEL,
+                                     pet_font_body(), COL_MUTED);
+    lv_obj_set_width(pin_label, PROV_CARD_W);
+    lv_obj_set_style_text_align(pin_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(pin_label, 0, PROV_PIN_LABEL_Y);
+
+    s_prov_pin = make_label(card, "", pet_font_title(), COL_ACCENT);
+    lv_obj_set_width(s_prov_pin, PROV_CARD_W);
+    lv_obj_set_style_text_align(s_prov_pin, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_prov_pin, 0, PROV_PIN_Y);
+
+    // 状态文字会随流程变长变短(带 IP 的那条最长), 留两行并允许换行。
+    s_prov_status = make_label(s_prov_scrim, "", pet_font_body(), COL_INK);
+    lv_obj_set_size(s_prov_status, PROV_STATUS_W, PROV_STATUS_H);
+    lv_label_set_long_mode(s_prov_status, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_align(s_prov_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_prov_status, PROV_STATUS_X, PROV_STATUS_Y);
+
+    lv_obj_t *hint = make_label(s_prov_scrim, PET_STR_PROV_HINT,
+                                pet_font_body(), COL_MUTED);
+    lv_obj_set_width(hint, SCR_W);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(hint, 0, PROV_HINT_Y);
+
+    lv_obj_add_flag(s_prov_scrim, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void refresh_provision_locked(void)
+{
+    if (s_prov_scrim == NULL) return;
+
+    // 20 px 的字体下 "1234" 四个数字挤在一起念不清, 拉开成一格一个。
+    char spaced[16];
+    if (strlen(s_prov_pin_text) == 4) {
+        snprintf(spaced, sizeof(spaced), "%c %c %c %c", s_prov_pin_text[0],
+                 s_prov_pin_text[1], s_prov_pin_text[2], s_prov_pin_text[3]);
+    } else {
+        snprintf(spaced, sizeof(spaced), "- - - -");
+    }
+
+    lv_label_set_text(s_prov_name, s_prov_device);
+    lv_label_set_text(s_prov_pin, spaced);
+    lv_label_set_text(s_prov_status, s_prov_status_text);
+    lv_obj_set_style_text_color(s_prov_status, lv_color_hex(s_prov_tone), 0);
+}
+
+static void set_provision_visible_locked(bool visible)
+{
+    s_prov_visible = visible;
+    if (s_prov_scrim == NULL) return;
+
+    if (visible) {
+        lv_obj_move_foreground(s_prov_scrim);
+        lv_obj_remove_flag(s_prov_scrim, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_prov_scrim, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (s_anim_timer != NULL) {
+        // 配网页关掉时把定时器的周期复位成 1, 下一拍立刻重新装载正确的动作;
+        // 打开时拉长周期, 底下的宠物不用再逐帧渲染。
+        lv_timer_set_period(s_anim_timer, visible ? 500 : 1);
+        lv_timer_reset(s_anim_timer);
+    }
+}
+
 void pet_ui_build(void)
 {
     if (!bsp_lvgl_lock(1000)) {
@@ -600,12 +727,16 @@ void pet_ui_build(void)
     build_platform();   // 先于舞台: 宠物要压在台面之上, 否则脚会被盖住
     build_stage();
     build_info();
+    build_provision();   // 最后建: 配网页要盖在信息面板之上
     refresh_status_locked();
     refresh_battery_locked();
+    refresh_provision_locked();
     set_info_visible_locked(s_info_visible);  // 重建时恢复面板显隐
 
     // 开机第一拍: 让定时器把第 0 帧画出来。
     s_anim_timer = lv_timer_create(anim_tick, 1, NULL);
+    // 放在定时器之后: 里面要按显隐调定时器周期。
+    set_provision_visible_locked(s_prov_visible);
 
     ESP_LOGI(TAG, "界面就绪: 舞台 %dx%d @ (%d,%d) 脚底 y=%d, 站台 %d..%d, 行高 %d",
              PET_ATLAS_STAGE_W, PET_ATLAS_STAGE_H, STAGE_X, STAGE_Y, PLAT_FLOOR_Y,
@@ -621,6 +752,11 @@ void pet_ui_init(void)
     s_battery = -1;
     s_info_visible = false;
     s_settings_ok = false;
+    s_prov_visible = false;
+    s_prov_device[0] = '\0';
+    s_prov_pin_text[0] = '\0';
+    s_prov_status_text[0] = '\0';
+    s_prov_tone = COL_INK;
 }
 
 void pet_ui_destroy(void)
@@ -648,6 +784,10 @@ void pet_ui_destroy(void)
     s_info_scrim = NULL;
     s_info_panel = NULL;
     for (int i = 0; i < INFO_ROW_COUNT; i++) s_info_value[i] = NULL;
+    s_prov_scrim = NULL;
+    s_prov_name = NULL;
+    s_prov_pin = NULL;
+    s_prov_status = NULL;
     s_playing = PET_ANIM_COUNT;
     s_frame = 0;
     s_override = false;
@@ -746,6 +886,35 @@ void pet_ui_set_info_visible(bool visible)
 {
     if (!bsp_lvgl_lock(1000)) return;
     set_info_visible_locked(visible);
+    bsp_lvgl_unlock();
+}
+
+void pet_ui_set_provision_visible(bool visible)
+{
+    if (!bsp_lvgl_lock(1000)) return;
+    set_provision_visible_locked(visible);
+    bsp_lvgl_unlock();
+}
+
+void pet_ui_set_provision(const char *device_name, const char *pin,
+                          const char *status, pet_tone_t tone)
+{
+    if (!bsp_lvgl_lock(1000)) return;
+
+    snprintf(s_prov_device, sizeof(s_prov_device), "%s",
+             device_name != NULL ? device_name : "");
+    snprintf(s_prov_pin_text, sizeof(s_prov_pin_text), "%s", pin != NULL ? pin : "");
+    snprintf(s_prov_status_text, sizeof(s_prov_status_text), "%s",
+             status != NULL ? status : "");
+
+    switch (tone) {
+    case PET_TONE_GOOD: s_prov_tone = COL_GOOD; break;
+    case PET_TONE_BAD:  s_prov_tone = COL_BAD;  break;
+    case PET_TONE_INFO:
+    default:            s_prov_tone = COL_INK;  break;
+    }
+
+    refresh_provision_locked();
     bsp_lvgl_unlock();
 }
 

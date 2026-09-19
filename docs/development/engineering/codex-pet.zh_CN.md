@@ -204,6 +204,8 @@ python3 tools/preview_pet_screen.py --anim idle --frame 3 --scale 3
 
 这组值只在编译期作为默认值使用；NVS 里存在一整套显式覆盖时才以 NVS 为准，且**不会**把默认值写回 NVS（否则改完 `pet_config.h` 重新烧录后旧的 SSID 还会生效）。
 
+这里完全可以不填真实 SSID。留占位符不动，设备开机就会以「未配网」状态起来，转而提供蓝牙配对 —— 见[蓝牙配网](#蓝牙配网)。
+
 ```bash
 source ~/esp/esp-idf-v5.5.3/export.sh
 ./tools/validate.sh --static      # 仓库检查 + 主机测试(含宠物状态机/协议/图集/字体覆盖)
@@ -215,6 +217,30 @@ esptool.py -p /dev/tty.usbmodem* write_flash 0x0 build/FoloToy-AI-Passport-full.
 ```
 
 合并镜像在 `build/FoloToy-AI-Passport-full.bin`，从 `0x0` 一次写入即可（bootloader + 分区表 + 应用都已在里面）。
+
+## 蓝牙配网
+
+`pet_config_local.h` 里的值是编译期常量：换个网络就得改文件、重新构建、重新烧录。设备也可以改为通过蓝牙从菜单栏应用接收 Wi-Fi 参数 —— 那些参数本来就躺在它正在运行的那台 Mac 上。
+
+各部分如何衔接：
+
+- 固件出厂带着占位 SSID（`PET_WIFI_PLACEHOLDER_SSID`）。`pet_settings_is_configured()` 把占位符视为「从未配过网」，设备因此会在开机时打开配网窗口并开始广播。在 `pet_config_local.h` 里填了真实 SSID 的用法不受影响，仍直接联网；两种情况都可以长按 **下键** 开关配网窗口 —— 它是**开关**：窗口开着时再长按下键就退出，与屏幕底部「长按下键退出配网」的提示一致。配网页不透明、盖住整个画面，且期间其余按键被刻意忽略；所以一个关不掉的配网页会被直接读成「设备死机」——这条提示语和处理分支必须成对改（`tests/test_pet_button_semantics.py` 钉住了它们）。
+- 屏幕上显示 4 位配对码。它是**长期**的：首次生成后写进 NVS，以后开窗、重连、重启都用同一个（`pet_settings_load_pin()`）。只有连续错满 `PET_PROVISION_MAX_ATTEMPTS` 次才换一个新码并断开链路 —— 那已经不是手滑，而是有人在试。配对码要防的只是「旁边别的机器顺手连上」，屏幕上一直写着它，做成一次一换只会让用户每次都得跑到设备跟前重抄。
+- 尝试次数**不随连接重置**。稳定的码配上「每次连接白送三次机会」等于可以把码慢慢试出来；次数在开窗、配对成功、换码时才回到上限。
+- 只有配对码通过之后设备才会写入任何东西。命令是单键 JSON 行 —— `{"pin":"1234"}`、`{"ssid":"…"}`、`{"pass":"…"}`、`{"host":"…"}`、`{"port":8765}`、`{"commit":true}`、`{"forget":true}` —— 逐字段下发，这样每个字段都能单独确认，失败时也能指到具体是哪一个。
+- `{"commit":true}` 会写入 NVS 并重建 Bridge 链路，然后把设备拿到的 IP 回报回来。密码不会出现在任何状态报文里。成功后设备停留 `PROV_CLOSE_AFTER_DONE_MS`（3 秒）展示拿到的地址，**然后自动退出配网界面**回到宠物；失败则把错误留在屏幕上，等窗口超时或用户重试。收尾必须走 `pet_provision_stop()`：只删任务的话 `s_running` 仍是真、界面也收不到 `PET_PROV_OFF`，配网画面会一直盖在宠物上面。
+- `{"forget":true}` 清空 NVS 里的**连接参数**，设备回到未配网状态。配对码不在清空范围内 —— 它管的是「哪台机器能连上设备」，跟网络参数是两件事。
+
+配对码是应用层的校验，不是蓝牙层的加密：它只能拦住旁边顺手推凭据的人，仅此而已。请把配网当作可信局域网里的便利功能，而不是一套授权方案。
+
+`pet_provision_parse.c` 承载解析与状态拼装逻辑，刻意不依赖 NimBLE，所以 `tests/test_pet_provision.c` 能在主机上覆盖它 —— 命令分帧、字段长度上限、以及各种拒绝路径。这一层已经抓出过两个 bug：状态拼装把自己 JSON 的结构引号也转义了；以及 UUID 解析排在了 `nimble_port_init()` 之前（见下）。
+
+Mac 侧用 CoreBluetooth 与设备通信（`tools/menubar/Sources/ProvisionClient.swift`），应用因此保持零第三方依赖。首次使用会触发 macOS 的蓝牙权限询问。
+
+有两处调用顺序容易写错：
+
+- UUID 解析必须在 `nimble_port_init()` **之后**。`ble_uuid_from_str()` 会走到 `ble_uuid_base_init()`，后者要用 NimBLE 的分配器申请 16 字节；提前调用会返回 `BLE_HS_ENOMEM`，表现为四个 UUID 全部「解析失败」——而且是时好时坏，看起来像 UUID 字符串写错了，实际是调用顺序问题。
+- `pet_settings_load()` 必须排在配网窗口打开之前，因为窗口要根据装载出来的 SSID 判断这台设备是不是还没配过网。
 
 ## 中文字体
 

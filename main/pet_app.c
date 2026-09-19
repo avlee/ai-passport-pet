@@ -1,12 +1,15 @@
 // main/pet_app.c
 #include "pet_app.h"
 
+#include <string.h>
+
 #include "app_input.h"
 #include "bsp_battery.h"
 #include "bsp_button.h"
 #include "bsp_display.h"
 #include "demo_menu.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -15,6 +18,7 @@
 #include "pet_config.h"
 #include "pet_fonts.h"
 #include "pet_protocol.h"
+#include "pet_provision.h"
 #include "pet_settings.h"
 #include "pet_strings.h"
 #include "pet_ui.h"
@@ -94,6 +98,148 @@ static void on_bridge_message(const pet_message_t *msg, void *user)
     case PET_MSG_NONE:
     default:
         break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 蓝牙配网
+// ---------------------------------------------------------------------------
+// 这台设备原先靠"改 pet_config_local.h 再重新烧录"换网络, 换个 Wi-Fi 就得重编一次。
+// 现在改成: 开机没有可用凭据就进配网, 或者长按下键随时重开, Mac 侧的菜单栏应用
+// 输入配对码后把 SSID/密码/配对端地址一起发过来, 存进 NVS。
+
+// 把当前 s_settings 拉起来。开机走一次; 配网成功后要再走一次(参数已经换成 Mac
+// 下发的了)。sink 放在文件作用域, 因为 pet_bridge 会记住它, 由 bridge 任务回调。
+static const pet_bridge_sink_t s_bridge_sink = {
+    .on_message = on_bridge_message,
+    .on_link = on_bridge_link,
+    .user = NULL,
+};
+
+static esp_err_t start_bridge(void)
+{
+    esp_err_t err = pet_bridge_prepare(&s_settings);
+    if (err == ESP_OK) err = pet_bridge_start(&s_bridge_sink);
+    return err;
+}
+
+// 设备只上报简短的原因码, 中文提示在这里落地 —— 文案的单一来源仍是
+// pet_strings.h, 字库覆盖由 tests/test_pet_font_coverage.py 保证。
+static const char *provision_error_text(const char *detail)
+{
+    if (detail != NULL) {
+        if (strcmp(detail, "save failed") == 0) return PET_STR_PROV_ERR_SAVE;
+        if (strcmp(detail, "connect failed") == 0) return PET_STR_PROV_ERR_CONNECT;
+    }
+    return PET_STR_PROV_FAILED;
+}
+
+// "保存参数 + 联网"会阻塞(等 DHCP 最坏几十秒), 由 pet_provision 放在它自己的任务
+// 里调用, 所以不会压在蓝牙协议栈上。
+static esp_err_t apply_provisioned(const pet_settings_t *settings, char *ip_out,
+                                   size_t ip_out_size)
+{
+    // 新旧参数可能完全不是同一个网络, 先把旧链路彻底收掉再重建, 免得重连退避还
+    // 挂着上一个网络的节奏。
+    (void)pet_bridge_stop();
+
+    s_settings = *settings;
+    s_settings_ok = true;
+
+    const esp_err_t err = start_bridge();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "按新参数启动 Bridge 失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    pet_ui_set_settings(&s_settings);
+
+    const int64_t deadline =
+        esp_timer_get_time() + (int64_t)PET_PROVISION_APPLY_TIMEOUT_MS * 1000;
+    while (esp_timer_get_time() < deadline) {
+        if (pet_bridge_local_ip(ip_out, ip_out_size)) return ESP_OK;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    ESP_LOGW(TAG, "等了 %d 秒仍没拿到 IP, 这次配网判定失败",
+             PET_PROVISION_APPLY_TIMEOUT_MS / 1000);
+    return ESP_ERR_TIMEOUT;
+}
+
+// 回调可能来自 NimBLE 宿主任务或配网任务。这里只改文案 + 通知界面: pet_ui 的每个
+// 入口都自己加 LVGL 锁, 因此从这两个线程调用是安全的。
+static void on_provision_state(pet_provision_state_t state, const char *detail,
+                               void *user)
+{
+    (void)user;
+
+    if (state == PET_PROV_OFF) {
+        // 配网结束(成功、超时、或被演示菜单接走蓝牙)都要收掉这一层, 否则宠物
+        // 界面会一直被它盖着。留条日志, 免得"到底收没收"只能靠盯屏幕。
+        ESP_LOGI(TAG, "配网界面: 收起");
+        pet_ui_set_provision_visible(false);
+        return;
+    }
+
+    char pin[8] = { 0 };
+    const bool has_pin = pet_provision_pin(pin, sizeof(pin));
+
+    char text[96];
+    pet_tone_t tone = PET_TONE_INFO;
+
+    switch (state) {
+    case PET_PROV_ADVERTISING:
+        snprintf(text, sizeof(text), "%s", PET_STR_PROV_WAITING);
+        break;
+    case PET_PROV_CONNECTED:
+        snprintf(text, sizeof(text), "%s", PET_STR_PROV_CONNECTED);
+        break;
+    case PET_PROV_PAIRED:
+        snprintf(text, sizeof(text), "%s", PET_STR_PROV_PAIRED);
+        tone = PET_TONE_GOOD;
+        break;
+    case PET_PROV_APPLYING:
+        snprintf(text, sizeof(text), "%s", PET_STR_PROV_APPLYING);
+        break;
+    case PET_PROV_DONE:
+        // 带上拿到的地址: 一眼就能看出设备落在哪个网段, 排查时很省事。
+        snprintf(text, sizeof(text), "%s %s", PET_STR_PROV_DONE,
+                 detail != NULL ? detail : "");
+        tone = PET_TONE_GOOD;
+        break;
+    case PET_PROV_FAILED:
+        snprintf(text, sizeof(text), "%s", provision_error_text(detail));
+        tone = PET_TONE_BAD;
+        break;
+    case PET_PROV_OFF:
+    default:
+        snprintf(text, sizeof(text), "%s", PET_STR_PROV_WAITING);
+        break;
+    }
+
+    ESP_LOGI(TAG, "配网界面: %s", text);
+    pet_ui_set_provision_visible(true);
+    pet_ui_set_provision(pet_provision_device_name(), has_pin ? pin : NULL, text,
+                         tone);
+}
+
+static void open_provision_window(void)
+{
+    if (pet_provision_active()) {
+        ESP_LOGI(TAG, "配网窗口已经开着");
+        return;
+    }
+
+    const pet_provision_sink_t sink = {
+        .on_state = on_provision_state,
+        .apply = apply_provisioned,
+        .user = NULL,
+    };
+
+    const esp_err_t err =
+        pet_provision_start(&sink, s_settings_ok ? &s_settings : NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "配网窗口打开失败: %s", esp_err_to_name(err));
     }
 }
 
@@ -178,6 +324,15 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
 static void run_demo_menu(void)
 {
     ESP_LOGI(TAG, "打开演示菜单");
+
+    // 演示菜单里的 BLE 示例和配网共用同一个 NimBLE 栈, 不能同时占着 —— 先把配网
+    // 窗口关掉, 退出后再按需重开。
+    const bool had_provision = pet_provision_active();
+    if (had_provision) {
+        ESP_LOGI(TAG, "先关掉配网窗口, 把蓝牙让给演示菜单");
+        (void)pet_provision_stop();
+    }
+
     pet_ui_destroy();
     bsp_display_backlight(PET_ACTIVE_BACKLIGHT_PCT);
 
@@ -186,19 +341,44 @@ static void run_demo_menu(void)
     // pet_ui 的状态(链路/Codex/文案/电量)在 destroy 时被刻意保留了, 所以重建
     // 界面后立刻就是最新画面, 不会闪回旧状态。
     pet_ui_build();
+    if (had_provision) {
+        ESP_LOGI(TAG, "演示菜单退出, 重新打开配网窗口");
+        open_provision_window();
+    }
     ESP_LOGI(TAG, "回到宠物界面");
 }
 
 static void handle_input(const app_input_t *in)
 {
     if (in->event == BSP_BTN_LONG) {
+        // 这几个手势在配网页打开时也要能用: 上键进演示菜单, 下键按屏幕上的提示
+        // 开关配网页。
+        if (in->btn == BSP_BTN_DOWN) {
+            // 下键是**开关**, 不是"只开不关"。配网页底下写着"长按下键退出配网",
+            // 早先这里无条件调 open_provision_window(), 而它已经开着时直接 return ——
+            // 用户按屏幕提示去关却关不掉, 整屏被不透明的配网页盖着, 看起来就是死机。
+            if (pet_provision_active()) {
+                ESP_LOGI(TAG, "长按下键: 退出蓝牙配网");
+                (void)pet_provision_stop();
+            } else {
+                ESP_LOGI(TAG, "长按下键: 打开蓝牙配网");
+                open_provision_window();
+            }
+            return;
+        }
         if (in->btn == BSP_BTN_UP) {
             run_demo_menu();
-        } else if (in->btn == BSP_BTN_OK) {
+            return;
+        }
+        if (in->btn == BSP_BTN_OK && !pet_provision_active()) {
             pet_ui_set_info_visible(true);
         }
         return;
     }
+
+    // 配网页是不透明的, 盖住了整个画面: 此刻其余按键都看不到效果, 直接忽略。
+    // 否则会留下"关掉配网页之后信息面板莫名其妙开着"这类状态。
+    if (pet_provision_active()) return;
 
     if (in->event != BSP_BTN_CLICK) return;
 
@@ -285,23 +465,22 @@ esp_err_t pet_app_start(void)
         ESP_LOGW(TAG, "电量任务创建失败, 电量将一直显示 --");
     }
 
-    if (s_settings_ok) {
-        err = pet_bridge_prepare(&s_settings);
-        if (err == ESP_OK) {
-            const pet_bridge_sink_t sink = {
-                .on_message = on_bridge_message,
-                .on_link = on_bridge_link,
-                .user = NULL,
-            };
-            err = pet_bridge_start(&sink);
-        }
-        if (err != ESP_OK) {
+    // 有可用凭据就照旧直连; 只有实际生效的 SSID 仍是编译期占位符(说明这台设备
+    // 还没配过网)时才进蓝牙配网 —— 所以 pet_config_local.h 里填了真实 SSID 的
+    // 老用法完全不受影响, 只是多了一个长按下键的配网入口。
+    if (s_settings_ok && pet_settings_is_configured(&s_settings)) {
+        const esp_err_t bridge_err = start_bridge();
+        if (bridge_err != ESP_OK) {
             ESP_LOGE(TAG, "Pet Bridge 启动失败: %s; 宠物保持睡眠状态",
-                     esp_err_to_name(err));
+                     esp_err_to_name(bridge_err));
             bsp_display_backlight(PET_SLEEP_BACKLIGHT_PCT);
         }
+    } else {
+        ESP_LOGI(TAG, "没有可用的 Wi-Fi 参数, 进入蓝牙配网等 Mac 下发");
+        open_provision_window();
     }
 
-    ESP_LOGI(TAG, "就绪。上/下=互动, 确定=戳一下, 长按确定=信息, 长按上=演示菜单");
+    ESP_LOGI(TAG, "就绪。上/下=互动, 确定=戳一下, 长按确定=信息, "
+                  "长按上=演示菜单, 长按下=蓝牙配网");
     return ESP_OK;
 }

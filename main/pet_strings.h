@@ -50,6 +50,26 @@
 #define PET_STR_SLEEP_MARK         "Zzz"
 
 // ---------------------------------------------------------------------------
+// 蓝牙配网页(标题 20 px, 正文 16 px)
+// ---------------------------------------------------------------------------
+#define PET_STR_PROV_TITLE         "蓝牙配网"
+#define PET_STR_PROV_PIN_LABEL     "配对码"
+// 状态区宽 PROV_STATUS_W=200px, 文案要留在单行内 —— 换行会让整屏看起来失焦。
+// 这两条原先分别是 207px / 205px, 正好压线换行。改文案时用
+// tests/test_pet_ui_text_fit.py 量一下, 别凭感觉。
+#define PET_STR_PROV_WAITING       "Mac 上打开「配置 Wi-Fi」"
+#define PET_STR_PROV_CONNECTED     "已连接，请输入配对码"
+#define PET_STR_PROV_PAIRED        "已配对，正在接收参数"
+#define PET_STR_PROV_APPLYING      "正在连接 Wi-Fi…"
+#define PET_STR_PROV_SAVING        "正在保存…"
+#define PET_STR_PROV_DONE          "配网完成"
+#define PET_STR_PROV_FAILED        "配网失败"
+#define PET_STR_PROV_ERR_SAVE      "保存参数失败"
+#define PET_STR_PROV_ERR_CONNECT   "无法连接到这个网络"
+#define PET_STR_PROV_HINT          "长按下键退出配网"
+#define PET_STR_PROV_HINT_OPEN     "长按下键配网"
+
+// ---------------------------------------------------------------------------
 // 文案清单。X 宏展开, 每个条目 = (键, 字面量, 界面上使用的字号)
 // ---------------------------------------------------------------------------
 #define PET_UI_STRING_LIST(X)                                  \
@@ -77,7 +97,20 @@
     X(info_unknown,      PET_STR_INFO_UNKNOWN,      16)        \
     X(info_hint_close,   PET_STR_INFO_HINT_CLOSE,   16)        \
     X(info_hint_demo,    PET_STR_INFO_HINT_DEMO,    16)        \
-    X(sleep_mark,        PET_STR_SLEEP_MARK,        16)
+    X(sleep_mark,        PET_STR_SLEEP_MARK,        16)        \
+    X(prov_title,        PET_STR_PROV_TITLE,        20)        \
+    X(prov_pin_label,    PET_STR_PROV_PIN_LABEL,    16)        \
+    X(prov_waiting,      PET_STR_PROV_WAITING,      16)        \
+    X(prov_connected,    PET_STR_PROV_CONNECTED,    16)        \
+    X(prov_paired,       PET_STR_PROV_PAIRED,       16)        \
+    X(prov_applying,     PET_STR_PROV_APPLYING,     16)        \
+    X(prov_saving,       PET_STR_PROV_SAVING,       16)        \
+    X(prov_done,         PET_STR_PROV_DONE,         16)        \
+    X(prov_failed,       PET_STR_PROV_FAILED,       16)        \
+    X(prov_err_save,     PET_STR_PROV_ERR_SAVE,     16)        \
+    X(prov_err_connect,  PET_STR_PROV_ERR_CONNECT,  16)        \
+    X(prov_hint,         PET_STR_PROV_HINT,         16)        \
+    X(prov_hint_open,    PET_STR_PROV_HINT_OPEN,    16)
 
 typedef struct {
     const char   *key;   // 用于测试报告定位问题

@@ -1,6 +1,6 @@
 // main/pet_ui.h
 // Codex 宠物界面: 一块直接立在背景上的宠物舞台 + 状态标签 + 站台(承载文本)
-// + 信息面板。
+// + 信息面板 + 蓝牙配网页。
 //
 // 设计目标(用户第一条要求): 屏幕上的宠物要和 ChatGPT App 里的看起来一致,
 // 且动画流畅。为此:
@@ -54,6 +54,25 @@ void pet_ui_emote(pet_anim_t anim);
 // 信息面板显隐。
 void pet_ui_set_info_visible(bool visible);
 bool pet_ui_info_visible(void);
+
+// ---------------------------------------------------------------------------
+// 蓝牙配网页
+// ---------------------------------------------------------------------------
+// 一条不透明的全屏覆盖层: 设备还没联网时宠物本来就在睡眠, 让配对码成为画面上
+// 唯一的焦点更好读。它和宠物界面共用同一块屏, 靠显隐切换。
+
+// 状态文字的语气, 决定用哪种颜色。
+typedef enum {
+    PET_TONE_INFO = 0,  // 普通说明
+    PET_TONE_GOOD,      // 成功
+    PET_TONE_BAD,       // 失败
+} pet_tone_t;
+
+void pet_ui_set_provision_visible(bool visible);
+
+// 更新配网页内容。pin 不是 4 位时显示破折号占位, status 为空则不显示。
+void pet_ui_set_provision(const char *device_name, const char *pin,
+                          const char *status, pet_tone_t tone);
 
 // 当前正在播放的动画行(调试/日志用)。
 pet_anim_t pet_ui_current_anim(void);

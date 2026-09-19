@@ -15,6 +15,7 @@ static const char *TAG = "pet_settings";
 #define KEY_PASS "pass"
 #define KEY_HOST "host"
 #define KEY_PORT "port"
+#define KEY_PIN "pin"
 
 // 从 NVS 读出一个有界字符串。键不存在或类型不符时返回 false。
 static bool read_string(nvs_handle_t handle, const char *key, char *out, size_t size)
@@ -127,8 +128,57 @@ esp_err_t pet_settings_clear(void)
     nvs_handle_t handle;
     esp_err_t err = nvs_open(PET_NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) return err;
-    err = nvs_erase_all(handle);
-    if (err == ESP_OK) err = nvs_commit(handle);
+
+    // 逐键删除而不是 nvs_erase_all(): 配对码也要留在这一个命名空间里, 而"忘了
+    // 网络参数"不该顺手把配对码也换掉。
+    //
+    // 键不存在不算失败 —— 用户可能只配了一半就想清掉。
+    const char *keys[] = { KEY_SSID, KEY_PASS, KEY_HOST, KEY_PORT };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const esp_err_t erase = nvs_erase_key(handle, keys[i]);
+        if (erase != ESP_OK && erase != ESP_ERR_NVS_NOT_FOUND) {
+            nvs_close(handle);
+            return erase;
+        }
+    }
+    err = nvs_commit(handle);
     nvs_close(handle);
     return err;
+}
+
+bool pet_settings_load_pin(char *out, size_t size)
+{
+    if (out == NULL || size == 0) return false;
+    out[0] = '\0';
+
+    if (!ensure_nvs()) return false;
+
+    nvs_handle_t handle;
+    if (nvs_open(PET_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return false;
+
+    const bool ok = read_string(handle, KEY_PIN, out, size);
+    nvs_close(handle);
+    return ok && out[0] != '\0';
+}
+
+esp_err_t pet_settings_save_pin(const char *pin)
+{
+    if (pin == NULL || pin[0] == '\0') return ESP_ERR_INVALID_ARG;
+    if (!ensure_nvs()) return ESP_ERR_NVS_NOT_INITIALIZED;
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(PET_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_str(handle, KEY_PIN, pin);
+    if (err == ESP_OK) err = nvs_commit(handle);
+
+    nvs_close(handle);
+    return err;
+}
+
+bool pet_settings_is_configured(const pet_settings_t *settings)
+{
+    if (settings == NULL || settings->ssid[0] == '\0') return false;
+    return strcmp(settings->ssid, PET_WIFI_PLACEHOLDER_SSID) != 0;
 }
