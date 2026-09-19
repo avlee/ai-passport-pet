@@ -98,18 +98,62 @@ static void on_bridge_message(const pet_message_t *msg, void *user)
 }
 
 // ---------------------------------------------------------------------------
-// 电量轮询
+// 电量
 // ---------------------------------------------------------------------------
 // CW2017 是 I2C 设备, 读一次要几毫秒。放在独立任务里, 避免拖住 LVGL 渲染任务。
+// 初始化也在这里做: 首次初始化要写电池 profile 并等 SOC 收敛, 最坏 5 秒以上,
+// 放在 pet_app_start() 里会把界面和 Bridge 一起拖住。
+static bool battery_init(void)
+{
+    const unsigned attempts = 3;
+
+    for (unsigned i = 1; i <= attempts; i++) {
+        const esp_err_t err = bsp_battery_init();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "电量计就绪");
+            return true;
+        }
+        ESP_LOGW(TAG, "CW2017 初始化失败 %u/%u: %s",
+                 i, attempts, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    // 没有电量计的板子照样能跑, 只是界面一直显示 "--", 所以只警告不失败。
+    ESP_LOGW(TAG, "电量计不可用, 电量将一直显示 --; "
+                  "用演示菜单的 I2C 扫描确认 0x63 是否在线");
+    return false;
+}
+
+// 单次 I2C 读失败不值得把电量打回 "--"; 连续失败到一定次数才认定为真的掉了,
+// 这时清空显示, 免得界面一直停在一个旧数值上骗人。
+#define BATTERY_FAIL_TOLERANCE 6
+
 static void battery_task(void *arg)
 {
     (void)arg;
+    (void)battery_init();
+
+    unsigned failures = 0;
+
     for (;;) {
         const int soc = bsp_battery_soc();
-        if (soc != s_last_soc) {
-            s_last_soc = soc;
-            pet_ui_set_battery(soc);
+
+        if (soc < 0) {
+            if (s_last_soc >= 0 && ++failures >= BATTERY_FAIL_TOLERANCE) {
+                ESP_LOGW(TAG, "连续 %u 次读电量失败, 改为显示未知", failures);
+                s_last_soc = -1;
+                pet_ui_set_battery(-1);
+                failures = 0;
+            }
+        } else {
+            failures = 0;
+            if (soc != s_last_soc) {
+                ESP_LOGI(TAG, "电量 %d%%", soc);
+                s_last_soc = soc;
+                pet_ui_set_battery(soc);
+            }
         }
+
         vTaskDelay(pdMS_TO_TICKS(PET_BATTERY_POLL_MS));
     }
 }
@@ -232,9 +276,10 @@ esp_err_t pet_app_start(void)
         ESP_LOGE(TAG, "按键初始化失败: %s", esp_err_to_name(err));
     }
 
-    if (xTaskCreate(battery_task, "pet_battery", 3072, NULL, 3,
+    // 4096 而非更小: 这个任务除了轮询还要跑 CW2017 初始化(profile 写入 + 日志)。
+    if (xTaskCreate(battery_task, "pet_battery", 4096, NULL, 3,
                     &s_battery_task) != pdPASS) {
-        ESP_LOGW(TAG, "电量轮询任务创建失败, 电量将一直显示 --");
+        ESP_LOGW(TAG, "电量任务创建失败, 电量将一直显示 --");
     }
 
     if (s_settings_ok) {
