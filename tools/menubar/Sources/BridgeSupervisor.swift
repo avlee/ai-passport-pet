@@ -7,6 +7,64 @@
 
 import Foundation
 
+/// 一只可换的宠物。列表由桥接侧扫 `~/.codex/pets` 得到 —— 设备那条 pets 分区只装
+/// 得下一只, 所以"换宠物"就是把这边的另一只重新打包推下去。
+struct PetEntry {
+    let id: String
+    let display: String
+    /// 已经打包过(缓存里有 .pet)。没打包过也没关系, 点了才开始打。
+    let cached: Bool
+    let size: Int
+    /// 这只不能用时的原因(图集版本不对、pet.json 读不出来…)。
+    let problem: String?
+}
+
+/// 最近一次换宠物的进展。
+///
+/// 注意"发完了"不等于"装上了": 包发完之后设备还要核对长度与整包 CRC 再重新映射,
+/// 然后回一条 petdone。所以 sent 只是个中间态, 结论只在 done/failed。
+struct PetTransfer {
+    var id = ""
+    var state = "idle"   // idle / preparing / sending / sent / done / failed
+    var sent = 0
+    var total = 0
+    var message: String?
+
+    var isActive: Bool { state == "preparing" || state == "sending" }
+
+    /// 顶栏那一行用的极短说法。空闲时返回 nil。
+    var shortLabel: String? {
+        switch state {
+        case "preparing": return "打包中…"
+        case "sending":
+            return total > 0 ? "传输 \(min(100, sent * 100 / total))%" : "传输中…"
+        case "sent": return "等设备确认…"
+        default: return nil
+        }
+    }
+
+    /// 菜单里那一行。idle 时返回 nil, 那一行就藏起来。
+    var label: String? {
+        switch state {
+        case "preparing":
+            return "正在打包 \(id)…"
+        case "sending":
+            guard total > 0 else { return "正在传输 \(id)…" }
+            let percent = min(100, sent * 100 / total)
+            return String(format: "正在传输 %@：%d%%（%.1f / %.1f MiB）", id, percent,
+                          Double(sent) / 1_048_576, Double(total) / 1_048_576)
+        case "sent":
+            return "已发完 \(id)，等设备确认…"
+        case "done":
+            return "已装上 \(id)"
+        case "failed":
+            return "⚠︎ 换宠物失败：\(message ?? id)"
+        default:
+            return nil
+        }
+    }
+}
+
 /// 桥接当前状态。全部来自控制通道的事件 —— 应用不推测, 只转述。
 struct BridgeSnapshot {
     var bridgePid: Int32?
@@ -24,6 +82,17 @@ struct BridgeSnapshot {
     var lastEventKind = ""
     var lastEventAt: Date?
     var lastError: String?
+
+    // 宠物库(桥接侧扫 ~/.codex/pets 的结果)。petsAvailable 为假表示桥接启动时带
+    // 了 --no-pets, 或者还没收到过 pets 事件。
+    var pets: [PetEntry] = []
+    var petsDir = ""
+    var petsAvailable = false
+    var petBusy = false
+    var petTransfer = PetTransfer()
+    /// 桥接那个解释器能不能打包(有没有 Pillow)。nil 表示还没收到过 pets 事件。
+    var petPackAvailable: Bool?
+    var petPackHint: String?
 
     var bridgeRunning: Bool { bridgePid != nil }
 
@@ -126,6 +195,17 @@ final class BridgeSupervisor {
 
     func requestSnapshot() {
         client.send(["cmd": "snapshot"])
+    }
+
+    /// 重新扫一遍 ~/.codex/pets。用户刚在 Codex 里下了新宠物时不用重启桥接。
+    func refreshPets() {
+        client.send(["cmd": "petlist"])
+    }
+
+    /// 换宠物。传输在桥接的后台线程里跑, 这里立刻返回 —— 结果走 petxfer/petdone
+    /// 事件, 不要在这里等。
+    func installPet(_ id: String) {
+        client.send(["cmd": "pet", "id": id])
     }
 
     // MARK: - 子进程
@@ -277,6 +357,48 @@ final class BridgeSupervisor {
                 if let pet = event["pet"] as? String { snapshot.petPackage = pet }
                 snapshot.lastEventKind = "device:\(kind)"
 
+            // --- 宠物库 ---
+            // 三件事分开记, 不要塞进 device: ControlHub 每类事件只留最新一份,
+            // 混在一起会把 hello 报上来的固件/宠物包顶掉。
+            case "pets":
+                snapshot.petsAvailable = true
+                snapshot.petsDir = (event["pets_dir"] as? String) ?? ""
+                snapshot.petBusy = (event["busy"] as? Bool) ?? false
+                // 打包能力: 桥接跑在哪个解释器上、那个解释器有没有 Pillow。缺 Pillow 时
+                // 点任何一只都会失败, 所以菜单要在点之前就说明白。
+                if let packer = event["packer"] as? [String: Any] {
+                    snapshot.petPackAvailable = (packer["available"] as? Bool) ?? false
+                    snapshot.petPackHint = packer["hint"] as? String
+                } else {
+                    snapshot.petPackAvailable = true   // 老桥接没这个字段: 别平白报错
+                    snapshot.petPackHint = nil
+                }
+                snapshot.pets = (event["items"] as? [[String: Any]] ?? []).map { item in
+                    PetEntry(id: (item["id"] as? String) ?? "",
+                             display: (item["display"] as? String) ?? "",
+                             cached: (item["cached"] as? Bool) ?? false,
+                             size: (item["size"] as? Int) ?? 0,
+                             problem: item["error"] as? String)
+                }
+                // last 是桥接侧记住的上一次结局, 客户端中途接入时靠它对齐进度行。
+                if let last = event["last"] as? [String: Any] { applyPetTransfer(last) }
+
+            case "petxfer":
+                applyPetTransfer(event)
+                snapshot.petBusy = snapshot.petTransfer.isActive
+
+            case "petdone":
+                // 设备确认。成功时 id 是槽里**真正**装上的那只, 与 hello 报的是同一个
+                // 来源, 所以直接信它; 失败时桥接侧给的是原本还在槽里那只的 id。
+                let id = (event["id"] as? String) ?? ""
+                let ok = (event["ok"] as? Bool) ?? false
+                if !id.isEmpty { snapshot.petTransfer.id = id }
+                snapshot.petTransfer.state = ok ? "done" : "failed"
+                snapshot.petTransfer.message = ok ? nil : "设备拒收了这个包"
+                snapshot.petBusy = false
+                if ok { snapshot.petPackage = id }
+                snapshot.lastEventKind = "petdone:\(ok ? "ok" : "failed")"
+
             case "error":
                 snapshot.lastError = (event["message"] as? String) ?? "控制通道报错"
 
@@ -298,5 +420,16 @@ final class BridgeSupervisor {
 
     private func publish() {
         onChange?(snapshot)
+    }
+
+    /// 换宠物进度。petxfer 事件与 pets 事件里的 last 字段是同一套键, 合并到一处。
+    private func applyPetTransfer(_ payload: [String: Any]) {
+        if let id = payload["id"] as? String { snapshot.petTransfer.id = id }
+        if let state = payload["state"] as? String { snapshot.petTransfer.state = state }
+        if let sent = payload["sent"] as? Int { snapshot.petTransfer.sent = sent }
+        if let total = payload["total"] as? Int { snapshot.petTransfer.total = total }
+        if let message = payload["message"] as? String {
+            snapshot.petTransfer.message = message
+        }
     }
 }

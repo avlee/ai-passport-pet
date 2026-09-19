@@ -101,15 +101,48 @@ struct BridgeSettings {
 
     /// 找 python3。GUI 应用从 Finder 启动时 PATH 很短, 所以按固定顺序探测而不是
     /// 依赖 env。
+    ///
+    /// 从"换宠物"这一步开始, 桥接不再只用标准库了: 把图集打成 `.pet` 需要 Pillow。
+    /// 所以这里**优先挑能 import PIL 的那一个**。挑错了不会在启动时报错 —— 桥接照样
+    /// 跑起来, 只有点"换宠物"时才失败, 从那个现象很难反推回"是解释器选的是系统
+    /// python"。探测过一次就记住, 别在每次刷新菜单时再 fork 一遍。
     static func findPython() -> String {
+        if let cached = cachedPython { return cached }
         let candidates = [
-            "/usr/bin/python3",
             "/opt/homebrew/bin/python3",
             "/usr/local/bin/python3",
-        ]
-        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
-            return path
+            "/usr/bin/python3",
+        ].filter { FileManager.default.isExecutableFile(atPath: $0) }
+        // 谁有 Pillow 用谁; 都没有就先挑第一个(至少桥接本体能跑), 菜单会提示打包不可用。
+        let chosen = candidates.first(where: canImportPillow) ?? candidates.first ?? "/usr/bin/python3"
+        cachedPython = chosen
+        return chosen
+    }
+
+    private static var cachedPython: String?
+
+    /// fork 一个短命子进程问一句 "import PIL 行不行"。
+    static func canImportPillow(_ python: String) -> Bool {
+        guard FileManager.default.isExecutableFile(atPath: python) else { return false }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: python)
+        task.arguments = ["-c", "import PIL"]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+        } catch {
+            return false
         }
-        return "/usr/bin/python3"
+        // python 启动正常在 100 ms 以内; 卡住就别把菜单拖在这儿。
+        let deadline = Date().addingTimeInterval(5)
+        while task.isRunning && Date() < deadline {
+            usleep(20_000)
+        }
+        if task.isRunning {
+            task.terminate()
+            return false
+        }
+        return task.terminationStatus == 0
     }
 }

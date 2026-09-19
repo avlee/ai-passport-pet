@@ -21,7 +21,16 @@ final class StatusMenuController: NSObject {
     private let sessionItem = NSMenuItem()
     private let errorItem = NSMenuItem()
     private let repoItem = NSMenuItem()
+    private let pythonItem = NSMenuItem()
     private let watchItem = NSMenuItem()
+
+    /// 宠物子菜单。与顶层菜单相反, 这一份是每次按需重建的 —— 它平时是合上的, 不会
+    /// 出现"菜单开着重建导致高亮乱跳"的问题, 而内容(列表 + 进度行)本来就是活的。
+    private let petItem = NSMenuItem(title: "宠物", action: nil, keyEquivalent: "")
+    private let petMenu = NSMenu()
+    /// 上次重建子菜单时的内容指纹。传输期间 petxfer 每 16 KiB 就报一次进度, 没必要
+    /// 每次都把 NSMenuItem 重造一遍。
+    private var petMenuKey = ""
 
     private let manualStates: [(id: String, label: String)] = [
         ("idle", "空闲"),
@@ -97,6 +106,12 @@ final class StatusMenuController: NSObject {
         stateItem.submenu = stateMenu
         menu.addItem(stateItem)
 
+        // 换宠物: 包由 Pet Bridge 从 ~/.codex/pets 现打现推, 设备不用重刷固件。
+        petMenu.autoenablesItems = false
+        petItem.submenu = petMenu
+        menu.addItem(petItem)
+        menu.addItem(.separator())
+
         let textItem = NSMenuItem(title: "发送气泡文字…",
                                   action: #selector(askForText), keyEquivalent: "t")
         textItem.target = self
@@ -128,6 +143,13 @@ final class StatusMenuController: NSObject {
         repoItem.target = self
         repoItem.isEnabled = true
         menu.addItem(repoItem)
+
+        // 换宠物要靠这个解释器把图集打成 .pet, 所以它得带 Pillow。标题里直接写出
+        // 当前用的是哪个, 免得用户以为"设置过了"其实设置的是另一个。
+        pythonItem.action = #selector(choosePython)
+        pythonItem.target = self
+        pythonItem.isEnabled = true
+        menu.addItem(pythonItem)
 
         let aboutItem = NSMenuItem(title: "关于 Codex Pet Bridge",
                                    action: #selector(showAbout), keyEquivalent: "")
@@ -192,6 +214,129 @@ final class StatusMenuController: NSObject {
 
         watchItem.state = snapshot.watchingCodex ? .on : .off
         repoItem.title = "项目目录：\(BridgeSettings.load().repoPath)"
+
+        // python 那一条带上有无 Pillow: 那正是"能不能换宠物"的前提。
+        var python = "python：\(BridgeSettings.load().pythonPath)"
+        switch snapshot.petPackAvailable {
+        case .some(true):  python += "（有 Pillow）"
+        case .some(false): python += "（⚠︎ 没有 Pillow）"
+        case .none:        break
+        }
+        pythonItem.title = python
+
+        refreshPetMenu(snapshot)
+    }
+
+    // MARK: - 宠物子菜单
+
+    /// 子菜单内容是活的(宠物列表 + 传输进度), 所以按需重建。与顶层菜单不同, 这一份
+    /// 平时是合上的, 重建不会让高亮乱跳。
+    private func refreshPetMenu(_ snapshot: BridgeSnapshot) {
+        // 顶栏标题带一眼就能看见的信息: 传输中报进度, 否则报设备上当前那只。
+        if let short = snapshot.petTransfer.shortLabel {
+            petItem.title = "宠物：\(short)"
+        } else if snapshot.petPackage.isEmpty {
+            petItem.title = "宠物"
+        } else {
+            petItem.title = "宠物：\(snapshot.petPackage)"
+        }
+
+        // 内容指纹。传输期间 petxfer 每 16 KiB 就报一次进度, 没必要每次都把
+        // NSMenuItem 全部重造。
+        let key = [
+            snapshot.petPackage,
+            snapshot.petsAvailable ? "1" : "0",
+            snapshot.petBusy ? "1" : "0",
+            snapshot.deviceConnected ? "1" : "0",
+            snapshot.petsDir,
+            snapshot.petPackAvailable.map { $0 ? "1" : "0" } ?? "-",
+            snapshot.petPackHint ?? "",
+            snapshot.pets.map { "\($0.id)/\($0.size)/\($0.problem ?? "")" }
+                .joined(separator: ","),
+            snapshot.petTransfer.state, snapshot.petTransfer.id,
+            String(snapshot.petTransfer.sent), String(snapshot.petTransfer.total),
+            snapshot.petTransfer.message ?? "",
+        ].joined(separator: "|")
+        guard key != petMenuKey else { return }
+        petMenuKey = key
+
+        petMenu.removeAllItems()
+
+        // 进度/结局那一行在最上面: 用户刚点完菜单, 这就是他要看的反馈。
+        if let label = snapshot.petTransfer.label {
+            petMenu.addItem(disabledPetItem(label))
+            petMenu.addItem(.separator())
+        }
+
+        // 打包是桥接侧那台 python 干的活。缺 Pillow 时**没缓存过的**那几只点了必然
+        // 失败, 所以先在顶上说清楚缺什么、去哪儿改, 而不是让用户点一只消失一只。
+        let unpackable = snapshot.petPackAvailable == false
+            && snapshot.pets.contains { !$0.cached && $0.problem == nil }
+        if unpackable {
+            petMenu.addItem(disabledPetItem("⚠︎ 无法打包：\(snapshot.petPackHint ?? "桥接的 python 没有 Pillow")"))
+            petMenu.addItem(disabledPetItem("   在下面的「选择 python3…」里换成装了 Pillow 的解释器"))
+            petMenu.addItem(.separator())
+        }
+
+        if !snapshot.petsAvailable {
+            petMenu.addItem(disabledPetItem("宠物库未启用（桥接启动时带了 --no-pets）"))
+        } else if snapshot.pets.isEmpty {
+            petMenu.addItem(disabledPetItem("~/.codex/pets 里没有宠物"))
+        } else {
+            for entry in snapshot.pets {
+                petMenu.addItem(petMenuItem(entry, snapshot))
+            }
+        }
+
+        petMenu.addItem(.separator())
+
+        let refreshItem = NSMenuItem(title: "刷新列表（刚在 Codex 里下了新宠物）",
+                                     action: #selector(refreshPets), keyEquivalent: "")
+        refreshItem.target = self
+        petMenu.addItem(refreshItem)
+
+        let openItem = NSMenuItem(title: "打开宠物目录", action: #selector(openPetsDir),
+                                  keyEquivalent: "")
+        openItem.target = self
+        openItem.representedObject = snapshot.petsDir
+        openItem.isEnabled = !snapshot.petsDir.isEmpty
+        petMenu.addItem(openItem)
+    }
+
+    private func disabledPetItem(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
+    private func petMenuItem(_ entry: PetEntry, _ snapshot: BridgeSnapshot) -> NSMenuItem {
+        let installed = entry.id == snapshot.petPackage
+        var title = entry.display.isEmpty ? entry.id : "\(entry.display)（\(entry.id)）"
+        if entry.size > 0 {
+            title += String(format: " · %.1f MiB", Double(entry.size) / 1_048_576)
+        }
+
+        let item = NSMenuItem(title: title, action: #selector(installPet(_:)),
+                              keyEquivalent: "")
+        item.target = self
+        item.representedObject = entry.id
+        item.state = installed ? .on : .off
+
+        if let problem = entry.problem {
+            item.title = "⚠︎ \(title)：\(problem)"
+            item.isEnabled = false
+        } else if !entry.cached && snapshot.petPackAvailable == false {
+            // 没缓存过 = 得现打, 而这边打不出来。禁掉比让用户点了再看报错更省事。
+            item.title = "⧗ \(title)：缺 Pillow, 打不出包"
+            item.isEnabled = false
+        } else if installed {
+            item.isEnabled = false            // 已经是它了
+        } else if !snapshot.deviceConnected {
+            item.isEnabled = false            // 设备没连上, 桥接只会回一句"设备还没连上"
+        } else {
+            item.isEnabled = !snapshot.petBusy
+        }
+        return item
     }
 
     private func updateIcon(for snapshot: BridgeSnapshot) {
@@ -243,6 +388,37 @@ final class StatusMenuController: NSObject {
         provisionController.show()
     }
 
+    @objc private func installPet(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        NSApp.activate(ignoringOtherApps: true)
+
+        // 确认一次是值得的: 传输期间设备的槽是先清空再写的, 中途断电/断网会留下
+        // "还没有宠物"的设备, 得再点一次。这不是一个可以随手误触的操作。
+        let alert = NSAlert()
+        alert.messageText = "把设备上的宠物换成 \(id)？"
+        alert.informativeText = """
+            桥接会把这只重新打包, 经 Wi-Fi 推到设备上(通常几十秒, 期间设备屏幕上 \
+            会显示接收进度)。
+
+            注意: 设备是先把槽清空再写入的 —— 传输中途断电或断网的话, 设备上就没有 \
+            宠物了, 重新点一次即可。
+            """
+        alert.addButton(withTitle: "开始传输")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        supervisor.installPet(id)
+    }
+
+    @objc private func refreshPets() {
+        supervisor.refreshPets()
+    }
+
+    @objc private func openPetsDir(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String, !path.isEmpty else { return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+
     @objc private func askForText() {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
@@ -285,6 +461,7 @@ final class StatusMenuController: NSObject {
             "Codex Pet Bridge \(BuildConfig.version)",
             "项目目录: \(settings.repoPath)",
             "python: \(settings.pythonPath)",
+            "打包: \(snapshot.petPackAvailable.map { $0 ? "可用" : "不可用（缺 Pillow）" } ?? "未知")",
             "端口: \(settings.port)",
             "控制通道: \(BridgePaths.socketPath)",
             "桥接: \(snapshot.bridgePid.map { "运行中 pid \($0)" } ?? "未运行")",
@@ -328,6 +505,60 @@ final class StatusMenuController: NSObject {
             return
         }
         UserDefaults.standard.set(url.path, forKey: PrefKey.repoPath)
+        supervisor.restart()
+    }
+
+    /// 换 python 解释器。换宠物要靠它把图集打成 `.pet`, 所以先用 `import PIL` 验一遍 ——
+    /// 没 Pillow 的解释器不是不能跑桥接, 而是**只有换宠物会失败**, 那种"一半能用"最难查。
+    @objc private func choosePython() {
+        let settings = BridgeSettings.load()
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "选择 python3"
+        alert.informativeText = "把图集打成设备要收的 .pet 需要 Pillow。留空则改为自动探测。"
+        alert.addButton(withTitle: "使用")
+        alert.addButton(withTitle: "取消")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        field.stringValue = settings.pythonPath
+        field.placeholderString = "/usr/bin/python3"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty {
+            UserDefaults.standard.removeObject(forKey: PrefKey.pythonPath)
+            supervisor.restart()
+            return
+        }
+
+        // 路径打错和"没装 Pillow"都会让换宠物失败, 但两句话该说得不一样。
+        guard FileManager.default.isExecutableFile(atPath: text) else {
+            let bad = NSAlert()
+            bad.messageText = "这个路径不可执行"
+            bad.informativeText = "找不到可执行的 \(text)"
+            bad.runModal()
+            return
+        }
+        if !BridgeSettings.canImportPillow(text) {
+            let warn = NSAlert()
+            warn.messageText = "这个 python 没有 Pillow"
+            warn.informativeText = """
+                桥接本体还能跑, 但「换宠物」会失败 —— 打包那一步需要 Pillow。
+
+                可以给它装上：
+                \(text) -m pip install Pillow
+
+                仍然改用它吗？
+                """
+            warn.addButton(withTitle: "仍然使用")
+            warn.addButton(withTitle: "取消")
+            guard warn.runModal() == .alertFirstButtonReturn else { return }
+        }
+
+        UserDefaults.standard.set(text, forKey: PrefKey.pythonPath)
         supervisor.restart()
     }
 
