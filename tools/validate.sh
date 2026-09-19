@@ -82,10 +82,27 @@ run_static_checks() {
         tests/test_bsp_audio_recovery.c components/bsp/src/bsp_es8311_sleep_check.c \
         -o "${test_dir}/test_bsp_audio_recovery"
     "${test_dir}/test_bsp_audio_recovery"
+    # 官方的 demo 回归测试靠"丢未引用段"才链接得过去：demo_enter 引用了桩里没实现的
+    # LVGL 符号，只有让链接器把它当未引用段丢掉才行，所以必须带一个段回收选项。问题
+    # 是这个选项在两个平台字面不同 —— GNU ld 是 -Wl,--gc-sections，Mach-O 的 ld 是
+    # -Wl,-dead_strip，而官方只写了前者（他们的 CI 跑在 Linux 上）。这里按平台探一遍。
+    gc_sections=""
+    for candidate in -Wl,--gc-sections -Wl,-dead_strip; do
+        if printf 'int main(void) { return 0; }\n' >"${test_dir}/gc_probe.c" &&
+            "${CC:-cc}" "${candidate}" "${test_dir}/gc_probe.c" \
+            -o "${test_dir}/gc_probe" >/dev/null 2>&1; then
+            gc_sections="${candidate}"
+            break
+        fi
+    done
+    if [[ -z "${gc_sections}" ]]; then
+        echo "ERROR: no usable section-GC link flag; demo runtime tests cannot link." >&2
+        return 1
+    fi
     for demo in audio low_power ble wifi; do
         "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
             -ffunction-sections -fdata-sections -Itests/demo_stubs -Imain \
-            "tests/test_demo_${demo}_runtime.c" -Wl,--gc-sections \
+            "tests/test_demo_${demo}_runtime.c" "${gc_sections}" \
             -o "${test_dir}/test_demo_${demo}_runtime"
         "${test_dir}/test_demo_${demo}_runtime"
     done
