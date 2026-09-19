@@ -21,6 +21,10 @@
     <!-- 纯菜单栏应用: 不进 Dock, 不占 Cmd-Tab。 -->
     <key>LSUIElement</key>
     <true/>
+    <!-- 蓝牙配网需要这条说明, 否则 macOS 会在访问 CoreBluetooth 时直接把进程杀掉
+         (TCC 隐私违规, SIGABRT, 连错误日志都来不及打)。 -->
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>通过蓝牙把家里的 Wi-Fi 名称和密码发送给 Codex 宠物, 设备之后用 Wi-Fi 与这台 Mac 通信。</string>
     <key>NSHumanReadableCopyright</key>
     <string>Codex Pet Bridge — 本地辅助工具</string>
 </dict>

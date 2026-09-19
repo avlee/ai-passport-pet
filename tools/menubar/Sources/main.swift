@@ -7,6 +7,14 @@
 
 import AppKit
 
+// --provision: 无界面的配网模式。放在启动 NSApplication 之前判断 —— 配网要能被
+// 脚本调用, 也不该为此在菜单栏里多出一个图标。
+var launchArguments = Array(CommandLine.arguments.dropFirst())
+if let index = launchArguments.firstIndex(of: "--provision") {
+    launchArguments.remove(at: index)
+    exit(ProvisionCommand.run(arguments: launchArguments))
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: StatusMenuController?
 

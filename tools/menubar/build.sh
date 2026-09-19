@@ -49,7 +49,8 @@ xcrun swiftc -O -swift-version 5 \
     -target "$(uname -m)-apple-macos12.0" \
     -o "$app_dir/Contents/MacOS/$app_name" \
     "${sources[@]}" "$work_dir/BuildConfig.swift" \
-    -framework AppKit
+    -framework AppKit \
+    -framework CoreBluetooth
 
 cp "$here/Info.plist" "$app_dir/Contents/Info.plist"
 

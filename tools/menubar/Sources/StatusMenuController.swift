@@ -31,6 +31,9 @@ final class StatusMenuController: NSObject {
         ("failed", "出错了"),
     ]
 
+    /// 配网窗口按需创建: 没配过网的人不该为这个功能付启动成本。
+    private lazy var provisionController = ProvisionWindowController()
+
     init(supervisor: BridgeSupervisor) {
         self.supervisor = supervisor
         super.init()
@@ -68,6 +71,16 @@ final class StatusMenuController: NSObject {
         menu.addItem(bubbleItem)
         menu.addItem(sessionItem)
         menu.addItem(errorItem)
+        menu.addItem(.separator())
+
+        // 配网放在最前面: 设备连不上时这是用户第一个要找的东西。
+        // 标题里不要加省略号: 这个名字会原样出现在设备屏幕上(那里的状态区只有
+        // 200px 宽), 多一个字符就可能折行。
+        let provisionItem = NSMenuItem(title: "配置 Wi-Fi",
+                                       action: #selector(openProvisioning),
+                                       keyEquivalent: "w")
+        provisionItem.target = self
+        menu.addItem(provisionItem)
         menu.addItem(.separator())
 
         // 手工推状态: 演示和联调时不用切回终端。
@@ -224,6 +237,10 @@ final class StatusMenuController: NSObject {
     @objc private func pushManualState(_ sender: NSMenuItem) {
         guard let state = sender.representedObject as? String else { return }
         supervisor.pushState(state)
+    }
+
+    @objc private func openProvisioning() {
+        provisionController.show()
     }
 
     @objc private func askForText() {

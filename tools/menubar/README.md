@@ -38,6 +38,7 @@ Hovering shows the current state, the pack level, and the bubble text.
 
 ## Menu items
 
+- **Configure Wi-Fi** (⌘W): opens the Bluetooth provisioning window. It prefills the SSID and LAN address of the Mac you are on, asks for the 4-digit code shown on the device screen, and pushes the credentials over BLE once the code is accepted. Use it whenever the device is on a different network from the one it was built for, or when it has never been provisioned at all. The title carries **no ellipsis**: it is shown verbatim on the device screen, whose status area is only 200px wide, so one extra character can wrap it (`tests/test_pet_ui_text_fit.py`).
 - **Bridge / Device / Battery / Codex / Bubble / Session**: read-only status rows. When the device is not connected the row reminds you to check that it is on the same 2.4 GHz network. The battery row is hidden until the device reports a level — it comes from the CW2017 gauge over the same link, and it is dropped again on disconnect so a stale reading is never shown; 20% or below adds a warning prefix.
 - **Push state**: manually push idle / working / waiting / ready / failed, so demos and debugging do not need a terminal. A manual state wins over log inference until the next Codex event arrives.
 - **Send bubble text…** (⌘T): changes only the one line shown on the device, not the state.
@@ -46,6 +47,20 @@ Hovering shows the current state, the pack level, and the bubble text.
 - **Open log** (⌘L) and **Copy diagnostics**: the former gives the full output, the latter puts the key status plus the log tail on the clipboard in one go.
 - **Project directory**: point the app at another checkout if it was not built inside this repo.
 - **Quit**: also stops the bridge child process, so no orphan keeps holding the port.
+
+## Headless provisioning (`--provision`)
+
+The same BLE client is reachable without the GUI, which is what makes the path scriptable and testable:
+
+```bash
+"Codex Pet Bridge.app/Contents/MacOS/CodexPetBridge" --provision --scan
+"Codex Pet Bridge.app/Contents/MacOS/CodexPetBridge" --provision --pin 1234 --password 'hunter2'
+"Codex Pet Bridge.app/Contents/MacOS/CodexPetBridge" --provision --pin 1234 --forget
+```
+
+`--scan` lists advertising devices and exits. Otherwise `--ssid`, `--host`, and `--port` default to the current Wi-Fi, this Mac's LAN address, and the configured bridge port. Exit codes: `0` success, `1` failure, `2` bad arguments. `--json` emits one JSON object per line; `--out <path>` additionally appends them to a file.
+
+Bluetooth permission is attributed to the **responsible process**, not to the binary being run. Launched from a terminal or an automation host, that is the terminal itself — which has no `NSBluetoothAlwaysUsageDescription`, so the process dies with `SIGABRT` under the `TCC` termination namespace. Launching through LaunchServices (`open -n … --args`) makes the app its own responsible process, and `--out` exists so the result can still be collected from a file. Either way the first run prompts for permission, and someone has to accept it.
 
 ## Ports and paths
 
