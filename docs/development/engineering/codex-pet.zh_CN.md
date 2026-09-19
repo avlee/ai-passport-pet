@@ -142,6 +142,37 @@ python3 tools/pet_bridge.py --list-sessions
 
 服务端每 5 s 发一条 `ping`，明显快于设备侧 12 s 的空闲判定，所以「设备静默掉线」只会在真的断网时发生。
 
+### 菜单栏应用（macOS）
+
+`tools/menubar/` 把它包成一个原生菜单栏应用：图标随状态变化，点开能看到桥接 / 设备 /
+Codex / 气泡状态，并能手工推状态、发气泡文字、开关日志跟随。
+
+```bash
+./tools/menubar/build.sh --run
+```
+
+只依赖 Command Line Tools 里的 `swiftc`，没有第三方依赖，也不需要 Xcode 工程。
+应用本身**不写任何网络报文** —— 它把 `pet_bridge.py` 拉成子进程（崩了按退避重拉），
+再通过下面这条本地通道读状态、下命令；退出时会一并收掉子进程。细节见
+`tools/menubar/README.md`。
+
+### 控制通道（`--control`）
+
+给 GUI 前端用的本地通道：AF_UNIX + JSON 行，双向。
+
+```bash
+python3 tools/pet_bridge.py --control "$HOME/Library/Application Support/CodexPetBridge/bridge.sock"
+```
+
+连上来先收到一条 `snapshot`（全部当前状态），之后是增量事件：`bridge` / `link` /
+`state` / `text` / `session` / `watch` / `device` / `error`。命令有 `state`、`text`、
+`raw`、`watch`、`snapshot`、`ping`。
+
+这是一条**事件流**，不是一问一答：命令成功不回执，结果以对应事件广播出来，只有出错
+才会多收到一条 `error` —— 客户端按事件更新状态即可，不要去配「发一条收一条」。
+协议的权威定义仍然是上面那几条发往设备的 JSON，控制通道只做观察和驱动，不新增任何
+下行报文。
+
 ## 版式预览（不需要真机）
 
 ```bash

@@ -142,6 +142,28 @@ It follows whichever of `~/.codex/sessions/**/rollout-*.jsonl` was modified most
 
 The server pings every 5 s, comfortably faster than the device's 12 s idle check, so a genuinely silent device only happens when the network really drops.
 
+### The menu bar app (macOS)
+
+`tools/menubar/` wraps that server into a native menu bar app: the icon tracks the state, and the menu shows the bridge / device / Codex / bubble status plus manual state pushes, bubble text and a log-following toggle.
+
+```bash
+./tools/menubar/build.sh --run
+```
+
+It needs nothing but `swiftc` from the Command Line Tools — no third-party dependency, no Xcode project. The app writes **no network traffic of its own**: it runs `pet_bridge.py` as a child process (relaunching it with backoff if it dies), then reads status and sends commands over the local channel below. Quitting the app also stops the child. See `tools/menubar/README.md` for the details.
+
+### Control channel (`--control`)
+
+A local channel for GUI front ends: AF_UNIX plus JSON lines, both directions.
+
+```bash
+python3 tools/pet_bridge.py --control "$HOME/Library/Application Support/CodexPetBridge/bridge.sock"
+```
+
+A new client first receives a `snapshot` (the whole current state) and then incremental events: `bridge`, `link`, `state`, `text`, `session`, `watch`, `device`, `error`. Commands are `state`, `text`, `raw`, `watch`, `snapshot` and `ping`.
+
+This is an **event stream, not request/response**: a successful command sends no acknowledgement — its result is broadcast as the matching event — and only failures add an `error`. Clients should update state from events rather than pairing a send with a receive. The authoritative definition of the wire format remains the handful of JSON messages sent to the device above; the control channel only observes and drives, and adds no downstream traffic.
+
 ## Layout preview (no device needed)
 
 ```bash

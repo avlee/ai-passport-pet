@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Codex Pet Bridge</string>
+    <key>CFBundleDisplayName</key>
+    <string>Codex Pet Bridge</string>
+    <key>CFBundleExecutable</key>
+    <string>CodexPetBridge</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.codex-pet.bridge</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <!-- 纯菜单栏应用: 不进 Dock, 不占 Cmd-Tab。 -->
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Codex Pet Bridge — 本地辅助工具</string>
+</dict>
+</plist>
