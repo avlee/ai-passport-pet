@@ -67,6 +67,23 @@ run_static_checks() {
             -o "${test_dir}/test_demo_${demo}_runtime"
         "${test_dir}/test_demo_${demo}_runtime"
     done
+
+    # Codex 宠物: 状态机 / 协议解析 / 图集自检都是纯逻辑, 直接在主机上跑。
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_pet_state.c main/pet_state.c \
+        -o "${test_dir}/test_pet_state"
+    "${test_dir}/test_pet_state"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_pet_protocol.c main/pet_protocol.c main/pet_state.c \
+        -o "${test_dir}/test_pet_protocol"
+    "${test_dir}/test_pet_protocol"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_pet_atlas.c main/pet_atlas_validate.c \
+        main/pet_atlas_sophie_portrait.c \
+        -o "${test_dir}/test_pet_atlas"
+    "${test_dir}/test_pet_atlas"
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_pet_font_coverage.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_pet_bridge.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_deep_sleep_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_check_repo.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_verify_firmware.py
