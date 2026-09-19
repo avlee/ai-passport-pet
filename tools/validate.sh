@@ -4,6 +4,12 @@ set -euo pipefail
 mode="${1:---all}"
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# 临时目录统一走 TMPDIR(macOS 上是 /var/folders/... ,不是 /tmp), 并去掉结尾的
+# 斜杠: macOS 的 TMPDIR 以 "/" 结尾, 直接拼出 "//" 会让后续 abspath 规范化成
+# 另一个字符串, 在按路径做访问控制的沙箱里会被判成"路径不认识"。
+scratch_root="${TMPDIR:-/tmp}"
+scratch_root="${scratch_root%/}"
+
 usage() {
     echo "Usage: $0 [--all|--static|--firmware]" >&2
 }
@@ -23,7 +29,7 @@ run_static_checks() {
     fi
     "${actionlint_bin}" -color .github/workflows/*.yml
 
-    test_dir="$(mktemp -d /tmp/ai-passport-host-tests.XXXXXX)"
+    test_dir="$(mktemp -d "${scratch_root}/ai-passport-host-tests.XXXXXX")"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_ui_pixel_math.c main/ui_pixel_math.c \
         -o "${test_dir}/test_ui_pixel_math"
@@ -78,8 +84,8 @@ run_firmware_checks() (
         return 1
     fi
 
-    validation_build_dir="$(mktemp -d /tmp/ai-passport-firmware.XXXXXX)"
-    trap 'case "${validation_build_dir}" in /tmp/ai-passport-firmware.*) rm -rf -- "${validation_build_dir}" ;; esac' EXIT
+    validation_build_dir="$(mktemp -d "${scratch_root}/ai-passport-firmware.XXXXXX")"
+    trap 'case "${validation_build_dir}" in */ai-passport-firmware.*) rm -rf -- "${validation_build_dir}" ;; esac' EXIT
 
     SDKCONFIG_DEFAULTS="${repo_root}/sdkconfig.defaults" \
         idf.py -B "${validation_build_dir}" \

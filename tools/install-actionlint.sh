@@ -49,14 +49,26 @@ if ! curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
     gh release download "v${version}" --repo rhysd/actionlint \
         --pattern "${archive_name}" --dir "${destination}"
 fi
-if command -v sha256sum >/dev/null 2>&1; then
-    printf '%s  %s\n' "${checksum}" "${archive_path}" | sha256sum --check --status
-elif command -v shasum >/dev/null 2>&1; then
-    [[ "$(shasum -a 256 "${archive_path}" | awk '{print $1}')" == "${checksum}" ]]
-else
-    echo "No SHA-256 verification tool is available" >&2
-    exit 1
-fi
+# macOS 自带 /sbin/sha256sum 是 BSD 变体, 没有 --check; 所以先探测能力, 再退回
+# 到 shasum。只看命令是否存在会在 macOS 上选到不能用的那个。
+verify_sha256() {
+    local file="$1" expected="$2"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        if printf '%s  %s\n' "${expected}" "${file}" \
+            | sha256sum --check --status 2>/dev/null; then
+            return 0
+        fi
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        [[ "$(shasum -a 256 "${file}" | awk '{print $1}')" == "${expected}" ]]
+        return
+    fi
+    echo "No usable SHA-256 verification tool is available" >&2
+    return 1
+}
+
+verify_sha256 "${archive_path}" "${checksum}"
 tar -xzf "${archive_path}" -C "${destination}" actionlint
 chmod +x "${destination}/actionlint"
 printf '%s\n' "${destination}/actionlint"
