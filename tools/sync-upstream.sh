@@ -210,31 +210,35 @@ if [[ "${integration}" == "none" ]]; then
 elif [[ "${current}" == "${local_branch}" ]]; then
     echo "当前就在 main 上，没有分支要跟上。"
 else
+    branch_before="$(git rev-parse HEAD)"
     echo "让 ${current} 跟上 ${local_branch}（${integration}）"
     if [[ "${integration}" == "rebase" ]]; then
         if ! git rebase "${local_branch}"; then
-            cat >&2 <<EOF
+            cat >&2 <<'EOF'
 
-ERROR: rebase 撞上冲突了。解完冲突后：
-  git add <files> && git rebase --continue
-想放弃：
-  git rebase --abort
+ERROR: rebase 停下来等人工解冲突：
+  解完冲突：git add <files> && git rebase --continue
+  想放弃：  git rebase --abort
 
-撞的通常是这几个文件（官方也在改、我们也在改）：
-  .gitignore
-  docs/development/README.md, docs/development/README.zh_CN.md
-  docs/development/engineering/{build-and-test,firmware-layout}{,.zh_CN}.md
-  tools/validate.sh
+冲突文件：
+EOF
+            git diff --name-only --diff-filter=U >&2
+            cat >&2 <<'EOF'
+
+两侧撞车多半是"在同一段末尾各追加了一块"，所以通常把两半都留下即可。
 EOF
             exit 1
         fi
-    else
-        if ! git merge --no-edit "${local_branch}"; then
-            echo "ERROR: merge 有冲突，解决后 git add 并 git commit 完成合并。" >&2
-            exit 1
-        fi
+    elif ! git merge --no-edit "${local_branch}"; then
+        echo "ERROR: merge 有冲突，解决后 git add 并 git commit 完成合并。" >&2
+        exit 1
     fi
-    integrated=1
+    # 分支本来就在 main 上时, git 会静静地什么都不做; 这时别提示去强推。
+    if [[ "$(git rev-parse HEAD)" == "${branch_before}" ]]; then
+        echo "${current} 本来就在 ${local_branch} 上，无需改动。"
+    else
+        integrated=1
+    fi
 fi
 
 pushed_branch=0
