@@ -21,3 +21,5 @@ main/pet_config_local.h
 .workbuddy/
 # 本机自备的备选宠物素材, 来源与许可未确认, 不随仓库分发
 assets/pets/li-muwan/
+# 烧录前读回的设备原厂固件快照, 体积大且与源码无关
+backup/
