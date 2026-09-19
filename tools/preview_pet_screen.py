@@ -29,12 +29,15 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# 与 main/pet_ui.c 的调色板保持一致。解析布局常量时也会用到这里的兜底值。
+# 与 main/pet_ui.c 的调色板保持一致。颜色是十六进制常量, 正则抓不到, 只能抄 —
+# 改了 pet_ui.c 的 COL_* 就要回来一起改。
 COLORS = {
     "COL_BG": (0x0B, 0x0F, 0x14),
     "COL_CARD": (0x16, 0x20, 0x2A),
     "COL_CARD_EDGE": (0x22, 0x32, 0x3F),
-    "COL_BUBBLE": (0x14, 0x1D, 0x26),
+    "COL_PLAT_FLOOR": (0x22, 0x34, 0x44),
+    "COL_PLAT_RIM": (0x3E, 0x63, 0x83),
+    "COL_PLAT_BODY": (0x13, 0x1B, 0x24),
     "COL_INK": (0xE8, 0xF1, 0xF5),
     "COL_MUTED": (0x7C, 0x93, 0xA3),
     "COL_ACCENT": (0x4C, 0xC2, 0xFF),
@@ -43,7 +46,7 @@ COLORS = {
     "COL_BAD": (0xF8, 0x71, 0x71),
 }
 
-# 状态 -> (状态文字, 圆点颜色, 气泡占位文案, 动作行, 是否睡眠)
+# 状态 -> (状态文字, 圆点颜色, 站台占位文案, 动作行, 是否睡眠)
 SCENES = [
     ("idle",        "空闲",     "COL_GOOD",  "等待 Codex 任务", "idle",    False),
     ("working",     "工作中",   "COL_ACCENT", "Codex 正在执行", "running", False),
@@ -63,13 +66,31 @@ FONT_CANDIDATES = [
 
 
 def parse_layout(pet_ui: Path) -> dict[str, int]:
-    """从 main/pet_ui.c 抓布局常量, 避免在这里再抄一份。"""
+    """从 main/pet_ui.c 抓布局常量, 避免在这里再抄一份。
+
+    只认整数字面量。pet_ui.c 里的长度/坐标因此都写成字面量, 互相之间的等式
+    由那边的 _Static_assert 保证 —— 写成宏算式这边会静默漏掉, 预览就会错位。
+    行尾的 // 注释允许存在。
+    """
     source = pet_ui.read_text(encoding="utf-8")
     layout: dict[str, int] = {}
-    for name, value in re.findall(r"^#define\s+([A-Z_0-9]+)\s+(-?\d+)\s*$",
+    for name, value in re.findall(r"^#define\s+([A-Z_0-9]+)\s+(-?\d+)\s*(?://.*)?$",
                                   source, re.MULTILINE):
         layout[name] = int(value)
     return layout
+
+
+def parse_font_line_height(font_c: Path) -> int:
+    """读 LVGL 生成字体的行高。
+
+    这里以前写死 21, 而设备上是 31: 预览的文本块因此比真机矮了一截, 看版式会
+    被误导(真机上两行文本是 62 px, 不是 42)。字体文件是生成产物, 直接读真值。
+    """
+    match = re.search(r"\.line_height\s*=\s*(\d+)",
+                      font_c.read_text(encoding="utf-8"))
+    if match is None:
+        raise ValueError(f"{font_c} 里找不到 line_height")
+    return int(match.group(1))
 
 
 def parse_atlas(header: Path, source: Path) -> tuple[dict[str, int], list[dict]]:
@@ -154,20 +175,59 @@ def parse_battery(text: str) -> int | None:
     return max(0, min(100, int(value))) if value.isdigit() else None
 
 
+def paste_platform(board: Image.Image, layout: dict[str, int]) -> None:
+    """画站台: 台身 + 台面(竖直渐变) + 台面顶沿高光 + 脚底接触阴影。
+
+    分层顺序与 main/pet_ui.c 的 build_platform() 一一对应, 而且必须在宠物之前
+    调用 —— 真机上宠物压在台面之上, 预览也要一样, 否则脚会被台面盖掉。
+    """
+    plat_x, plat_w = layout["PLAT_X"], layout["PLAT_W"]
+
+    body = Image.new("RGBA", (plat_w, layout["PLAT_BODY_H"]),
+                     COLORS["COL_PLAT_BODY"] + (255,))
+    board.paste(body, (plat_x, layout["PLAT_BODY_Y"]),
+                rounded_mask(plat_w, layout["PLAT_BODY_H"], layout["PLAT_RADIUS"]))
+    ImageDraw.Draw(board).rounded_rectangle(
+        (plat_x, layout["PLAT_BODY_Y"],
+         plat_x + plat_w - 1, layout["PLAT_BODY_Y"] + layout["PLAT_BODY_H"] - 1),
+        radius=layout["PLAT_RADIUS"], outline=COLORS["COL_CARD_EDGE"], width=1)
+
+    # 台面: 台身色到台面色的竖直渐变, 用逐行填充做, 与 LV_GRAD_DIR_VER 等价。
+    floor_h = layout["PLAT_FLOOR_H"]
+    floor = Image.new("RGBA", (plat_w, floor_h), (0, 0, 0, 0))
+    paint = ImageDraw.Draw(floor)
+    top, bottom = COLORS["COL_PLAT_FLOOR"], COLORS["COL_PLAT_BODY"]
+    for row in range(floor_h):
+        t = row / max(floor_h - 1, 1)
+        color = tuple(round(a + (b - a) * t) for a, b in zip(top, bottom))
+        paint.line((0, row, plat_w - 1, row), fill=color + (255,))
+    board.paste(floor, (plat_x, layout["PLAT_FLOOR_Y"]),
+                rounded_mask(plat_w, floor_h, layout["PLAT_FLOOR_RADIUS"]))
+
+    ImageDraw.Draw(board).rounded_rectangle(
+        (plat_x + layout["PLAT_RIM_INSET"], layout["PLAT_FLOOR_Y"],
+         plat_x + plat_w - 1 - layout["PLAT_RIM_INSET"],
+         layout["PLAT_FLOOR_Y"] + layout["PLAT_RIM_H"] - 1),
+        radius=layout["PLAT_RIM_H"] // 2, fill=COLORS["COL_PLAT_RIM"])
+
+    shadow = Image.new("RGBA", (layout["SHADOW_W"], layout["SHADOW_H"]), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (0, 0, layout["SHADOW_W"] - 1, layout["SHADOW_H"] - 1),
+        radius=layout["SHADOW_H"] // 2, fill=(0, 0, 0, 102))   # LV_OPA_40
+    board.paste(shadow, (board.width // 2 - layout["SHADOW_W"] // 2,
+                         layout["SHADOW_Y"]), shadow)
+
+
 def render(scene: tuple, layout: dict[str, int], constants: dict[str, int],
            frames: list[dict], blob: bytes, frame_index: int | None,
-           battery_text: str = "82%") -> Image.Image:
-    key, status_text, dot_color, bubble_text, anim, asleep = scene
+           battery_text: str = "82%", body_line_height: int = 31) -> Image.Image:
+    key, status_text, dot_color, plate_text, anim, asleep = scene
 
     board = Image.new("RGB", (240, 320), COLORS["COL_BG"])
-
-    # 宠物卡片 + 舞台
     draw = ImageDraw.Draw(board)
-    draw.rounded_rectangle(
-        (layout["CARD_X"], layout["CARD_Y"],
-         layout["CARD_X"] + layout["CARD_W"] - 1,
-         layout["CARD_Y"] + layout["CARD_H"] - 1),
-        radius=24, fill=COLORS["COL_CARD"], outline=COLORS["COL_CARD_EDGE"], width=1)
+
+    # 宠物身下不再有底色; "地面"由站台和接触阴影交代。
+    paste_platform(board, layout)
 
     stage = Image.new("RGBA", (constants["PET_ATLAS_STAGE_W"],
                                constants["PET_ATLAS_STAGE_H"]), (0, 0, 0, 0))
@@ -227,20 +287,16 @@ def render(scene: tuple, layout: dict[str, int], constants: dict[str, int],
                    layout["STAGE_Y"] + layout["SLEEP_Y"]),
                   "Zzz", font=body_font, fill=COLORS["COL_ACCENT"])
 
-    # 文本气泡(两行高度, 居中)
-    line_height = 21          # pet_font_16 在设备上的行高
-    bubble_h = line_height * 2 + layout["BUBBLE_PAD"] * 2
-    draw.rounded_rectangle(
-        (layout["BUBBLE_X"], layout["BUBBLE_Y"],
-         layout["BUBBLE_X"] + layout["BUBBLE_W"] - 1,
-         layout["BUBBLE_Y"] + bubble_h - 1),
-        radius=16, fill=COLORS["COL_BUBBLE"],
-        outline=COLORS["COL_CARD_EDGE"], width=1)
-    color = COLORS["COL_INK"] if not bubble_text.startswith("等待 Codex") else COLORS["COL_MUTED"]
-    draw.text((layout["BUBBLE_X"] + layout["BUBBLE_W"] // 2
-               - text_width(draw, bubble_text, body_font) // 2,
-               layout["BUBBLE_Y"] + layout["BUBBLE_PAD"] + 2),
-              bubble_text, font=body_font, fill=color)
+    # 文本落在台身上: 真机上是一个 PLAT_TEXT_W x (行高x2) 的居中标签, 预览只画
+    # 一行。行高从生成字体里读, 所以字体换了这边也跟着走 —— 以前写死 21, 真机
+    # 是 31, 文本块的位置是碰巧对上的。
+    line_top = layout["PLAT_BODY_Y"] + layout["PLAT_TEXT_PAD"]
+    text_y = line_top + (body_line_height - body_font.size) // 2
+    color = COLORS["COL_INK"] if not plate_text.startswith("等待 Codex") else COLORS["COL_MUTED"]
+    draw.text((layout["PLAT_X"] + layout["PLAT_W"] // 2
+               - text_width(draw, plate_text, body_font) // 2,
+               text_y + 2),
+              plate_text, font=body_font, fill=color)
 
     # 与 BSP 一致的 30 px 圆角黑边(BSP_LVGL_SCREEN_RADIUS)
     mask = rounded_mask(240, 320, 30)
@@ -272,12 +328,19 @@ def main() -> int:
             print(f"缺少生成产物 {path}; 先运行 tools/gen_pet_assets.py")
             return 1
 
+    font_c = REPO_ROOT / "assets" / "fonts" / "pet_font_16.c"
+    if not font_c.exists():
+        print(f"缺少生成产物 {font_c}; 先运行 tools/gen_pet_fonts.py")
+        return 1
+
     layout = parse_layout(REPO_ROOT / "main" / "pet_ui.c")
     constants, frames = parse_atlas(header, source)
+    body_line_height = parse_font_line_height(font_c)
     # 床垫(bin)按需读: 2.4 MB, 一次读进来比反复 seek 简单。
     blob = blob_path.read_bytes()
     print(f"帧表 {len(frames)} 帧, blob {len(blob)} 字节, "
-          f"舞台 {constants['PET_ATLAS_STAGE_W']}x{constants['PET_ATLAS_STAGE_H']}")
+          f"舞台 {constants['PET_ATLAS_STAGE_W']}x{constants['PET_ATLAS_STAGE_H']}, "
+          f"正文行高 {body_line_height}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     rendered = 0
@@ -285,7 +348,7 @@ def main() -> int:
         if args.anim and scene[4] != args.anim:
             continue
         image = render(scene, layout, constants, frames, blob, args.frame,
-                       args.battery)
+                       args.battery, body_line_height)
         if args.scale > 1:
             image = image.resize((image.width * args.scale, image.height * args.scale),
                                  Image.NEAREST)
