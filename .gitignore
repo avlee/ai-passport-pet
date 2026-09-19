@@ -23,3 +23,6 @@ main/pet_config_local.h
 assets/pets/li-muwan/
 # 烧录前读回的设备原厂固件快照, 体积大且与源码无关
 backup/
+# Python 字节码缓存(tools/ 与 tests/ 下会生成)
+__pycache__/
+*.pyc
