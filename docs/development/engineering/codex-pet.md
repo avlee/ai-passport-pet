@@ -199,13 +199,16 @@ python3 tools/pet_bridge.py --no-pets                   # disable the whole feat
 
 ### The menu bar app (macOS)
 
-`tools/menubar/` wraps that server into a native menu bar app: the icon tracks the state, and the menu shows the bridge / device / battery / Codex / bubble status plus manual state pushes, bubble text and a log-following toggle. A "pets" submenu lists the pets available in Codex, ticks the one currently on the device, and swaps on selection (the transfer percentage appears in the status item title). The "python: ..." item marks whether that interpreter has Pillow and lets you pick another one; when none of them does, the pets submenu states the reason at the top and disables the pets that have not been packed yet, instead of letting you fail one pet at a time.
+`tools/menubar/` wraps that server into a native menu bar app: the icon tracks the state, and the menu shows the bridge / device / battery / Codex / bubble status plus manual state pushes, bubble text and a log-following toggle. A "pets" submenu lists the pets available in Codex, ticks the one currently on the device, and swaps on selection (the transfer percentage appears in the status item title). It has an "About" dialog that shows the interpreter the bridge runs on and whether it has Pillow, but **no way to edit it**: one wrong character in the path, or deleting that virtual environment later, shows up only as pet swapping failing, with no way back to the previous one. When no interpreter has Pillow, the pets submenu states the reason at the top and disables the pets that have not been packed yet, instead of letting you fail one pet at a time; to point at another interpreter, use `defaults write local.codex-pet.bridge pythonPath <path>` (`defaults delete` returns to auto-detection). See `tools/menubar/README.md`.
 
 ```bash
-./tools/menubar/build.sh --run
+./tools/menubar/build.sh --install    # build, install into /Applications, restart
+./tools/menubar/build.sh --run        # or just build and launch the build/menubar copy
 ```
 
-It needs nothing but `swiftc` from the Command Line Tools — no third-party dependency, no Xcode project. The app writes **no network traffic of its own**: it runs `pet_bridge.py` as a child process (relaunching it with backoff if it dies), then reads status and sends commands over the local channel below. Quitting the app also stops the child. See `tools/menubar/README.md` for the details.
+It needs nothing but `swiftc` from the Command Line Tools — no third-party dependency, no Xcode project. The app writes **no network traffic of its own**: it runs `pet_bridge.py` as a child process (relaunching it with backoff if it dies), then reads status and sends commands over the local channel below. Quitting the app also stops the child.
+
+The build copies `pet_bridge.py` and `gen_pet_package.py` into the bundle at `Contents/Resources/bridge/`, and compiles the bridge port in from the firmware header. The app **reads nothing from the source directory at runtime** — that bundled copy is its only script source, which is what lets it run from `/Applications`, or on a machine that never had this repo at all. Editing the script or the port therefore means rebuilding (`--install` replaces the installed copy and restarts in one step). `python3` and Pillow stay external requirements. See `tools/menubar/README.md` for the details.
 
 ### Control channel (`--control`)
 

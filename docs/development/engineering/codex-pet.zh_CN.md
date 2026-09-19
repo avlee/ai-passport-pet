@@ -236,9 +236,12 @@ python3 tools/pet_bridge.py --no-pets                   # 设备没刷 pets 分�
 `tools/menubar/` 把它包成一个原生菜单栏应用：图标随状态变化，点开能看到桥接 / 设备 /
 电量 / Codex / 气泡状态，并能手工推状态、发气泡文字、开关日志跟随；「宠物」子菜单列出
 Codex 里可用的宠物、勾出设备上当前那只，选中即换（传输进度显示在顶栏标题里，`43%` 这样）。
-菜单里的「python：…」那一项会标出当前解释器有没有 Pillow，点它可以换一个 —— 挑不到带
-Pillow 的解释器时，「宠物」子菜单会直接把原因写在顶上，并且禁掉那些还没打过包的宠物，
-而不是让用户点一只失败一只。
+菜单里的「关于」会显示桥接跑在哪个解释器上、它有没有 Pillow —— 但**没有**改它的入口：
+路径打错一个字符、或者那个虚拟环境后来被删掉，现象都只是「换宠物失败」，还找不回原来那个。
+挑不到带 Pillow 的解释器时，「宠物」子菜单会直接把原因写在顶上，并且禁掉那些还没打过包的
+宠物，而不是让用户点一只失败一只；要把解释器指到别处，用
+`defaults write local.codex-pet.bridge pythonPath <路径>`（`defaults delete` 回到自动
+探测），见 `tools/menubar/README.zh_CN.md`。
 
 ```bash
 ./tools/menubar/build.sh --run
@@ -246,8 +249,13 @@ Pillow 的解释器时，「宠物」子菜单会直接把原因写在顶上，�
 
 只依赖 Command Line Tools 里的 `swiftc`，没有第三方依赖，也不需要 Xcode 工程。
 应用本身**不写任何网络报文** —— 它把 `pet_bridge.py` 拉成子进程（崩了按退避重拉），
-再通过下面这条本地通道读状态、下命令；退出时会一并收掉子进程。细节见
-`tools/menubar/README.md`。
+再通过下面这条本地通道读状态、下命令；退出时会一并收掉子进程。
+
+构建时会把 `pet_bridge.py` 与 `gen_pet_package.py` 复制进应用包的
+`Contents/Resources/bridge/`，桥接端口也在构建期从固件头文件提取后编译进去。**应用在运行期
+不读源码目录** —— 那是应用唯一一处脚本来源，所以它被搬进 `/Applications`、或者装到一台
+根本没有这个仓库的机器上，都照样能跑。改完脚本或端口要重新 `build.sh`（`--install` 会连
+换装带重启）。`python3` 与 Pillow 仍是外部依赖。细节见 `tools/menubar/README.md`。
 
 ### 控制通道（`--control`）
 
