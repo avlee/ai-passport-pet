@@ -34,9 +34,30 @@ static void apply_defaults(pet_settings_t *settings)
     settings->port = (uint16_t)PET_BRIDGE_PORT;
 }
 
+// NVS 是这里的第一个使用者, 不能假设别处已经初始化过 —— 否则 nvs_open 只会
+// 返回 ESP_ERR_NVS_NOT_INITIALIZED, NVS 覆盖路径永远读不到, 看起来又像"配置没生效"。
+//
+// 分区损坏(无空闲页 / 版本不符)时不擦除: 擦掉的是用户数据, 而编译期默认值本来
+// 就能兜住, 没必要为此冒险。这里只报错并让调用方退回默认值。
+static bool ensure_nvs(void)
+{
+    const esp_err_t err = nvs_flash_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS 初始化失败(%s), 无法读取 NVS 覆盖配置",
+                 esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
 esp_err_t pet_settings_load(pet_settings_t *out)
 {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
+
+    if (!ensure_nvs()) {
+        apply_defaults(out);
+        return ESP_OK;
+    }
 
     nvs_handle_t handle;
     esp_err_t err = nvs_open(PET_NVS_NAMESPACE, NVS_READWRITE, &handle);
