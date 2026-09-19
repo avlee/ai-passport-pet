@@ -20,6 +20,7 @@ This directory contains AI Passport engineering rules and reusable workflows, gr
 - [lvgl-chinese-fonts.md](engineering/lvgl-chinese-fonts.md): step-by-step CJK configuration, font generation/linking, fallback examples, glyph checks, and troubleshooting.
 - [codex-pet.md](engineering/codex-pet.md): the Codex Pet application (v2 atlas format and generation, animation driver, state→animation mapping, wire protocol, the Mac-side Pet Bridge, configuration and flashing).
 - [wifi-provisioning.md](engineering/wifi-provisioning.md): Bluetooth-based Wi-Fi setup using the BLUFI reference branch, the companion mini program, and integration checks.
+- [upstream-sync.md](engineering/upstream-sync.md): how this downstream repository picks up official changes, which files conflict during a sync, and why the CI sync job cannot apply here.
 
 ## CI
 

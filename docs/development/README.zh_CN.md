@@ -29,6 +29,7 @@
 - [lvgl-chinese-fonts.zh_CN.md](engineering/lvgl-chinese-fonts.zh_CN.md)：CJK 配置、字体生成/链接、fallback 示例、缺字检查和故障排查的分步指南。
 - [codex-pet.zh_CN.md](engineering/codex-pet.zh_CN.md)：Codex 宠物应用（v2 图集格式与生成、动画驱动、状态→动作映射、线路协议、Mac 侧 Pet Bridge、配置与烧录）。
 - [wifi-provisioning.zh_CN.md](engineering/wifi-provisioning.zh_CN.md)：参考 BLUFI 分支实现蓝牙 Wi-Fi 配网，包含配套小程序名称及接入检查。
+- [upstream-sync.zh_CN.md](engineering/upstream-sync.zh_CN.md)：这个下游仓库如何同步官方改动、同步时会撞在哪些文件上，以及自带的 CI 同步任务为什么在这里用不上。
 
 ## CI（ci）
 
