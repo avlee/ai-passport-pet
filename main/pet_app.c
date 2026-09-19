@@ -143,6 +143,7 @@ static void battery_task(void *arg)
                 ESP_LOGW(TAG, "连续 %u 次读电量失败, 改为显示未知", failures);
                 s_last_soc = -1;
                 pet_ui_set_battery(-1);
+                (void)pet_bridge_notify_battery(-1);   // 菜单栏跟着回到"未知"
                 failures = 0;
             }
         } else {
@@ -151,6 +152,8 @@ static void battery_task(void *arg)
                 ESP_LOGI(TAG, "电量 %d%%", soc);
                 s_last_soc = soc;
                 pet_ui_set_battery(soc);
+                // 顺手报给 Mac: 菜单栏也显示电量。未连线时是空操作。
+                (void)pet_bridge_notify_battery(soc);
             }
         }
 

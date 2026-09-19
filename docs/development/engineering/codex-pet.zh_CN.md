@@ -108,9 +108,12 @@ Mac → 设备：
 
 ```json
 {"type":"hello","fw":"0.1.0","pet":"sophie-portrait"}
+{"type":"battery","soc":95}
 {"type":"pong"}
 {"type":"poke"}
 ```
+
+`battery` 在电量变化时上报，`soc` 为 `null` 表示读不到；链路重连后会紧跟 `hello` 补发一次已知值，否则菜单栏在下一次电量刷新（最多 5 秒）之前只能显示未知。
 
 解析是**有界且宽容**的：单行上限 `PET_PROTOCOL_LINE_MAX`（512 字节）、文本字段上限 `PET_PROTOCOL_TEXT_MAX`（192 字节），超长行丢弃并在下一个换行处重新同步，未知字段忽略，UTF-8 只在字符边界上截断。设备是 TCP 客户端、Mac 是服务端，所以设备侧不需要接受入站连接，也不依赖 mDNS 发现。
 
@@ -145,7 +148,7 @@ python3 tools/pet_bridge.py --list-sessions
 ### 菜单栏应用（macOS）
 
 `tools/menubar/` 把它包成一个原生菜单栏应用：图标随状态变化，点开能看到桥接 / 设备 /
-Codex / 气泡状态，并能手工推状态、发气泡文字、开关日志跟随。
+电量 / Codex / 气泡状态，并能手工推状态、发气泡文字、开关日志跟随。
 
 ```bash
 ./tools/menubar/build.sh --run
@@ -165,8 +168,8 @@ python3 tools/pet_bridge.py --control "$HOME/Library/Application Support/CodexPe
 ```
 
 连上来先收到一条 `snapshot`（全部当前状态），之后是增量事件：`bridge` / `link` /
-`state` / `text` / `session` / `watch` / `device` / `error`。命令有 `state`、`text`、
-`raw`、`watch`、`snapshot`、`ping`。
+`state` / `text` / `session` / `watch` / `device` / `battery` / `error`。命令有
+`state`、`text`、`raw`、`watch`、`snapshot`、`ping`。
 
 这是一条**事件流**，不是一问一答：命令成功不回执，结果以对应事件广播出来，只有出错
 才会多收到一条 `error` —— 客户端按事件更新状态即可，不要去配「发一条收一条」。

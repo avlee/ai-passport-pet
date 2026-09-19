@@ -306,6 +306,20 @@ def test_control_channel_drives_the_device() -> None:
             event = json.loads(reader.readline())
             assert event == {"event": "device", "kind": "hello", "fw": "0.1.0",
                              "pet": "sophie-portrait"}, event
+
+            # 电量走独立事件名: 挤在 device 里会把上面那条 hello 顶掉(ControlHub
+            # 每类事件只留最新一份), 菜单栏就再也看不到固件和宠物包了。
+            writer_end.sendall(b'{"type":"battery","soc":95}\n')
+            event = json.loads(reader.readline())
+            assert event == {"event": "battery", "soc": 95}, event
+
+            # 设备读不到电量时发 soc=null; 越界的值也按"读不到"处理, 不能原样透给 GUI。
+            for payload in (b'{"type":"battery","soc":null}\n',
+                            b'{"type":"battery","soc":150}\n',
+                            b'{"type":"battery"}\n'):
+                writer_end.sendall(payload)
+                event = json.loads(reader.readline())
+                assert event == {"event": "battery", "soc": None}, event
             writer_end.close()
         finally:
             if client is not None:

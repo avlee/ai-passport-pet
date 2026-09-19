@@ -49,6 +49,7 @@ Codex 会把每一轮对话写成 rollout JSONL: ~/.codex/sessions/YYYY/MM/DD/ro
     session  跟随的会话文件      name, path
     watch    是否跟随日志        enabled
     device   设备上报            kind(hello/poke), fw, pet
+    battery  设备电量            soc(0..100, null 表示读不到)
     pong     ping 的回应
     error    命令出错            message
 
@@ -389,7 +390,7 @@ def serve(link: DeviceLink, bind: str, port: int) -> None:
 
 
 def read_device(link: DeviceLink, conn: socket.socket) -> None:
-    """读设备发回来的消息(hello / pong / poke)。"""
+    """读设备发回来的消息(hello / battery / poke / pong)。"""
     buffer = b""
     try:
         while True:
@@ -419,6 +420,14 @@ def read_device(link: DeviceLink, conn: socket.socket) -> None:
                 elif mtype == "poke":
                     print("[recv] 用户戳了宠物一下", flush=True)
                     link._publish({"event": "device", "kind": "poke"})
+                elif mtype == "battery":
+                    # 单独一个事件名, 不并进 device: ControlHub 每类只留最新一份,
+                    # 挤在 device 里会把 hello 报上来的固件/宠物包顶掉。
+                    soc = message.get("soc")
+                    if not isinstance(soc, int) or not 0 <= soc <= 100:
+                        soc = None
+                    print(f"[recv] 电量 {soc if soc is not None else '未知'}", flush=True)
+                    link._publish({"event": "battery", "soc": soc})
                 elif mtype != "pong":
                     print(f"[recv] {message}", flush=True)
     except OSError:

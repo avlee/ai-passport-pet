@@ -37,5 +37,11 @@ esp_err_t pet_bridge_stop(void);
 // 未连接时返回 ESP_ERR_INVALID_STATE。
 esp_err_t pet_bridge_notify(const char *type, const char *text);
 
+// 上报电池电量(0..100;-1 表示读不到, 会发 soc=null)。
+// 除了立刻发一条, 还会记住这个值: 链路重连后紧跟 hello 补发一次, 否则菜单栏
+// 要在下一次电量变化(最多 5 秒一拍)之前一直显示"未知"。
+// 未连接时不算错误, 只是没人接收。
+esp_err_t pet_bridge_notify_battery(int soc_percent);
+
 // 当前是否已连接(供 UI 查询)。
 bool pet_bridge_is_online(void);

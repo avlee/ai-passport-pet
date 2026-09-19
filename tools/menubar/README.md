@@ -34,11 +34,11 @@ Once launched, the icon appears on the right side of the menu bar. **Having no D
 | ✅ (`checkmark.circle.fill`) | the turn finished |
 | ❌ (`xmark.octagon.fill`) | failed |
 
-Hovering shows the current state and bubble text.
+Hovering shows the current state, the pack level, and the bubble text.
 
 ## Menu items
 
-- **Bridge / Device / Codex / Bubble / Session**: read-only status rows. When the device is not connected the row reminds you to check that it is on the same 2.4 GHz network.
+- **Bridge / Device / Battery / Codex / Bubble / Session**: read-only status rows. When the device is not connected the row reminds you to check that it is on the same 2.4 GHz network. The battery row is hidden until the device reports a level — it comes from the CW2017 gauge over the same link, and it is dropped again on disconnect so a stale reading is never shown; 20% or below adds a warning prefix.
 - **Push state**: manually push idle / working / waiting / ready / failed, so demos and debugging do not need a terminal. A manual state wins over log inference until the next Codex event arrives.
 - **Send bubble text…** (⌘T): changes only the one line shown on the device, not the state.
 - **Follow Codex session log**: when off, the bridge stops reading `~/.codex/sessions` and states come only from manual commands.

@@ -108,9 +108,12 @@ Device → Mac:
 
 ```json
 {"type":"hello","fw":"0.1.0","pet":"sophie-portrait"}
+{"type":"battery","soc":95}
 {"type":"pong"}
 {"type":"poke"}
 ```
+
+`battery` is sent whenever the level changes, with `soc` set to `null` when it cannot be read. After a reconnect the last known value is re-sent right after `hello`; otherwise the menu bar would show nothing until the next poll (up to 5 seconds).
 
 Parsing is **bounded and forgiving**: a per-line limit of `PET_PROTOCOL_LINE_MAX` (512 bytes) and a text-field limit of `PET_PROTOCOL_TEXT_MAX` (192 bytes), overlong lines are dropped and resynchronised at the next newline, unknown fields are ignored, and UTF-8 is only truncated on character boundaries. The device is the TCP client and the Mac is the server, so the device never needs to accept inbound connections and does not depend on mDNS discovery.
 
@@ -144,7 +147,7 @@ The server pings every 5 s, comfortably faster than the device's 12 s idle check
 
 ### The menu bar app (macOS)
 
-`tools/menubar/` wraps that server into a native menu bar app: the icon tracks the state, and the menu shows the bridge / device / Codex / bubble status plus manual state pushes, bubble text and a log-following toggle.
+`tools/menubar/` wraps that server into a native menu bar app: the icon tracks the state, and the menu shows the bridge / device / battery / Codex / bubble status plus manual state pushes, bubble text and a log-following toggle.
 
 ```bash
 ./tools/menubar/build.sh --run
@@ -160,7 +163,7 @@ A local channel for GUI front ends: AF_UNIX plus JSON lines, both directions.
 python3 tools/pet_bridge.py --control "$HOME/Library/Application Support/CodexPetBridge/bridge.sock"
 ```
 
-A new client first receives a `snapshot` (the whole current state) and then incremental events: `bridge`, `link`, `state`, `text`, `session`, `watch`, `device`, `error`. Commands are `state`, `text`, `raw`, `watch`, `snapshot` and `ping`.
+A new client first receives a `snapshot` (the whole current state) and then incremental events: `bridge`, `link`, `state`, `text`, `session`, `watch`, `device`, `battery`, `error`. Commands are `state`, `text`, `raw`, `watch`, `snapshot` and `ping`.
 
 This is an **event stream, not request/response**: a successful command sends no acknowledgement — its result is broadcast as the matching event — and only failures add an `error`. Clients should update state from events rather than pairing a send with a receive. The authoritative definition of the wire format remains the handful of JSON messages sent to the device above; the control channel only observes and drives, and adds no downstream traffic.
 

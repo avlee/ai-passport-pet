@@ -10,6 +10,8 @@
 //
 //   设备 -> Mac  (由 pet_bridge.c 生成)
 //     {"type":"hello","fw":"0.1.0","pet":"sophie-portrait","state":"idle"}
+//     {"type":"battery","soc":95}      电量变化时上报; soc 为 null 表示读不到
+//     {"type":"poke"}                  用户戳了宠物一下
 //     {"type":"pong"}
 //
 // 解析必须是「有界且宽容」的: 单行长度、字段长度都有上限, 未知字段直接忽略,

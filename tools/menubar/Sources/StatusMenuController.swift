@@ -15,6 +15,7 @@ final class StatusMenuController: NSObject {
     // 会让高亮跳动。
     private let bridgeItem = NSMenuItem()
     private let deviceItem = NSMenuItem()
+    private let batteryItem = NSMenuItem()
     private let codexItem = NSMenuItem()
     private let bubbleItem = NSMenuItem()
     private let sessionItem = NSMenuItem()
@@ -51,16 +52,18 @@ final class StatusMenuController: NSObject {
     private func buildMenu() {
         menu.autoenablesItems = false
 
-        for item in [bridgeItem, deviceItem, codexItem,
+        for item in [bridgeItem, deviceItem, batteryItem, codexItem,
                      bubbleItem, sessionItem, errorItem, repoItem] {
             item.isEnabled = false
         }
+        batteryItem.isHidden = true
         bubbleItem.isHidden = true
         sessionItem.isHidden = true
         errorItem.isHidden = true
 
         menu.addItem(bridgeItem)
         menu.addItem(deviceItem)
+        menu.addItem(batteryItem)
         menu.addItem(codexItem)
         menu.addItem(bubbleItem)
         menu.addItem(sessionItem)
@@ -149,6 +152,16 @@ final class StatusMenuController: NSObject {
             deviceItem.title = "设备：控制通道未就绪"
         }
 
+        // 电量只有设备主动上报过才有; 读不到(或还没收到)就把这一行藏掉,
+        // 而不是显示一个可能过期的数字。
+        if let battery = snapshot.batteryLabel {
+            batteryItem.title = snapshot.batteryIsLow ? "⚠︎ 电量：\(battery)"
+                                                      : "电量：\(battery)"
+            batteryItem.isHidden = false
+        } else {
+            batteryItem.isHidden = true
+        }
+
         var codex = "Codex：\(snapshot.codexStateLabel)"
         if !snapshot.stateSource.isEmpty {
             codex += "（\(snapshot.stateSource == "manual" ? "手工" : "日志")）"
@@ -199,6 +212,9 @@ final class StatusMenuController: NSObject {
     private func tooltip(for snapshot: BridgeSnapshot) -> String {
         if !snapshot.deviceConnected { return "Codex 宠物：设备未连接" }
         var text = "Codex 宠物：\(snapshot.codexStateLabel)"
+        if let battery = snapshot.batteryLabel {
+            text += "\n电量：\(battery)"
+        }
         if !snapshot.bubbleText.isEmpty { text += "\n\(snapshot.bubbleText)" }
         return text
     }
@@ -262,6 +278,7 @@ final class StatusMenuController: NSObject {
             "跟随会话: \(snapshot.sessionName.isEmpty ? "-" : snapshot.sessionName)",
             "固件: \(snapshot.firmware.isEmpty ? "-" : snapshot.firmware)",
             "宠物包: \(snapshot.petPackage.isEmpty ? "-" : snapshot.petPackage)",
+            "电量: \(snapshot.batteryLabel ?? "-")",
         ]
         if let error = snapshot.lastError { lines.append("最后错误: \(error)") }
         let tail = supervisor.logTail(lines: 15)

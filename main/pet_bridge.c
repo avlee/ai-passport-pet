@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -181,6 +182,26 @@ static void send_hello(void)
     }
 }
 
+// 最后一次成功读到的电量。INT_MIN = 还没读到过, 重连时不必补发。
+static atomic_int s_last_soc = ATOMIC_VAR_INIT(INT_MIN);
+
+static esp_err_t send_battery(int soc)
+{
+    char line[64];
+    if (soc < 0) {
+        snprintf(line, sizeof(line), "{\"type\":\"battery\",\"soc\":null}\n");
+    } else {
+        snprintf(line, sizeof(line), "{\"type\":\"battery\",\"soc\":%d}\n", soc);
+    }
+    return send_line(line);
+}
+
+esp_err_t pet_bridge_notify_battery(int soc_percent)
+{
+    atomic_store(&s_last_soc, soc_percent);
+    return send_battery(soc_percent);
+}
+
 // ---------------------------------------------------------------------------
 // 连接流程
 // ---------------------------------------------------------------------------
@@ -346,6 +367,12 @@ static void bridge_task(void *arg)
         // 顺序反了 hello 会被自己挡掉(实测就是这条一直发不出去)。
         set_online(true);
         send_hello();
+        // 补发一次已知电量: 对端刚连上, 手里还没有任何读数, 而电量最多 5 秒
+        // 才刷新一次 —— 不补发的话菜单栏会先空一段。
+        const int known_soc = atomic_load(&s_last_soc);
+        if (known_soc != INT_MIN) {
+            (void)send_battery(known_soc);
+        }
 
         while (!atomic_load(&s_stop) && generation == s_generation) {
             if (!pump_socket(&protocol, &last_rx_us)) break;

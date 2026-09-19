@@ -15,6 +15,7 @@ struct BridgeSnapshot {
     var devicePeer = ""
     var firmware = ""
     var petPackage = ""
+    var batterySoc: Int?
     var codexState = "idle"
     var bubbleText = ""
     var stateSource = ""
@@ -25,6 +26,15 @@ struct BridgeSnapshot {
     var lastError: String?
 
     var bridgeRunning: Bool { bridgePid != nil }
+
+    /// 电量说法。读不到时返回 nil(菜单里那一行直接藏起来)。
+    var batteryLabel: String? {
+        guard let batterySoc else { return nil }
+        return "\(batterySoc)%"
+    }
+
+    /// 低电量(<=20%), 菜单里加个警示前缀。
+    var batteryIsLow: Bool { (batterySoc ?? 100) <= 20 }
 
     /// Codex 状态的中文说法。
     var codexStateLabel: String {
@@ -236,7 +246,11 @@ final class BridgeSupervisor {
             case "link":
                 snapshot.deviceConnected = (event["connected"] as? Bool) ?? false
                 snapshot.devicePeer = (event["peer"] as? String) ?? ""
-                if !snapshot.deviceConnected { snapshot.bubbleText = "" }
+                if !snapshot.deviceConnected {
+                    snapshot.bubbleText = ""
+                    // 设备走了, 最后那个读数就不再是"当前电量", 别挂在那里骗人。
+                    snapshot.batterySoc = nil
+                }
 
             case "state":
                 if let state = event["state"] as? String { snapshot.codexState = state }
@@ -245,6 +259,11 @@ final class BridgeSupervisor {
 
             case "text":
                 snapshot.bubbleText = (event["text"] as? String) ?? ""
+
+            case "battery":
+                // soc 为 null 表示设备读不到电量; JSONSerialization 给的也是 NSNull,
+                // 转 Int 失败, 正好落到 nil。
+                snapshot.batterySoc = event["soc"] as? Int
 
             case "session":
                 snapshot.sessionName = (event["name"] as? String) ?? ""
