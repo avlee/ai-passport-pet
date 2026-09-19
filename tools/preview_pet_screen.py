@@ -15,6 +15,7 @@
     python3 tools/preview_pet_screen.py                       # 每个状态一张
     python3 tools/preview_pet_screen.py --anim working        # 只画指定动作
     python3 tools/preview_pet_screen.py --frame 3             # 画该动作的第 3 帧
+    python3 tools/preview_pet_screen.py --battery 95%         # 指定顶栏电量
     python3 tools/preview_pet_screen.py --out-dir /tmp/preview
 """
 
@@ -147,8 +148,15 @@ def rounded_mask(width: int, height: int, radius: int) -> Image.Image:
     return mask
 
 
+def parse_battery(text: str) -> int | None:
+    """把 --battery 的取值转成 0..100 的整数; "--" 这类写法代表未知。"""
+    value = text.strip().rstrip("%").strip()
+    return max(0, min(100, int(value))) if value.isdigit() else None
+
+
 def render(scene: tuple, layout: dict[str, int], constants: dict[str, int],
-           frames: list[dict], blob: bytes, frame_index: int | None) -> Image.Image:
+           frames: list[dict], blob: bytes, frame_index: int | None,
+           battery_text: str = "82%") -> Image.Image:
     key, status_text, dot_color, bubble_text, anim, asleep = scene
 
     board = Image.new("RGB", (240, 320), COLORS["COL_BG"])
@@ -184,13 +192,17 @@ def render(scene: tuple, layout: dict[str, int], constants: dict[str, int],
     draw.text((layout["STATUS_X"], layout["STATUS_Y"] - 4), status_text,
               font=title_font, fill=COLORS["COL_INK"])
 
-    # 电量: 82% 作为示意值
+    # 电量: 文字与填充比例都跟着 --battery 走, 默认 82% 只是示意值。
+    # 未读数时固件显示 "--" 且填充不可见, 这里保持一致, 方便和真机对照。
     body_font = load_font(16)
-    battery = "82%"
+    soc = parse_battery(battery_text)
+    battery_color = ("COL_GOOD" if soc is None or soc >= 50
+                     else "COL_WARN" if soc >= 20 else "COL_BAD")
     draw.text((layout["BAT_TEXT_X"] + layout["BAT_TEXT_W"]
-               - text_width(draw, battery, body_font),
+               - text_width(draw, battery_text, body_font),
                layout["BAT_TEXT_Y"] - 1),
-              battery, font=body_font, fill=COLORS["COL_GOOD"])
+              battery_text, font=body_font,
+              fill=COLORS["COL_MUTED" if soc is None else battery_color])
     draw.rounded_rectangle(
         (layout["BAT_BODY_X"], layout["BAT_BODY_Y"],
          layout["BAT_BODY_X"] + layout["BAT_BODY_W"] - 1,
@@ -201,12 +213,13 @@ def render(scene: tuple, layout: dict[str, int], constants: dict[str, int],
          layout["BAT_CAP_X"] + layout["BAT_CAP_W"] - 1,
          layout["BAT_CAP_Y"] + layout["BAT_CAP_H"] - 1),
         radius=1, fill=COLORS["COL_MUTED"])
-    fill_w = int(layout["BAT_FILL_MAX_W"] * 0.82)
-    draw.rounded_rectangle(
-        (layout["BAT_FILL_X"], layout["BAT_FILL_Y"],
-         layout["BAT_FILL_X"] + fill_w - 1,
-         layout["BAT_FILL_Y"] + layout["BAT_FILL_H"] - 1),
-        radius=1, fill=COLORS["COL_GOOD"])
+    if soc is not None:
+        fill_w = max(int(layout["BAT_FILL_MAX_W"] * soc / 100), 1)
+        draw.rounded_rectangle(
+            (layout["BAT_FILL_X"], layout["BAT_FILL_Y"],
+             layout["BAT_FILL_X"] + fill_w - 1,
+             layout["BAT_FILL_Y"] + layout["BAT_FILL_H"] - 1),
+            radius=1, fill=COLORS[battery_color])
 
     # 睡眠标记
     if asleep:
@@ -246,6 +259,8 @@ def main() -> int:
                         default=REPO_ROOT / "assets" / "pets"
                         / "sophie-portrait" / "preview")
     parser.add_argument("--scale", type=int, default=2, help="输出放大倍数")
+    parser.add_argument("--battery", default="82%",
+                        help="顶栏电量, 如 95%% 或 -- (表示未读到)")
     args = parser.parse_args()
 
     slug = args.pet_id.replace("-", "_")
@@ -269,7 +284,8 @@ def main() -> int:
     for scene in SCENES:
         if args.anim and scene[4] != args.anim:
             continue
-        image = render(scene, layout, constants, frames, blob, args.frame)
+        image = render(scene, layout, constants, frames, blob, args.frame,
+                       args.battery)
         if args.scale > 1:
             image = image.resize((image.width * args.scale, image.height * args.scale),
                                  Image.NEAREST)
