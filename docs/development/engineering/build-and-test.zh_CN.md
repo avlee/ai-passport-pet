@@ -140,6 +140,12 @@ cc -std=c11 -Wall -Wextra -Werror -Imain \
 
 完整验证要求预先激活 ESP-IDF 5.5.3。CI 与本地使用同一脚本；若 CI 和本地行为不同，应先修复脚本或环境，而不是维护两份命令。
 
+`--static` 里有一条 `tests/test_pet_package.py`，其中「从真图集切帧成 `.pet`」那一段需要 Pillow。脚本会**优先挑一个带 Pillow 的解释器**（先看 PATH 上的 `python3`，所以激活过的 venv 会被直接命中），挑不到就照常跑，但会**明确打印**哪一段被跳过了 —— 门禁全绿不等于那段代码被执行过。要指定解释器用 `PET_PYTHON`（给了就照用，不再探测）：
+
+```bash
+PET_PYTHON=/path/to/venv/bin/python3 ./tools/validate.sh --static
+```
+
 涉及物理外设的改动必须在真机运行硬件指南验收清单，并把“编译通过”与“硬件验证通过”分开记录。
 
 社区只能上传验证通过的 `build/FoloToy-AI-Passport-full.bin`，不得上传应用单镜像

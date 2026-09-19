@@ -164,6 +164,12 @@ Use the unified validation entry point:
 
 CI calls the same script. Fix the shared script or environment if local and CI behavior differs; do not duplicate command sequences in workflows.
 
+`--static` includes `tests/test_pet_package.py`, whose "slice a real atlas into a `.pet`" stage needs Pillow. The script **prefers an interpreter that has Pillow** (it tries `python3` on `PATH` first, so an activated venv is picked up directly). When none is found it still runs, but it **prints explicitly** which stage was skipped — a green gate does not mean that code executed. Use `PET_PYTHON` to name an interpreter (it is used verbatim, with no probing):
+
+```bash
+PET_PYTHON=/path/to/venv/bin/python3 ./tools/validate.sh --static
+```
+
 Hardware-affecting changes must also run the applicable on-device checklist in the hardware guide. Report compilation separately from physical-device validation.
 
 Never upload the app-only `build/FoloToy-AI-Passport.bin` to the community. Only

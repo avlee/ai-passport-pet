@@ -14,6 +14,7 @@ This is the application delivered on the `feature/codex-pet` branch. It does not
 - Top row: a status dot plus status text (offline / connecting / idle / working / waiting / ready / failed) on the left, battery on the right.
 - A platform at the bottom, carrying the text Codex pushed as its front face; when there is no text it shows a placeholder for the current state. Its floor edge is pinned to the pet's feet (stage bottom row), so the pet reads as standing on it.
 - Sleep (link down): the pet is dimmed to 40%, frame timing slows to 250%, backlight drops to 45%, and `Zzz` appears in the top-right of the stage.
+- With an empty slot, the stage shows "no pet yet" centred and the platform says "install one from the menu bar app" — the layout is identical to the reference pet's, so "empty" reads as a state rather than as "failed to boot".
 
 Buttons:
 
@@ -33,47 +34,78 @@ Hardware stays in `components/bsp`; the application lives entirely in `main/`:
 | --- | --- |
 | `main/main.c` | Entry point: I2C and display/LVGL init, then hands over to `pet_app` |
 | `main/pet_app.c` | Application wiring: buttons, battery polling, bridge events, string coverage self-check |
-| `main/pet_ui.c` | Pet screen and animation driver (the single draw entry point) |
+| `main/pet_ui.c` | Pet screen and animation driver (the single draw entry point), plus the transfer screen used while swapping pets |
 | `main/pet_state.c` | Link/Codex state → animation row mapping (pure logic) |
 | `main/pet_protocol.c` | Wire-protocol parser (pure logic) |
-| `main/pet_bridge.c` | Wi-Fi STA + TCP client + backoff reconnect |
+| `main/pet_pkg.c` | `.pet` package structural parsing and validation (pure logic) |
+| `main/pet_slot.c` | The `pets` partition: erase, write, mmap, validate |
+| `main/pet_layout.c` | Layout: stage centring, foot-on-platform alignment, per-frame landing (pure logic) |
+| `main/pet_bridge.c` | Wi-Fi STA + TCP client + backoff reconnect + package intake |
 | `main/pet_settings.c` | NVS persistence for connection parameters |
-| `main/pet_atlas.c` | Atlas access layer wrapping frame tables into `lv_image_dsc_t` |
-| `main/pet_atlas_validate.c` | Atlas self-consistency validation (pure logic) |
+| `main/pet_atlas.c` | Atlas access layer wrapping the slot's frame tables into `lv_image_dsc_t` |
 | `main/pet_config.h` | Compile-time defaults (SSID / bridge endpoint / timeouts / backlight) |
 | `main/pet_strings.h` | Single source of truth for UI strings (X-macro list shared by self-check and tests) |
 | `main/pet_fonts.c` | Application font entry points (16 px body / 20 px title + fallback) |
 | `main/demo_menu.c` | The original `main.c` demo menu, moved verbatim into its own file |
 
-`pet_state.c`, `pet_protocol.c`, `pet_atlas_validate.c`, and `pet_strings.h` deliberately do not depend on ESP-IDF or LVGL, so they run under host unit tests.
+`pet_state.c`, `pet_protocol.c`, `pet_pkg.c`, `pet_layout.c`, and `pet_strings.h` deliberately do not depend on ESP-IDF or LVGL, so they run under host unit tests.
 
-## Pet atlas (v2 format)
+## The pet package (`.pet`) and single-slot swapping
 
-The source is a ChatGPT / Codex v2 pet atlas: 1536×2288 WebP, 8 columns × 11 rows, 192×208 cells. The 57 frames cover 9 state animations (idle 6, running_right 8, running_left 8, waving 4, jumping 5, failed 8, waiting 6, running 6, review 6), each frame carrying its own duration in milliseconds.
+The pet is **no longer compiled into the firmware**. It is a self-describing package living in its own `pets` partition, pushed there by the Mac-side Pet Bridge over the same TCP link — so swapping a pet neither recompiles nor reflashes anything.
 
-Generate the firmware assets:
+The source material is still a ChatGPT / Codex v2 pet atlas: 1536×2288 WebP, 8 columns × 11 rows, 192×208 cells. The 57 frames cover 9 state animations (idle 6, running_right 8, running_left 8, waving 4, jumping 5, failed 8, waiting 6, running 6, review 6), each frame carrying its own duration in milliseconds.
+
+Building a package (byte-for-byte against `main/pet_pkg.h` on the device side):
 
 ```bash
-python3 tools/gen_pet_assets.py \
-    --atlas assets/pets/<pet-id>/spritesheet.webp \
-    --pet-id <pet-id> \
-    --out-bin main/assets/pet_<pet>_portrait.bin \
-    --out-header main/pet_atlas_<pet>_portrait.h \
-    --out-source main/pet_atlas_<pet>_portrait.c \
-    --preview-dir assets/pets/<pet-id>/preview
+python3 tools/gen_pet_package.py --list                    # what is under ~/.codex/pets
+python3 tools/gen_pet_package.py --pet sophie-portrait     # writes build/pets/<id>.pet
+python3 tools/gen_pet_package.py --pet ~/.codex/pets/sophie --out /tmp/s.pet
 ```
+
+| Offset | Contents |
+| --- | --- |
+| `+0` | 120-byte header: magic `PET1`, version, total size, frame and state counts, stage union, `pet_id`, `display_name` |
+| `+frames_offset` | Frame table, `frame_count × 16` bytes (offset + x/y/w/h + duration) |
+| `+states_offset` | State table, `state_count × 20` bytes (name + first frame + frame count) |
+| `+blob_offset` | Per-frame RGB565A8 pixels |
+
+Each of the three regions has its own CRC32: header, tables (frame and state tables laid out as one contiguous run), and pixels. Keeping the tables contiguous is deliberate — one CRC then covers both, and a misplaced state table is the hardest failure to spot on screen.
 
 Notes:
 
-- **Per-frame tight crops.** The character occupies only 54–129 px of the 192 px cell, so cropping to the non-transparent bounding box and remembering the crop offset is pixel-identical to whole cells while using roughly 3× less flash.
+- **Per-frame tight crops.** The character occupies only 54–129 px of the 192 px cell, so cropping to the non-transparent bounding box while remembering the crop origin is pixel-identical to whole cells while using roughly 3× less space.
 - **RGB565A8 pixel format** (2 colour bytes + 1 alpha byte, 3 bytes per pixel) so LVGL can blend transparency. `stride = w * 2` with the alpha plane right after the colour plane — see `img_width_to_stride()` in `lvgl/src/draw/lv_image_decoder.c`.
-- Current pet `sophie-portrait`: 57 frames, 2,551,288 bytes (2.43 MiB), 129×198 draw stage.
+- **The stage is computed at runtime.** The header records the union of every frame's crop box (129×198 for the reference pet, `sophie-portrait`), and `pet_layout_for_stage()` centres it horizontally and derives its top edge by aligning the pet's feet with the platform — so a wider or taller pet stands on the same platform instead of dragging it around. A package whose stage falls outside the usable range (`main/pet_layout.h`) is refused at load time rather than drawn out of bounds.
+- Current pet `sophie-portrait`: 57 frames, 2,551,288 bytes (2.43 MiB), 129×198 stage.
+
+### Slot semantics
+
+The `pets` partition holds exactly one pet (see [firmware-layout](firmware-layout.md)), so swapping is an **overwrite**, not a side-by-side install:
+
+1. The device erases the header first and only then writes the package in chunks, so "erased halfway" and "empty slot" are the same state — a half-written package is never mistaken for a valid one.
+2. Losing power or the link mid-transfer leaves the slot **empty**, and the device shows "no pet yet / install one from the menu bar app". There is no rollback; just send it again.
+3. Before finishing, the device checks the declared length and the whole-package CRC32, then `esp_partition_mmap`s **only the bytes the package actually occupies** and unmaps immediately — mapping the full 3.94 MB would burn MMU pages it shares with the app's rodata.
+4. On success the device re-sends `hello`, whose `pet` field reports the pet that is **actually** in the slot.
+
+While the transfer runs the device shows a different screen (below), because the pet UI has to be torn down first: `lv_image` is still referencing the flash that is about to be rewritten.
+
+### The pet transfer screen
+
+Swapping a pet means tearing the whole pet UI down first: `lv_image` references memory mapped from the very flash being rewritten, and mapping while erasing is undefined behaviour. But the screen must not sit black either — a 1–3 MB package takes tens of seconds over 2.4 GHz Wi-Fi, and a user who cannot tell whether the device is working will pull the plug, leaving half a package behind.
+
+So this screen goes up instead: title, pet id, progress bar, one status line. It references no atlas pixels, which is why it can outlive the unmapping. Its layout constants are the `TRANS_*` macros in `main/pet_ui.c` (integer literals like the rest, so the preview tool can read them).
+
+- An unknown length does not fake progress: only the empty track is drawn.
+- The reason for a failure (bad package, CRC mismatch, link dropped) stays on screen along with a retry hint.
+- When it finishes the pet UI comes back; if the slot ended up empty, that screen says "no pet yet / install one from the menu bar app" rather than showing nothing.
 
 ## Animation driver
 
 `main/pet_ui.c` has exactly one draw entry point, `render_frame()`, so frame synchronisation only has to be reasoned about in one place:
 
-1. Every frame has a different crop origin inside its atlas cell. Subtracting the stage origin (`PET_ATLAS_STAGE_X/Y`) and setting that as the `lv_image` position is what puts it in the right place on screen — the horizontal motion inside an animation comes from the source material, matching the ChatGPT rendering, not from tweening we add.
+1. Every frame has a different crop origin inside its atlas cell. What must be subtracted is the **crop origin of the stage inside the cell** (the header's `stage_x/stage_y`, i.e. the union of every frame's crop box); the result is that frame's landing point inside the stage, and the horizontal motion inside an animation comes from the source material, matching the ChatGPT rendering, not from tweening we add. It is **not** the `stage_x/stage_y` that `pet_layout_for_stage()` computes — that is also a "stage origin", but it is the stage's position **on screen**, tens of pixels away from the cell coordinate system (for the 129 px wide reference pet: 31 in the cell, 55 on screen). Mixing the two compiles fine and never crashes; it just shifts the pet up and to the left and lets the stage clip a corner off — which is exactly what the first on-device pet swap did. The subtraction therefore lives in one place, `pet_layout_frame_rect()`, which refuses to draw a frame whose crop box is not contained in the stage's.
 2. The delay until the next frame is taken straight from that frame's `duration`. No interpolation, no fixed frame rate. Sleep multiplies it by `PET_STATE_SLEEP_SPEED_PCT`.
 3. One-shot animations (the wave on connect, the jump celebrating completion, button emotes) fall back automatically once they finish: state-machine transitions are advanced by `pet_state_oneshot_complete()`, user-triggered ones are handled by an override flag in the UI.
 4. The frame rate is entirely determined by the material (110–320 ms, roughly 3–9 fps). The 129×198 stage is about 33% of the screen, leaving several times the needed headroom at 40 MHz SPI with a 240×20 DMA buffer.
@@ -102,6 +134,7 @@ Mac → device:
 {"type":"state","state":"working","text":"refactoring the login module"}
 {"type":"text","text":"update the text only, leave the state alone"}
 {"type":"ping"}
+{"type":"pet","id":"sophie-portrait","size":2551684,"crc32":2181165281}
 ```
 
 Device → Mac:
@@ -111,9 +144,12 @@ Device → Mac:
 {"type":"battery","soc":95}
 {"type":"pong"}
 {"type":"poke"}
+{"type":"petdone","id":"sophie-portrait","ok":true}
 ```
 
 `battery` is sent whenever the level changes, with `soc` set to `null` when it cannot be read. After a reconnect the last known value is re-sent right after `hello`; otherwise the menu bar would show nothing until the next poll (up to 5 seconds).
+
+`pet` is the one message that is **followed by raw bytes**: the `size` bytes after the announcement line are the `.pet` package itself (not base64 — that would cost another 33%), and the device is in "binary mode" for the duration, counting bytes instead of parsing lines. The bridge therefore holds its send lock for the whole transfer: any JSON slipped in would land inside the payload and misalign the package from then on. The device answers with `petdone` — **until then the package has only been sent, not installed** — and `ok` false means the slot is empty.
 
 Parsing is **bounded and forgiving**: a per-line limit of `PET_PROTOCOL_LINE_MAX` (512 bytes) and a text-field limit of `PET_PROTOCOL_TEXT_MAX` (192 bytes), overlong lines are dropped and resynchronised at the next newline, unknown fields are ignored, and UTF-8 is only truncated on character boundaries. The device is the TCP client and the Mac is the server, so the device never needs to accept inbound connections and does not depend on mDNS discovery.
 
@@ -145,9 +181,25 @@ It follows whichever of `~/.codex/sessions/**/rollout-*.jsonl` was modified most
 
 The server pings every 5 s, comfortably faster than the device's 12 s idle check, so a genuinely silent device only happens when the network really drops.
 
+### Swapping pets
+
+At startup the bridge scans `~/.codex/pets` and broadcasts the list of available pets (the `pets` event) alongside the rest of its state. Picking one builds the package on demand — through `tools/gen_pet_package.py`'s implementation, not a second copy, because the package format is a cross-language contract with exactly one source of truth — caches it in `~/Library/Application Support/CodexPetBridge/pets/<id>.pet`, and pushes it to the device from a **background thread**.
+
+- The cache key is the source atlas's name, size, and modification time: an untouched atlas is never re-sliced (one 3 MB pet means 57 frames converted pixel by pixel to RGB565).
+- The transfer has to stay off the control channel's read thread. It takes tens of seconds, and blocking there makes the GUI look like it ignored the click.
+- Progress goes out as `petxfer` events (`preparing`, `sending` with a byte count, `sent`) and the device's verdict arrives as `petdone`. **Do not treat `sent` as success** — the device is still checking the CRC at that point.
+- Slicing frames needs Pillow, while `pet_bridge.py` itself uses only the standard library. That combination means **the bridge starts happily with the wrong interpreter and only pet swapping fails**. Such a failure must name the interpreter: `gen_pet_package` imports PIL lazily (so `tests/test_pet_package.py` still runs on a machine without Pillow), which means that `ImportError` never surfaces from `import gen_pet_package` — catching it there only ever produced a bare "internal error". The bridge now probes `import PIL` up front and reports a `packer` object (`available`, `python`, `pillow`, `hint`) inside the `pets` event, so the menu can explain the situation **before** anything is clicked.
+- `pets.last` is the previous outcome, and a client attaching midway uses it to align the progress line. When the device returns its verdict the bridge must therefore settle it into a terminal state and **drop `petxfer` from `ControlHub`'s latest-event cache**: that event carries progress, not state, and leaving its final `sent` frame behind makes a late-attaching client replay the snapshot (the menu bar merges events sorted by name, with `petdone` ahead of `petxfer`) straight back to "waiting for the device". The same step re-scans the pet list, because the cache entry only appears once packing succeeded — otherwise the pet you just installed still reads as unpacked.
+
+```bash
+python3 tools/pet_bridge.py --pets-dir ~/.codex/pets    # a different set of sources
+python3 tools/pet_bridge.py --pet-cache /tmp/pets       # a different cache directory
+python3 tools/pet_bridge.py --no-pets                   # disable the whole feature (device flashed without a pets partition)
+```
+
 ### The menu bar app (macOS)
 
-`tools/menubar/` wraps that server into a native menu bar app: the icon tracks the state, and the menu shows the bridge / device / battery / Codex / bubble status plus manual state pushes, bubble text and a log-following toggle.
+`tools/menubar/` wraps that server into a native menu bar app: the icon tracks the state, and the menu shows the bridge / device / battery / Codex / bubble status plus manual state pushes, bubble text and a log-following toggle. A "pets" submenu lists the pets available in Codex, ticks the one currently on the device, and swaps on selection (the transfer percentage appears in the status item title). The "python: ..." item marks whether that interpreter has Pillow and lets you pick another one; when none of them does, the pets submenu states the reason at the top and disables the pets that have not been packed yet, instead of letting you fail one pet at a time.
 
 ```bash
 ./tools/menubar/build.sh --run
@@ -163,26 +215,30 @@ A local channel for GUI front ends: AF_UNIX plus JSON lines, both directions.
 python3 tools/pet_bridge.py --control "$HOME/Library/Application Support/CodexPetBridge/bridge.sock"
 ```
 
-A new client first receives a `snapshot` (the whole current state) and then incremental events: `bridge`, `link`, `state`, `text`, `session`, `watch`, `device`, `battery`, `error`. Commands are `state`, `text`, `raw`, `watch`, `snapshot` and `ping`.
+A new client first receives a `snapshot` (the whole current state) and then incremental events: `bridge`, `link`, `state`, `text`, `session`, `watch`, `device`, `battery`, `pets`, `petxfer`, `petdone`, `error`. Commands are `state`, `text`, `raw`, `watch`, `snapshot`, `ping`, `petlist`, and `pet` (with `id`).
+
+`pets`, `petxfer` and `petdone` are three separate kinds of device fact and must **not** be folded into `device`: `ControlHub` keeps only the newest event per kind, so mixing them would evict the firmware and package reported by `hello`. The same reasoning applies to any new device fact — give it a new event name.
 
 This is an **event stream, not request/response**: a successful command sends no acknowledgement — its result is broadcast as the matching event — and only failures add an `error`. Clients should update state from events rather than pairing a send with a receive. The authoritative definition of the wire format remains the handful of JSON messages sent to the device above; the control channel only observes and drives, and adds no downstream traffic.
 
 ## Layout preview (no device needed)
 
 ```bash
-python3 tools/preview_pet_screen.py          # one PNG per state plus a combined contact sheet
+python3 tools/preview_pet_screen.py                     # every screen, one PNG each, plus a contact sheet
+python3 tools/preview_pet_screen.py --pet sophie         # render a different pet
 python3 tools/preview_pet_screen.py --anim idle --frame 3 --scale 3
+python3 tools/preview_pet_screen.py --screen nopet,transfer,prov   # the pet-independent screens only
 ```
 
-Output lands in `assets/pets/<pet-id>/preview/screen-*.png`.
+Output lands in `assets/pets/<pet-id>/preview/screen-*.png`. Besides the six state screens there are the empty slot, the pet transfer screen (`--transfer-percent` / `--transfer-failed`), and the Bluetooth provisioning screen.
 
-The tool renders **from the generated artefacts**, not from the source atlas: frame tables are
-parsed out of `main/pet_atlas_<pet>_portrait.c`, pixels are read from
-`main/assets/pet_<pet>_portrait.bin` — the exact bytes embedded in the firmware — and the layout
-constants are parsed out of `main/pet_ui.c`. That makes it a check as well as a mockup: a wrong
-crop offset or blob layout shows up immediately as a missing or misplaced chunk of the pet. Text uses
-a system CJK font as a stand-in (the device uses subsetted Noto Sans CJK SC), so positions and sizes
-are accurate while glyph shapes differ slightly.
+The tool **copies not a single value** — everything is read at the source: pixels and frame tables come from a `.pet` package (built on the fly by default, or `--package` for an existing one), layout constants are parsed out of `main/pet_layout.{h,c}` and `main/pet_ui.c`, colours out of the `COL_*` macros in `pet_ui.c`, strings out of `main/pet_strings.h`, and line heights and baselines out of `assets/fonts/pet_font_{16,20}.c`. That also makes it a check: a wrong crop offset in the packer shows up immediately as a missing chunk of the pet.
+
+Text is placed the way LVGL places it: **baseline = line top + `line_height` − `base_line`** (see `lv_draw_label.c`). Glyphs come from a system CJK font (the device uses subsetted Noto Sans CJK SC), so shapes differ slightly while positions and sizes are accurate.
+
+It re-implements `pet_layout_for_stage()` in Python — there is no C compiler in an editor — and two implementations drifting apart would only mean a lying mockup, so `tests/test_pet_layout_mirror.py` compares it field by field against the same C code the device runs, with `tests/dump_pet_layout.c` as the harness.
+
+Two formulas are compared: every layout field, and each frame's landing point (the subtraction in `pet_layout_frame_rect()`). The second one was added after the fact — the device used to subtract the wrong base (the on-screen stage position instead of the cell crop origin), so the mockup was right while the real screen was shifted 24/33 px with a corner clipped, and the comparison at the time only covered layout fields, leaving that formula with nothing to be checked against.
 
 ## Configuration, build, and flashing
 
@@ -201,7 +257,8 @@ You do not have to put a real SSID here at all. Leaving the placeholder in place
 
 ```bash
 source ~/esp/esp-idf-v5.5.3/export.sh
-./tools/validate.sh --static      # repo checks + host tests (pet state machine / protocol / atlas / font coverage)
+./tools/validate.sh --static      # repo checks + host tests (pet state machine / protocol / package format / layout / fonts)
+PET_PYTHON=~/venv/bin/python3 ./tools/validate.sh --static   # only with Pillow does the atlas-to-.pet stage run
 ./tools/validate.sh --firmware    # build + verify + produce the merged image
 ./tools/validate.sh               # both
 
@@ -249,12 +306,16 @@ See [lvgl-chinese-fonts.zh_CN.md](lvgl-chinese-fonts.zh_CN.md) for details.
 
 | Item | Size |
 | --- | --- |
-| Pet atlas blob (RGB565A8, 57 frames) | 2.43 MiB |
+| `factory` app partition | 4,194,304 bytes (`partitions.csv`) |
+| App image (excluding any pet) | 3,244,544 bytes (~3.1 MiB), 77% of the partition |
+| Pet package `.pet` (57 frames, RGB565A8) | 2.43 MiB (in the `pets` partition, **not** in the app) |
+| `pets` data partition | 4,128,768 bytes (0x3f0000) |
 | `pet_font_16` glyph data (GB2312 levels 1+2) | ~0.5 MiB |
 | `pet_font_20` glyph data (GB2312 level 1) | ~0.4 MiB |
-| `factory` app partition | 8,323,072 bytes (`partitions.csv`) |
 
-The ESP32-C3 has no PSRAM, so the atlas and fonts stay in flash and are read directly by LVGL (`lv_image` references the external `lv_image_dsc_t` without copying). The LVGL memory pool is still `CONFIG_LV_MEM_SIZE_KILOBYTES=24`; this UI uses roughly 35 objects, which fits.
+The ESP32-C3 has no PSRAM, so fonts stay in flash and are read directly by LVGL (`lv_image` references the external `lv_image_dsc_t` without copying). Pet pixels are `esp_partition_mmap`ed at load time and unmapped right after use. The LVGL memory pool is still `CONFIG_LV_MEM_SIZE_KILOBYTES=24`; this UI uses roughly 35 objects, which fits.
+
+The `pets` partition holds one uncompressed pet, so "just carry a few" does not fit in 8 MB. That would take per-frame deflate (down to 0.86–1.04 MB per pet, at a peak cost of 75–90 KB of RAM) or giving up the OTA slot pair.
 
 ## Assets and licensing
 
@@ -262,14 +323,13 @@ Recorded as `assets/README.md` requires:
 
 | Path | Contents | Source / licence | Integration |
 | --- | --- | --- | --- |
-| `assets/pets/sophie-portrait/spritesheet.webp`, `pet.json` | v2 pet source atlas | Copied from `~/.codex/pets/sophie-portrait` on this machine. **The upstream licence is not stated**, so confirm it before redistributing publicly | Input to the generator; not compiled |
-| `assets/pets/sophie-portrait/preview/*.png` | One preview frame per animation | Same as above | Human review only; not compiled |
+| `assets/pets/sophie-portrait/spritesheet.webp`, `pet.json` | v2 pet source atlas | Copied from `~/.codex/pets/sophie-portrait` on this machine. **The upstream licence is not stated**, so confirm it before redistributing publicly | Input to `tools/gen_pet_package.py`; not compiled |
+| `assets/pets/sophie-portrait/preview/screen-*.png` | One preview per screen | Same as above | Human review only; not compiled |
 | `assets/fonts/pet_font_16.c`, `pet_font_20.c` | Generated CJK glyph data | Subset-generated by `tools/gen_pet_fonts.py` from Noto Sans CJK SC (SIL OFL 1.1) | `target_sources` in `main/CMakeLists.txt` |
 | `assets/fonts/pet_font_charset.json` | Font codepoint coverage manifest | Same as above | Read by `tests/test_pet_font_coverage.py` |
-| `main/assets/pet_sophie_portrait.bin` | Per-frame cropped RGB565A8 frame data | Derived from the source atlas in `assets/pets/` | `EMBED_FILES` in `main/CMakeLists.txt` |
-| `main/pet_atlas_sophie_portrait.{h,c}` | Generated frame tables | Same as above | Compiled into the firmware |
 
 Two things worth knowing:
 
-- The generated artefacts (`.bin`, generated `.c`/`.h`, manifest) are all committed, so a **fresh clone builds without the source atlas**; the atlas is only needed to regenerate or to swap pets.
-- Swapping pets means updating three places: the generated header included by `main/pet_atlas.h`, the `extern` symbol name in `main/pet_atlas.c`, and the `EMBED_FILES` path in `main/CMakeLists.txt`.
+- The firmware contains **no pet assets at all** any more. `main/assets/pet_*.bin` and the generated `pet_atlas_*.{h,c}` are gone, so `main/CMakeLists.txt` has no `EMBED_FILES`.
+- A **fresh clone therefore builds without the source atlas**, and the firmware it produces has no pet in it: the device boots with an empty slot and waits for you to install one from the menu bar app. The atlas is only needed to build packages and previews.
+- Swapping pets requires no source change, no rebuild, and no reflash — pick one from the "pets" submenu in the menu bar.

@@ -21,6 +21,11 @@ The default partition table contains exactly:
 The default has no OTA slots. This is a starting point, not a restriction on
 user firmware.
 
+> Note: this branch (`feature/codex-pet`) has already changed its
+> `partitions.csv` as described under "Custom layouts" below — the app region
+> shrinks to 4 MB and a `pets` data partition appears. The three rows above are
+> the template defaults, not what the branch currently ships.
+
 ## Custom layouts
 
 Users may edit `partitions.csv` to resize, move, add, or remove partitions for
@@ -29,6 +34,31 @@ partitions, or other application-specific data. Keep the 8 MB device boundary,
 avoid overlaps, and make sure the application image is flashed at the start of
 an app partition large enough to contain it. When a derivative changes its
 layout, update that project's documentation and flashing instructions.
+
+### This branch's layout (Codex pet)
+
+Pet assets are no longer compiled into the application image. They travel as a
+single `.pet` data package in a dedicated `pets` partition, pushed over Wi-Fi by
+the Mac-side Pet Bridge — which is why swapping a pet needs neither a rebuild nor
+a reflash. Fitting a 4 MB-scale application, CJK fonts, and a 2.43 MiB pet into
+8 MB means giving up the OTA slot pair:
+
+| Partition | Type/subtype | Offset | Size | Purpose |
+| --- | --- | ---: | ---: | --- |
+| `pets` | data/`0x40` | `0x410000` | `0x3F0000` | The single pet package (`.pet`), swappable at runtime |
+
+- The app region shrinks from `0x7F0000` to **`0x400000`**, with `pets` right
+  after it. `tools/verify_firmware.py` validates the table by the same rules as
+  always (boundaries, overlaps, unique labels, app capacity).
+- ESP-IDF reserves `data` subtypes `0x00`–`0x3F`, so application-defined data
+  starts at `0x40`. The firmware looks the partition up as `(data, 0x40)` — see
+  `main/pet_slot.c`.
+- The slot is **single**: swapping overwrites rather than storing side by side.
+  Carrying more than one pet on this device would need per-frame compression
+  (0.86–1.04 MB each, at the cost of a 75–90 KB RAM decode buffer) — see
+  [codex-pet](codex-pet.md#the-pet-package-pet-and-single-slot-swapping).
+- No OTA slot: 8 MB cannot hold "two slots + CJK fonts + a pet". Firmware
+  upgrades still go through the merged image written once from `0x0`.
 
 ## Enforced validation
 

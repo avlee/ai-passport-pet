@@ -14,6 +14,8 @@
 - 顶部一行：左侧状态圆点 + 状态文字（离线 / 连接中 / 空闲 / 工作中 / 等待确认 / 已完成 / 出错了），右侧电量。
 - 底部一座站台：台身正面承载 Codex 下发的文本，没有文本时显示当前状态的占位文案；台面前沿压在宠物脚底那一行，所以宠物读起来是「站在站台上」。
 - 断连（睡眠）：宠物整体压暗到 40%，帧速放慢到 250%，背光降到 45%，舞台右上角出现 `Zzz`。
+- 槽里还没有宠物时，舞台区居中显示「还没有宠物」，站台上写「在菜单栏应用里安装宠物」——
+  版式与装了参照宠物时完全一致，所以"空"看起来是一个状态，而不是没启动。
 
 按键：
 
@@ -33,47 +35,94 @@
 | --- | --- |
 | `main/main.c` | 入口：I2C、显示/LVGL 初始化，然后交给 `pet_app` |
 | `main/pet_app.c` | 应用编排：按键、电量轮询、Bridge 事件、文案覆盖自检 |
-| `main/pet_ui.c` | 宠物界面与动画驱动（唯一绘制入口） |
+| `main/pet_ui.c` | 宠物界面与动画驱动（唯一绘制入口），以及换宠物期间的传输页 |
 | `main/pet_state.c` | 链路/Codex 状态 → 动画行映射（纯逻辑） |
 | `main/pet_protocol.c` | 线路协议解析（纯逻辑） |
-| `main/pet_bridge.c` | Wi-Fi STA + TCP 客户端 + 退避重连 |
+| `main/pet_pkg.c` | `.pet` 宠物包的结构解析与自检（纯逻辑） |
+| `main/pet_slot.c` | `pets` 分区：擦、写、mmap 装载与校验 |
+| `main/pet_layout.c` | 版式：舞台居中 + 脚底对齐台面 + 帧落点换算（纯逻辑） |
+| `main/pet_bridge.c` | Wi-Fi STA + TCP 客户端 + 退避重连 + 宠物包接收 |
 | `main/pet_settings.c` | 连接参数的 NVS 持久化 |
-| `main/pet_atlas.c` | 图集访问层，把帧表包成 `lv_image_dsc_t` |
-| `main/pet_atlas_validate.c` | 图集自洽校验（纯逻辑） |
+| `main/pet_atlas.c` | 图集访问层，把槽里那份包的帧表包成 `lv_image_dsc_t` |
 | `main/pet_config.h` | 编译期默认参数（SSID / 配对端地址 / 超时 / 背光） |
 | `main/pet_strings.h` | 界面文案的唯一来源（X 宏清单，供自检与测试共用） |
 | `main/pet_fonts.c` | 应用字体入口（正文 16 px / 标题 20 px + fallback） |
 | `main/demo_menu.c` | 原 `main.c` 的演示菜单，原样搬到独立文件 |
 
-`pet_state.c`、`pet_protocol.c`、`pet_atlas_validate.c`、`pet_strings.h` 刻意不依赖 ESP-IDF 与 LVGL，可以在主机上直接跑单元测试。
+`pet_state.c`、`pet_protocol.c`、`pet_pkg.c`、`pet_layout.c` 与 `pet_strings.h` 刻意不依赖 ESP-IDF 与 LVGL，可以在主机上直接跑单元测试。
 
-## 宠物图集（v2 格式）
+## 宠物包（`.pet`）与单槽更换
 
-素材是 ChatGPT / Codex v2 宠物图集：1536×2288 WebP，8 列 × 11 行，单元格 192×208。57 帧 = 9 个状态动作（idle 6、running_right 8、running_left 8、waving 4、jumping 5、failed 8、waiting 6、running 6、review 6），每帧自带毫秒时长。
+宠物**不再编进固件**。它是一份自描述的数据包，躺在独立的 `pets` 分区里，由 Mac 侧的 Pet
+Bridge 经同一条 TCP 链路推上去 —— 换宠物既不重新编译，也不重新烧录。
 
-生成固件资源：
+源素材仍是 ChatGPT / Codex v2 宠物图集：1536×2288 WebP，8 列 × 11 行，单元格 192×208。
+57 帧 = 9 个状态动作（idle 6、running_right 8、running_left 8、waving 4、jumping 5、failed 8、waiting 6、running 6、review 6），每帧自带毫秒时长。
+
+打包（与设备侧 `main/pet_pkg.h` 的字节布局一一对应）：
 
 ```bash
-python3 tools/gen_pet_assets.py \
-    --atlas assets/pets/<pet-id>/spritesheet.webp \
-    --pet-id <pet-id> \
-    --out-bin main/assets/pet_<pet>_portrait.bin \
-    --out-header main/pet_atlas_<pet>_portrait.h \
-    --out-source main/pet_atlas_<pet>_portrait.c \
-    --preview-dir assets/pets/<pet-id>/preview
+python3 tools/gen_pet_package.py --list                    # ~/.codex/pets 里有哪些
+python3 tools/gen_pet_package.py --pet sophie-portrait     # 产出 build/pets/<id>.pet
+python3 tools/gen_pet_package.py --pet ~/.codex/pets/sophie --out /tmp/s.pet
 ```
+
+| 偏移 | 内容 |
+| --- | --- |
+| `+0` | 头部 120 字节：magic `PET1`、版本、总长、帧数与状态数、舞台并集、`pet_id`、`display_name` |
+| `+frames_offset` | 帧表，`frame_count × 16` 字节（offset + x/y/w/h + duration） |
+| `+states_offset` | 状态表，`state_count × 20` 字节（名字 + 首帧 + 帧数） |
+| `+blob_offset` | 逐帧 RGB565A8 像素 |
+
+三块内容各有一条 CRC32：头部 / 表区（帧表与状态表连成一段）/ 像素。表区特意排成连续的
+一整段，这样一条 CRC 就能同时覆盖两块 —— 状态表一旦没有校验，出问题时的表现最难从画面
+上看出来。
 
 要点：
 
-- **逐帧紧裁**。角色只占单元格 192 px 里的 54–129 px，按非透明包围盒裁剪再加回偏移，画面与整格完全一致，Flash 少用约 3 倍。
+- **逐帧紧裁**。角色只占单元格 192 px 里的 54–129 px，按非透明包围盒裁剪并记住裁剪原点，
+  画面与整格完全一致，而体积少约 3 倍。
 - **像素格式 RGB565A8**（2 字节颜色 + 1 字节 alpha，每像素 3 字节），LVGL 可做透明混合。`stride = w * 2`，alpha 平面紧随颜色平面，见 `lvgl/src/draw/lv_image_decoder.c` 的 `img_width_to_stride()`。
-- 当前宠物 `sophie-portrait`：57 帧、2,551,288 字节（2.43 MiB）、绘制外框 129×198。
+- **舞台是运行时算出来的**。头部记着所有帧裁剪区的并集（参照宠物 `sophie-portrait` 是 129×198），`pet_layout_for_stage()` 按它水平居中、竖直按脚底对齐台面反推 —— 换成更宽或更高的宠物时站台一动不动，是宠物自己站上去。尺寸超出可用范围（`main/pet_layout.h`）的包在装载时就被拒收，而不是画出一个越界的界面。
+- 当前宠物 `sophie-portrait`：57 帧、2,551,288 字节（2.43 MiB）、舞台 129×198。
+
+### 槽的语义
+
+`pets` 分区只装得下一只（见 [firmware-layout](firmware-layout.zh_CN.md)），所以"换宠物"是
+**覆写**，不是并排存放：
+
+1. 设备先把头部擦掉再逐块写入 —— 于是"擦了一半"和"一片空槽"是同一个状态，不会有半份包
+   被当成有效的。
+2. 中途掉电或断网的结果是**槽空了**，设备显示「还没有宠物 / 在菜单栏应用里安装宠物」。
+   没有回滚，重发一次即可。
+3. 收完之前设备会核对声明的长度、整包 CRC32，再 `esp_partition_mmap` **只映射包实际占用
+   的那一段**并立即 `munmap` —— 3.94 MB 整块映射会白白吃掉 MMU 页，而那些页与 app 的
+   rodata 是共用的。
+4. 装完之后设备重发一次 `hello`，其中的 `pet` 字段报的是槽里**真正**装上的那只。
+
+传输期间设备上是另一块屏（见下），因为宠物界面必须先整个拆掉 —— `lv_image` 正引用着那块
+要重写的 flash。
+
+### 宠物接收页
+
+换宠物时宠物界面必须先整个拆掉：`lv_image` 正引用着要从 flash 上 mmap 的那块内存，一边
+映射一边擦是未定义行为。但拆掉之后屏幕不能黑着 —— 一份 1~3 MB 的包在 2.4 GHz Wi-Fi 上要传
+十几秒到几十秒，用户看不出设备在不在干活就会去拔电，那就只剩半份包。
+
+所以顶上这块屏：标题、宠物 id、进度条、一句状态。它不引用任何图集像素，因此可以在解除映射
+之后继续显示。版式常量是 `main/pet_ui.c` 里的 `TRANS_*`（一样只写整数字面量，预览工具读它们
+出图）。
+
+- 长度未知时不假装有进度：只画外框。
+- 失败的原因（包坏了、CRC 对不上、链路断了）留在屏幕上，并提示重新发送。
+- 装完之后回到宠物界面；槽是空的话那里显示「还没有宠物 / 在菜单栏应用里安装宠物」，而不是
+  一片黑。
 
 ## 动画驱动
 
 `main/pet_ui.c` 里只有一个绘制入口 `render_frame()`，帧同步问题只需在这一处想清楚：
 
-1. 每帧在图集单元格里的裁剪原点不同。扣掉舞台原点（`PET_ATLAS_STAGE_X/Y`）后设给 `lv_image` 的位置，才是它在屏上的落点 —— 动作里的横向位移来自素材本身，与 ChatGPT 里的表现一致，不是额外加的补间。
+1. 每帧在图集单元格里的裁剪原点不同。要减掉的基准是**舞台在图集单元格里的裁剪原点**（包头 `stage_x/stage_y`，也就是所有帧裁剪框的并集原点），减完才是这一帧在舞台里的落点 —— 动作里的横向位移来自素材本身，与 ChatGPT 里的表现一致，不是额外加的补间。**不是**减 `pet_layout_for_stage()` 算出来的 `stage_x/stage_y`：那也是"舞台原点"，但它是舞台在**屏幕上**的落点，跟单元格坐标系差着几十像素（129 px 宽的参照宠物：单元格里 31，屏幕上 55）。两者混用不会编译失败、不会崩，只会让宠物整体左上偏移并被舞台裁掉一角 —— 真机上第一次换宠物就是这么错的，所以换算只留在 `pet_layout_frame_rect()` 这一个入口里，帧的裁剪框必须含在舞台裁剪框内，否则拒绝绘制。
 2. 下一帧的间隔直接取该帧的 `duration`，不插值、不固定帧率。睡眠时乘 `PET_STATE_SLEEP_SPEED_PCT`。
 3. 一次性动作（连上时的挥手、完成时的跳跃庆祝、按键互动）播完自动回落：状态机过场由 `pet_state_oneshot_complete()` 推进，用户触发的一次性动作由 UI 的 override 标志接管。
 4. 帧率完全由素材决定（110–320 ms，约 3–9 fps）。整块舞台 129×198 ≈ 全屏 33%，在 40 MHz SPI + 240×20 DMA 缓冲下有几倍余量。
@@ -102,6 +151,7 @@ Mac → 设备：
 {"type":"state","state":"working","text":"正在重构登录模块"}
 {"type":"text","text":"只更新文本, 不改状态"}
 {"type":"ping"}
+{"type":"pet","id":"sophie-portrait","size":2551684,"crc32":2181165281}
 ```
 
 设备 → Mac：
@@ -111,9 +161,15 @@ Mac → 设备：
 {"type":"battery","soc":95}
 {"type":"pong"}
 {"type":"poke"}
+{"type":"petdone","id":"sophie-portrait","ok":true}
 ```
 
 `battery` 在电量变化时上报，`soc` 为 `null` 表示读不到；链路重连后会紧跟 `hello` 补发一次已知值，否则菜单栏在下一次电量刷新（最多 5 秒）之前只能显示未知。
+
+`pet` 是唯一一条**后面跟着原始字节**的消息：宣告行之后的 `size` 个字节就是 `.pet` 包本身
+（不 base64 —— 那要多传 33%），设备在这段时间里处于"二进制模式"，只按字节计数、不再按行
+解析。所以桥接侧必须在整个传输期间持有发送锁，插进去任何一条 JSON 都会被打包体里、从此
+整包错位。发完设备会回一条 `petdone` —— **在那之前只能算"发出去了"**，`ok` 为假时槽是空的。
 
 解析是**有界且宽容**的：单行上限 `PET_PROTOCOL_LINE_MAX`（512 字节）、文本字段上限 `PET_PROTOCOL_TEXT_MAX`（192 字节），超长行丢弃并在下一个换行处重新同步，未知字段忽略，UTF-8 只在字符边界上截断。设备是 TCP 客户端、Mac 是服务端，所以设备侧不需要接受入站连接，也不依赖 mDNS 发现。
 
@@ -145,10 +201,44 @@ python3 tools/pet_bridge.py --list-sessions
 
 服务端每 5 s 发一条 `ping`，明显快于设备侧 12 s 的空闲判定，所以「设备静默掉线」只会在真的断网时发生。
 
+### 换宠物
+
+桥接启动时扫一遍 `~/.codex/pets`，把可用宠物的列表（`pets` 事件）随状态一起广播出去。
+选中一只时它按需打包 —— 用的是 `tools/gen_pet_package.py` 的那份实现，不另写一份：包格式
+是跨语言的契约，只能有一个源头 —— 缓存到 `~/Library/Application Support/CodexPetBridge/pets/<id>.pet`，
+再在**后台线程**里推给设备。
+
+- 缓存键是源图集的"文件名 + 大小 + 改动时间"：图集没动就不会重复切帧（一只 3 MB 的宠物要
+  切 57 帧、逐像素转 RGB565）。
+- 传输必须离开控制通道的读线程。一次推送要几十秒，卡在那里会让 GUI 看起来"点了没反应"。
+- 进度走 `petxfer` 事件（`preparing` / `sending` 带已发字节 / `sent`），设备的结论走
+  `petdone`。**别把 `sent` 当成成功** —— 那时设备还在核对 CRC。
+- 切帧要 Pillow，而 `pet_bridge.py` 本身只用标准库 —— 所以**解释器挑错时桥接照样启动，
+  只有"换宠物"会失败**。这个失败必须说清是解释器的问题：`gen_pet_package` 是惰性导入
+  PIL 的（为了让 `tests/test_pet_package.py` 在没有 Pillow 的机器上也能跑），那句
+  `ImportError` 不会从 `import gen_pet_package` 里抛出来，光靠兜它只会得到一句没头没脑的
+  「内部错误」。现在改成先 `import PIL` 探一下，并在 `pets` 事件里带一个 `packer`
+  对象（`available` / `python` / `pillow` / `hint`），好让菜单**在点之前**就把原因说清楚。
+- `pets.last` 是"上一次结局"，客户端中途接入时靠它对齐进度行，所以设备给出结论后必须
+  把它收成终局，并把 `petxfer` 从 `ControlHub` 的最新一份里**撤掉** —— 它是进度不是状态，
+  留着最后一帧 `sent`，中途接入的客户端重放快照时（菜单栏按事件名排序合并，`petdone`
+  排在 `petxfer` 前面）会把终点状态盖回「等设备确认」。同一处还要重扫一遍宠物列表：
+  打包成功后缓存才刚出现，"点完还是未打包"看着像没生效。
+
+```bash
+python3 tools/pet_bridge.py --pets-dir ~/.codex/pets    # 换一批源素材
+python3 tools/pet_bridge.py --pet-cache /tmp/pets       # 换个缓存目录
+python3 tools/pet_bridge.py --no-pets                   # 设备没刷 pets 分区时关掉这套能力
+```
+
 ### 菜单栏应用（macOS）
 
 `tools/menubar/` 把它包成一个原生菜单栏应用：图标随状态变化，点开能看到桥接 / 设备 /
-电量 / Codex / 气泡状态，并能手工推状态、发气泡文字、开关日志跟随。
+电量 / Codex / 气泡状态，并能手工推状态、发气泡文字、开关日志跟随；「宠物」子菜单列出
+Codex 里可用的宠物、勾出设备上当前那只，选中即换（传输进度显示在顶栏标题里，`43%` 这样）。
+菜单里的「python：…」那一项会标出当前解释器有没有 Pillow，点它可以换一个 —— 挑不到带
+Pillow 的解释器时，「宠物」子菜单会直接把原因写在顶上，并且禁掉那些还没打过包的宠物，
+而不是让用户点一只失败一只。
 
 ```bash
 ./tools/menubar/build.sh --run
@@ -168,8 +258,13 @@ python3 tools/pet_bridge.py --control "$HOME/Library/Application Support/CodexPe
 ```
 
 连上来先收到一条 `snapshot`（全部当前状态），之后是增量事件：`bridge` / `link` /
-`state` / `text` / `session` / `watch` / `device` / `battery` / `error`。命令有
-`state`、`text`、`raw`、`watch`、`snapshot`、`ping`。
+`state` / `text` / `session` / `watch` / `device` / `battery` / `pets` / `petxfer` /
+`petdone` / `error`。命令有 `state`、`text`、`raw`、`watch`、`snapshot`、`ping`、
+`petlist`、`pet`（带 `id`）。
+
+`pets` / `petxfer` / `petdone` 是三类独立的设备事实，**不要合并进 `device`**：`ControlHub`
+每类事件只留最新一份，混在一起会把 `hello` 报上来的固件与宠物包顶掉。同理，新增一类设备
+事实就要用新的事件名。
 
 这是一条**事件流**，不是一问一答：命令成功不回执，结果以对应事件广播出来，只有出错
 才会多收到一条 `error` —— 客户端按事件更新状态即可，不要去配「发一条收一条」。
@@ -179,17 +274,32 @@ python3 tools/pet_bridge.py --control "$HOME/Library/Application Support/CodexPe
 ## 版式预览（不需要真机）
 
 ```bash
-python3 tools/preview_pet_screen.py          # 每个状态一张 + 一张拼起来的联系表
+python3 tools/preview_pet_screen.py                     # 全部屏各一张 + 一张联系表
+python3 tools/preview_pet_screen.py --pet sophie         # 换一只宠物出图
 python3 tools/preview_pet_screen.py --anim idle --frame 3 --scale 3
+python3 tools/preview_pet_screen.py --screen nopet,transfer,prov   # 只看与宠物无关的屏
 ```
 
-输出到 `assets/pets/<pet-id>/preview/screen-*.png`。
+输出到 `assets/pets/<pet-id>/preview/screen-*.png`。除了 6 个状态屏，还有空槽、宠物接收页
+（`--transfer-percent` / `--transfer-failed`）与蓝牙配网页。
 
-这个工具**从生成产物画**，而不是从源图集画：帧表解析自 `main/pet_atlas_<pet>_portrait.c`，
-像素读自 `main/assets/pet_<pet>_portrait.bin`，也就是固件真正烧进去的那份字节；布局常量
-从 `main/pet_ui.c` 解析。所以它同时是一道校验 —— 如果裁剪偏移或 blob 布局算错，预览里的
-宠物会立刻缺一块或错位。文字用系统 CJK 字体近似（设备上用的是子集化的 Noto Sans CJK SC），
-位置和字号是准的，字形会有细微差别。
+这个工具**一个数字都不复制**，全部从源头读：像素与帧表来自一份 `.pet` 包（默认现打一份，
+也可以用 `--package` 指一个现成的包），布局常量解析自 `main/pet_layout.{h,c}` 与
+`main/pet_ui.c`，配色来自 `pet_ui.c` 的 `COL_*`，文案来自 `main/pet_strings.h`，行高与基线
+来自 `assets/fonts/pet_font_{16,20}.c`。所以它同时是一道校验：打包时的裁剪偏移算错，预览里
+的宠物立刻缺一块。
+
+文字位置按 LVGL 的算法算：**基线 = 行框顶 + `line_height` - `base_line`**（见 lvgl 的
+`lv_draw_label.c`）。字形用的是系统 CJK 字体（设备上是子集化的 Noto Sans CJK SC），所以
+字形有细微差别，位置和字号是准的。
+
+它把 `pet_layout_for_stage()` 在 Python 里重写了一遍（编辑器里编译不了 C），两份实现跑偏
+只会让预览图骗人，所以 `tests/test_pet_layout_mirror.py` 拿设备侧的同一份 C 逐字段对照，
+`tests/dump_pet_layout.c` 就是那根挂具。
+
+对照的是**两条式子**：版式的每个字段，以及每帧的落点（`pet_layout_frame_rect()` 那一减）。
+第二条是补上来的 —— 落点曾经在设备侧减错了基准（拿屏幕落点当裁剪原点），预览画得对、真机
+偏了 24/33 px 并被裁掉一角，而当时的对照只覆盖版式字段，这条式子没有对手可比。
 
 ## 配置、构建与烧录
 
@@ -208,7 +318,8 @@ python3 tools/preview_pet_screen.py --anim idle --frame 3 --scale 3
 
 ```bash
 source ~/esp/esp-idf-v5.5.3/export.sh
-./tools/validate.sh --static      # 仓库检查 + 主机测试(含宠物状态机/协议/图集/字体覆盖)
+./tools/validate.sh --static      # 仓库检查 + 主机测试(含宠物状态机/协议/包格式/版式/字体覆盖)
+PET_PYTHON=~/venv/bin/python3 ./tools/validate.sh --static   # 带 Pillow 时才跑到"图集->.pet"那一段
 ./tools/validate.sh --firmware    # 构建 + 校验 + 产出合并镜像
 ./tools/validate.sh               # 全部
 
@@ -256,12 +367,19 @@ Mac 侧用 CoreBluetooth 与设备通信（`tools/menubar/Sources/ProvisionClien
 
 | 项 | 大小 |
 | --- | --- |
-| 宠物图集 blob（RGB565A8，57 帧） | 2.43 MiB |
+| `factory` app 分区 | 4,194,304 字节（`partitions.csv`） |
+| app 镜像（不含宠物） | 3,244,544 字节（约 3.1 MiB），分区占用 77% |
+| 宠物包 `.pet`（57 帧，RGB565A8） | 2.43 MiB（装在 `pets` 分区，**不在 app 里**） |
+| `pets` 数据分区 | 4,128,768 字节（0x3f0000） |
 | `pet_font_16` 字模（GB2312 一二级） | ~0.5 MiB |
 | `pet_font_20` 字模（GB2312 一级） | ~0.4 MiB |
-| `factory` app 分区 | 8,323,072 字节（`partitions.csv`） |
 
-ESP32-C3 无 PSRAM，图集与字模都放在 Flash 里由 LVGL 直接读取（`lv_image` 引用外部 `lv_image_dsc_t`，不复制数据）。LVGL 自身的内存池仍是 `CONFIG_LV_MEM_SIZE_KILOBYTES=24`；本界面约 35 个对象，够用。
+ESP32-C3 无 PSRAM，字模放在 Flash 里由 LVGL 直接读取（`lv_image` 引用外部 `lv_image_dsc_t`，
+不复制数据）。宠物像素则是在装载时 `esp_partition_mmap` 上来的，用完立刻解除映射。LVGL 自身
+的内存池仍是 `CONFIG_LV_MEM_SIZE_KILOBYTES=24`；本界面约 35 个对象，够用。
+
+`pets` 分区只装得下一只未压缩的宠物，所以"多带几只"在 8 MB 上是做不到的 —— 那需要逐帧
+deflate（一只降到 0.86~1.04 MB，但峰值要吃 75~90 KB RAM），或者砍掉 OTA 双槽。
 
 ## 资产与许可
 
@@ -269,14 +387,15 @@ ESP32-C3 无 PSRAM，图集与字模都放在 Flash 里由 LVGL 直接读取（`
 
 | 路径 | 内容 | 来源 / 许可 | 集成方式 |
 | --- | --- | --- | --- |
-| `assets/pets/sophie-portrait/spritesheet.webp`、`pet.json` | v2 宠物源图集 | 来自本机 `~/.codex/pets/sophie-portrait`。**上游许可未标注**，公开再分发前需自行确认 | 生成脚本的输入，不参与编译 |
-| `assets/pets/sophie-portrait/preview/*.png` | 每个动作一帧的预览图 | 同上 | 仅用于人工核对，不参与编译 |
+| `assets/pets/sophie-portrait/spritesheet.webp`、`pet.json` | v2 宠物源图集 | 来自本机 `~/.codex/pets/sophie-portrait`。**上游许可未标注**，公开再分发前需自行确认 | `tools/gen_pet_package.py` 的输入，不参与编译 |
+| `assets/pets/sophie-portrait/preview/screen-*.png` | 各屏的预览图 | 同上 | 仅用于人工核对，不参与编译 |
 | `assets/fonts/pet_font_16.c`、`pet_font_20.c` | 生成的中文字模 | 由 `tools/gen_pet_fonts.py` 用 Noto Sans CJK SC（SIL OFL 1.1）子集化生成 | `main/CMakeLists.txt` 的 `target_sources` |
 | `assets/fonts/pet_font_charset.json` | 字库码点覆盖清单 | 同上 | 供 `tests/test_pet_font_coverage.py` 读取 |
-| `main/assets/pet_sophie_portrait.bin` | 逐帧裁剪后的 RGB565A8 帧数据 | 由 `assets/pets/` 的源图集派生 | `main/CMakeLists.txt` 的 `EMBED_FILES` |
-| `main/pet_atlas_sophie_portrait.{h,c}` | 生成的帧表 | 同上 | 编译进固件 |
 
-注意两点：
+注意：
 
-- 生成产物（`.bin` / 生成的 `.c` / `.h` / 清单）都已提交，因此**全新克隆不需要源图集也能编译**；源图集只用于重新生成或换宠物。
-- 换宠物时需要同步改三处：`main/pet_atlas.h` 里包含的生成头文件、`main/pet_atlas.c` 里的 `extern` 符号名、`main/CMakeLists.txt` 的 `EMBED_FILES` 路径。
+- 固件里**不再有任何宠物素材**。`main/assets/pet_*.bin` 与生成的 `pet_atlas_*.{h,c}` 都已删除，
+  所以 `main/CMakeLists.txt` 里没有 `EMBED_FILES`。
+- 因此**全新克隆不需要源图集就能编译**，编译出来的固件也还没有宠物：设备开机就是"还没有
+  宠物"，等你在菜单栏应用里装一只。源图集只用于打包与出预览图。
+- 换宠物不需要改任何源码，也不需要重新编译或烧录 —— 在菜单栏的「宠物」子菜单里选一只即可。
