@@ -311,6 +311,8 @@ static void bridge_task(void *arg)
     pet_protocol_init(&protocol);
 
     uint32_t backoff_ms = PET_BRIDGE_RETRY_MIN_MS;
+    // 上次提醒过的退避档位。连不上时只在档位变化时打一条, 避免每轮刷屏。
+    uint32_t logged_backoff = 0;
     int64_t last_rx_us = esp_timer_get_time();
 
     // 停止请求可能在任务还没跑起来时就到了, 所以每轮都重新检查。
@@ -324,6 +326,11 @@ static void bridge_task(void *arg)
         if ((xEventGroupGetBits(s_events) & BIT_GOT_IP) == 0) continue;
 
         if (!open_socket()) {
+            if (backoff_ms != logged_backoff) {
+                ESP_LOGW(TAG, "连接 %s:%u 失败, %u ms 后重试", s_settings.host,
+                         (unsigned)s_settings.port, (unsigned)backoff_ms);
+                logged_backoff = backoff_ms;
+            }
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
             backoff_ms = backoff_ms * 2 > PET_BRIDGE_RETRY_MAX_MS
                              ? PET_BRIDGE_RETRY_MAX_MS
@@ -332,10 +339,13 @@ static void bridge_task(void *arg)
         }
 
         backoff_ms = PET_BRIDGE_RETRY_MIN_MS;
+        logged_backoff = 0;
         pet_protocol_init(&protocol);
         last_rx_us = esp_timer_get_time();
-        send_hello();
+        // 必须先置 online 再发 hello: send_line() 会用 s_online 判断链路是否可用,
+        // 顺序反了 hello 会被自己挡掉(实测就是这条一直发不出去)。
         set_online(true);
+        send_hello();
 
         while (!atomic_load(&s_stop) && generation == s_generation) {
             if (!pump_socket(&protocol, &last_rx_us)) break;
