@@ -10,28 +10,27 @@
 #include "pet_atlas.h"
 #include "pet_config.h"
 #include "pet_fonts.h"
+#include "pet_layout.h"
 #include "pet_protocol.h"
 #include "pet_strings.h"
 
 static const char *TAG = "pet_ui";
 
 // ---------------------------------------------------------------------------
-// 布局。屏幕 240x320, 四角被 BSP 强制成 30 px 圆角(见 bsp_display.h), 所以
-// 靠边的元素都要躲开角落的弧线, 下面这些数值是照着力学算好的:
+// 布局
 //
-//   y   6 ..  28   状态圆点 + 状态文字(左) / 电量(右)
-//   y  38 .. 235   宠物舞台 129x198 —— 与图集裁剪区的并集等大, 不画底, 直接立在背景上
-//   y 235 .. 314   站台: 台面 + 台身, 台面上沿压在宠物脚底那一行
+// 屏幕几何(240x320、四角被 BSP 切 30 px 圆角)与站台/舞台的坐标全部在
+// pet_layout.c 里 —— 那边是纯逻辑, 有主机测试, 也有 tools/preview_pet_screen.py
+// 用的同一批字面量。这里只负责把算出来的坐标摆到 LVGL 对象上。
 //
-// 舞台尺寸直接取自图集(PET_ATLAS_STAGE_*), 不写死: 换一只宠物时自动适配。
+// 舞台尺寸现在是**运行时**的: 每只宠物图集裁剪区的并集不同(sophie-portrait
+// 129x198、li-muwan 156x198), pet_ui_build() 会先问图集要尺寸再算版式。以前
+// STAGE_X 是写死的 55(照 129 宽的舞台算的), 换成 156 宽的那只就会静默偏右。
 //
-// 站台为什么贴到 235: 57 帧素材的裁剪区并集下沿都在图集 y=203, 换算到屏幕就是
-// 脚底那一行(235)。把台面上沿放在这里, 宠物读起来就是"站在站台上", 而不是
-// "浮在方块前"。素材换一份时这个值要跟着 PET_ATLAS_STAGE_H 重新对。
+// 下面顶栏(ROW_DOT_*/STATUS_*/BAT_*)与 INFO_*/PROV_*/TRANS_* 都与宠物尺寸无关,
+// 是固定版式, 一律写成整数字面量: 预览工具用正则直接读它们出预览图, 写成宏算式
+// 会被静默漏掉, 等式由 _Static_assert 兜住。
 // ---------------------------------------------------------------------------
-#define SCR_W 240
-#define SCR_H 320
-
 #define COL_BG         0x0B0F14
 #define COL_CARD       0x16202A
 #define COL_CARD_EDGE  0x22323F
@@ -45,87 +44,42 @@ static const char *TAG = "pet_ui";
 #define COL_WARN       0xFBBF24
 #define COL_BAD        0xF87171
 
+// 顶栏: 左 = 状态圆点 + 状态文字, 右 = 电量(数字 + 电池图形)。
 #define ROW_DOT_X   18
 #define ROW_DOT_Y   16
-#define ROW_DOT_D   8
-
+#define ROW_DOT_D    8
 #define STATUS_X    32
-#define STATUS_Y    5
+#define STATUS_Y     5
 
-#define BAT_TEXT_X  130
-#define BAT_TEXT_Y  7
-#define BAT_TEXT_W  74
-#define BAT_BODY_X  208
-#define BAT_BODY_Y  15
-#define BAT_BODY_W  22
-#define BAT_BODY_H  11
-#define BAT_CAP_X   230
-#define BAT_CAP_Y   18
-#define BAT_CAP_W   3
-#define BAT_CAP_H   5
-#define BAT_FILL_X  210
-#define BAT_FILL_Y  17
-#define BAT_FILL_H  7
+#define BAT_TEXT_X   130
+#define BAT_TEXT_Y     7
+#define BAT_TEXT_W    74
+#define BAT_BODY_X   208
+#define BAT_BODY_Y    15
+#define BAT_BODY_W    22
+#define BAT_BODY_H    11
+#define BAT_CAP_X    230
+#define BAT_CAP_Y     18
+#define BAT_CAP_W      3
+#define BAT_CAP_H      5
+#define BAT_FILL_X   210
+#define BAT_FILL_Y    17
+#define BAT_FILL_H     7
 #define BAT_FILL_MAX_W 18
-
-// 舞台: 129x198 的图集裁剪区并集, 水平居中(240 - 129 = 111 → 左边距 55)。
-// 底行 235 就是宠物脚底, 站台的台面前沿要对在这里。
-#define STAGE_X     55
-#define STAGE_Y     38
-
-// 站台。数值一律写字面量(不写成宏算式): tools/preview_pet_screen.py 用正则
-// 直接读这些 #define 来出预览图, 算式会让它看不懂。等式由下面的
-// _Static_assert 兜住 —— 改错了编译期就炸, 不会悄悄错位。
-//
-// 站台左右与屏幕中心对称: (240 - 212) / 2 = 14。
-#define PLAT_X        14
-#define PLAT_W       212
-#define PLAT_RADIUS   14
-
-// 台面上沿 = 宠物脚底那一行, 见文件头的布局说明。
-#define PLAT_FLOOR_Y 235
-#define PLAT_FLOOR_H  14
-// 台面比台身矮得多, 用 PLAT_RADIUS 会鼓成胶囊, 单独给一个小圆角。
-#define PLAT_FLOOR_RADIUS 5
-#define PLAT_RIM_H     2
-#define PLAT_RIM_INSET 6
-
-// 台身到 314 为止: 屏幕底部 30 px 圆角在 x=14 处从 y≈314 开始收, 再往下会被切。
-#define PLAT_BODY_Y  249
-#define PLAT_BODY_H   65
-
-// 脚底接触阴影: 压在台面正中, 让宠物"贴"在台面上而不是飘着。
-// 别做太大 —— 台面只有 14 px 高, 阴影盖满就变成台面上一个黑洞。
-#define SHADOW_Y     236
-#define SHADOW_W      56
-#define SHADOW_H       7
-
-#define PLAT_TEXT_PAD  2
-#define PLAT_TEXT_W  184
-
-// 站台的几何约束。全部是整数常量表达式, 在编译期求值。
-// 台面上沿必须正好落在舞台底行(= 素材里宠物的脚底), 否则宠物要么浮空、
-// 要么脚被台面切掉。换宠物素材(不同 PET_ATLAS_STAGE_H)时这里会先报错。
-_Static_assert(PLAT_FLOOR_Y == STAGE_Y + PET_ATLAS_STAGE_H - 1,
-               "站台台面必须对齐宠物脚底(舞台底行)");
-_Static_assert(PLAT_BODY_Y == PLAT_FLOOR_Y + PLAT_FLOOR_H,
-               "台身必须紧接台面下沿");
-_Static_assert(PLAT_X + PLAT_W == SCR_W - PLAT_X,
-               "站台必须水平居中");
-_Static_assert(PLAT_BODY_Y + PLAT_BODY_H <= SCR_H - 6,
-               "站台底边要给屏幕底部的圆角和边框留出余量");
-_Static_assert(SHADOW_Y >= PLAT_FLOOR_Y && SHADOW_Y + SHADOW_H <= PLAT_BODY_Y,
-               "接触阴影必须整个落在台面上");
-_Static_assert(PLAT_TEXT_W == PLAT_W - 28,
-               "文本宽度 = 站台宽度减去左右各 14 px 内边距");
-
-#define SLEEP_X     98
-#define SLEEP_Y     6
 
 #define INFO_X      10
 #define INFO_Y      40
 #define INFO_W      220
 #define INFO_H      250
+
+_Static_assert(STATUS_X + 88 <= BAT_TEXT_X,
+               "状态文字要给右边的电量让出位置(最长那条 4 个汉字 = 80 px)");
+_Static_assert(BAT_BODY_X + BAT_BODY_W + BAT_CAP_W <= PET_LAYOUT_SCR_W,
+               "电池图形不能超出屏幕右边");
+_Static_assert(BAT_CAP_X == BAT_BODY_X + BAT_BODY_W,
+               "电池正极要贴在电池体右侧");
+_Static_assert(BAT_FILL_X > BAT_BODY_X && BAT_FILL_X + BAT_FILL_MAX_W < BAT_CAP_X,
+               "电量填充必须落在电池体内");
 
 // 蓝牙配网页。同样只写字面量: tools/preview_pet_screen.py 会读这些值出预览图,
 // 编辑器里看不到屏幕, 预览就是唯一能"眼见为实"的途径。
@@ -147,7 +101,31 @@ _Static_assert(PROV_CARD_Y + PROV_CARD_H < PROV_STATUS_Y,
                "配对码卡片不能压到状态文字");
 _Static_assert(PROV_STATUS_Y + PROV_STATUS_H < PROV_HINT_Y,
                "状态文字不能压到底部提示");
-_Static_assert(PROV_HINT_Y + 32 <= SCR_H, "底部提示要给屏幕圆角留出余量");
+_Static_assert(PROV_HINT_Y + 32 <= PET_LAYOUT_SCR_H,
+               "底部提示要给屏幕圆角留出余量");
+
+// 宠物传输页。换宠物时宠物界面必须先整个拆掉(图集要解除映射), 但黑屏几秒钟会
+// 让人以为设备坏了 —— 这块屏幕顶上, 只显示"在收什么、收到哪了"。
+// 名字是 ASCII 的宠物 id, 最坏 31 字节, 靠 DOTS 模式省略, 所以只给宽度不设断言。
+#define TRANS_TITLE_Y   112
+#define TRANS_NAME_Y    142
+#define TRANS_BAR_X      40
+#define TRANS_BAR_Y     178
+#define TRANS_BAR_W     160
+#define TRANS_BAR_H      10
+#define TRANS_MSG_X      20
+#define TRANS_MSG_Y     200
+#define TRANS_MSG_W     200
+#define TRANS_MSG_H      64
+
+_Static_assert(TRANS_BAR_X + TRANS_BAR_W <= PET_LAYOUT_SCR_W,
+               "进度条不能超出屏幕");
+_Static_assert(TRANS_MSG_X + TRANS_MSG_W <= PET_LAYOUT_SCR_W,
+               "说明文字不能超出屏幕");
+_Static_assert(TRANS_BAR_Y < TRANS_MSG_Y,
+               "说明文字要在进度条下面");
+_Static_assert(TRANS_MSG_Y + TRANS_MSG_H + 32 <= PET_LAYOUT_SCR_H,
+               "说明文字要给屏幕底部圆角留出余量");
 
 // 信息面板的行: 顺序与 INFO_ROW_* 一致。
 enum {
@@ -168,6 +146,13 @@ static const char *const INFO_ROW_LABELS[INFO_ROW_COUNT] = {
 // ---------------------------------------------------------------------------
 // 状态
 // ---------------------------------------------------------------------------
+// 当前版式。由 pet_ui_build() 按**当前宠物**的舞台尺寸算出来 —— 换宠物之后
+// 舞台尺寸会变, 所以这些坐标不能是编译期常量。s_layout_ok 为假表示这只宠物的
+// 舞台放不下(理论上不会走到, pet_atlas_load() 已经拦过一道)。
+static pet_layout_t s_layout;
+static bool          s_layout_ok;
+static bool          s_pet_ready;   // 建界面时槽里有没有宠物
+
 static lv_obj_t *s_screen;
 static lv_obj_t *s_dot;
 static lv_obj_t *s_status;
@@ -178,10 +163,27 @@ static lv_obj_t *s_plat_text;
 static lv_obj_t *s_stage;
 static lv_obj_t *s_sprite;
 static lv_obj_t *s_sleep;
+static lv_obj_t *s_stage_hint;   // 没有宠物时舞台区的占位文字
+
+// 帧落在舞台外只可能是包坏了; 每帧都刷一条日志没有意义, 但一条不刷会让人
+// 对着空屏幕猜。用一个"说过一次"的闩, 换宠物时复位。
+static bool s_bad_frame_warned;
 
 static lv_obj_t *s_info_scrim;
 static lv_obj_t *s_info_panel;
 static lv_obj_t *s_info_value[INFO_ROW_COUNT];
+
+// 传输页: 与宠物界面互斥的另一块屏幕(见 pet_ui.h)。它不引用任何图集像素,
+// 所以可以在图集解除映射之后继续显示。
+static lv_obj_t *s_transfer_screen;
+static lv_obj_t *s_transfer_name;
+static lv_obj_t *s_transfer_msg;
+static lv_obj_t *s_transfer_bar;
+static lv_obj_t *s_transfer_fill;
+static uint32_t  s_transfer_total;
+static uint32_t  s_transfer_seen;
+static uint32_t  s_transfer_tone = COL_MUTED;
+static char      s_transfer_msg_text[64];
 
 // 配网页: 一个不透明的全屏覆盖层。它盖住宠物舞台是故意的 —— 设备还没联网时
 // 宠物本来就在睡觉, 这时候让配对码成为画面上唯一焦点更好读。
@@ -308,13 +310,19 @@ static void refresh_status_locked(void)
     lv_label_set_text(s_status, status_text(link, codex));
     lv_obj_set_style_bg_color(s_dot, lv_color_hex(status_color(link, codex)), 0);
 
-    // 用户没有下发文本时, 用占位文案说明当前在等什么。
-    if (s_text[0] == '\0') {
-        lv_label_set_text(s_plat_text, placeholder_text(link, codex));
+    // 没有宠物时, 站台上那句要说的是"怎么办", 而不是 Codex 在等什么 ——
+    // 槽是空的, 只可能是用户还没装。
+    const bool placeholder = (s_text[0] == '\0') || !s_pet_ready;
+    if (placeholder) {
+        lv_label_set_text(s_plat_text,
+                          s_pet_ready ? placeholder_text(link, codex)
+                                      : PET_STR_PH_NO_PET);
     }
     lv_obj_set_style_text_color(
         s_plat_text,
-        lv_color_hex(s_text[0] != '\0' ? COL_INK : COL_MUTED), 0);
+        lv_color_hex(s_text[0] != '\0' && s_pet_ready ? COL_INK : COL_MUTED), 0);
+
+    if (s_sprite == NULL) return;   // 没有宠物: 舞台区只有占位文字, 没有可压暗的图像
 
     const bool asleep = (link == PET_LINK_OFFLINE);
     lv_obj_set_style_image_opa(s_sprite, asleep ? LV_OPA_40 : LV_OPA_COVER, 0);
@@ -359,7 +367,9 @@ static void refresh_info_locked(void)
                       status_text(s_state.link, s_state.codex));
 
     lv_label_set_text(s_info_value[INFO_ROW_FIRMWARE], PET_FIRMWARE_VERSION);
-    lv_label_set_text(s_info_value[INFO_ROW_PACKAGE], PET_PACKAGE_ID);
+    // 宠物不再是编译期常量, 所以这一行报的是槽里**当前**那只的 id(没有则 none),
+    // 与 hello 报文里 pet 字段同源 —— 换完宠物不用重刷固件就能看到这里变了。
+    lv_label_set_text(s_info_value[INFO_ROW_PACKAGE], pet_atlas_pet_id());
     lv_label_set_text(s_info_value[INFO_ROW_WIFI],
                       s_settings_ok && s_settings.ssid[0] != '\0'
                           ? s_settings.ssid
@@ -402,21 +412,42 @@ static void set_info_visible_locked(bool visible)
 // 这是整个界面唯一的绘制入口, 所以帧同步问题只需要在这里想清楚。
 static void render_frame(void)
 {
+    if (s_sprite == NULL) return;   // 没有宠物
+
     const uint16_t count = pet_atlas_frame_count(s_playing);
     if (count == 0) return;
     if (s_frame >= count) s_frame = 0;
 
-    const pet_atlas_frame_t *frame = pet_atlas_frame(s_playing, s_frame);
+    const pet_pkg_frame_t *frame = pet_atlas_frame(s_playing, s_frame);
     const lv_image_dsc_t *image = pet_atlas_image(s_playing, s_frame);
     if (frame == NULL || image == NULL) return;
 
     lv_image_set_src(s_sprite, image);
 
-    // 关键: 每帧在图集单元格里的裁剪原点不同, 扣掉舞台原点才是它在屏上的位置。
-    // 动作里的位移(跑动、跳跃的横向移动)就是这么来的 —— 与 ChatGPT 一致,
-    // 不是我们额外加的补间。
-    lv_obj_set_pos(s_sprite, frame->x - PET_ATLAS_STAGE_X,
-                   frame->y - PET_ATLAS_STAGE_Y);
+    // 关键: 每帧在图集单元格里的裁剪原点不同, 扣掉**舞台在单元格里的裁剪原点**
+    // 才是它在舞台里的落点。动作里的位移(跑动、跳跃的横向移动)就是这么来的 ——
+    // 与 ChatGPT 一致, 不是我们额外加的补间。
+    //
+    // 基准必须取 pet_atlas_stage_x/y()(包头的 stage_x/stage_y, 即所有帧裁剪框的
+    // 并集原点)。**不能取 s_layout.stage_x/y** —— 那是舞台上屏幕的落点, 在另一个
+    // 坐标系里(129 px 宽的舞台: 单元格原点 31, 屏幕落点 55), 拿它来减会让整个宠物
+    // 左上偏移 24/33 px 并被舞台裁掉一角。换算与这道判断都在 pet_layout.c 里,
+    // 主机测试逐条钉住(tests/test_pet_layout.c)。
+    pet_layout_rect_t rect;
+    if (!pet_layout_frame_rect(frame->x, frame->y, frame->w, frame->h,
+                               (int)pet_atlas_stage_x(),
+                               (int)pet_atlas_stage_y(),
+                               &s_layout, &rect)) {
+        if (!s_bad_frame_warned) {
+            s_bad_frame_warned = true;
+            ESP_LOGW(TAG, "帧 %u %dx%d @ (%d,%d) 落在舞台 %dx%d @ (%d,%d) 外, 不画",
+                     (unsigned)s_frame, frame->w, frame->h, frame->x, frame->y,
+                     s_layout.stage_w, s_layout.stage_h, s_layout.stage_x,
+                     s_layout.stage_y);
+        }
+        return;
+    }
+    lv_obj_set_pos(s_sprite, rect.x, rect.y);
 
     uint32_t period = frame->duration;
     const pet_pose_t pose = pet_state_pose(&s_state);
@@ -439,7 +470,8 @@ static void anim_tick(lv_timer_t *timer)
 {
     (void)timer;
     // 配网页是不透明的, 底下的宠物没人看得见 —— 别再逐帧重绘它, 省 CPU 也省电。
-    if (s_screen == NULL || s_prov_visible) return;
+    // 槽里没有宠物时同理: 没有帧可画, 醒着也只是空转。
+    if (s_screen == NULL || s_prov_visible || !s_pet_ready) return;
 
     const pet_pose_t pose = pet_state_pose(&s_state);
     const pet_anim_t want = s_override ? s_override_anim : pose.anim;
@@ -517,9 +549,18 @@ static void build_stage(void)
     s_stage = lv_obj_create(s_screen);
     lv_obj_remove_style_all(s_stage);
     lv_obj_remove_flag(s_stage, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(s_stage, STAGE_X, STAGE_Y);
-    lv_obj_set_size(s_stage, PET_ATLAS_STAGE_W, PET_ATLAS_STAGE_H);
+    lv_obj_set_pos(s_stage, s_layout.stage_x, s_layout.stage_y);
+    lv_obj_set_size(s_stage, s_layout.stage_w, s_layout.stage_h);
     lv_obj_set_style_bg_opa(s_stage, LV_OPA_TRANSP, 0);
+
+    if (!s_pet_ready) {
+        // 槽是空的: 舞台区放一句占位, 免得屏幕上半截完全空白, 看起来像没启动。
+        // 位置由 lv_obj_center 算, 不写死坐标 —— 舞台尺寸是运行时才知道的。
+        s_stage_hint = make_label(s_stage, PET_STR_NO_PET, pet_font_body(),
+                                  COL_MUTED);
+        lv_obj_center(s_stage_hint);
+        return;
+    }
 
     s_sprite = lv_image_create(s_stage);
     lv_obj_remove_style_all(s_sprite);
@@ -528,7 +569,7 @@ static void build_stage(void)
     // 睡眠标记浮在宠物右上方那块空白上(素材头部只占左半边)。
     s_sleep = make_label(s_stage, PET_STR_SLEEP_MARK, pet_font_body(),
                          COL_ACCENT);
-    lv_obj_set_pos(s_sleep, SLEEP_X, SLEEP_Y);
+    lv_obj_set_pos(s_sleep, s_layout.sleep_x, s_layout.sleep_y);
     lv_obj_set_style_text_opa(s_sleep, LV_OPA_70, 0);
 }
 
@@ -537,43 +578,47 @@ static void build_stage(void)
 // 否则脚会被台面盖掉, 变成"站在台子后面"。
 static void build_platform(void)
 {
-    s_plat_body = make_box(s_screen, PLAT_X, PLAT_BODY_Y, PLAT_W, PLAT_BODY_H,
-                           COL_PLAT_BODY, PLAT_RADIUS);
+    s_plat_body = make_box(s_screen, s_layout.plat_x, s_layout.plat_body_y,
+                           s_layout.plat_w, s_layout.plat_body_h, COL_PLAT_BODY,
+                           s_layout.plat_radius);
     lv_obj_set_style_border_width(s_plat_body, 1, 0);
     lv_obj_set_style_border_color(s_plat_body, lv_color_hex(COL_CARD_EDGE), 0);
 
     // 台面: 竖直渐变让上沿亮、下沿并入台身, 接缝不生硬。
-    lv_obj_t *floor = make_box(s_screen, PLAT_X, PLAT_FLOOR_Y, PLAT_W,
-                               PLAT_FLOOR_H, COL_PLAT_FLOOR,
-                               PLAT_FLOOR_RADIUS);
+    lv_obj_t *floor = make_box(s_screen, s_layout.plat_x, s_layout.plat_floor_y,
+                               s_layout.plat_w, s_layout.plat_floor_h,
+                               COL_PLAT_FLOOR, s_layout.plat_floor_radius);
     lv_obj_set_style_bg_grad_dir(floor, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_bg_grad_color(floor, lv_color_hex(COL_PLAT_BODY), 0);
 
     // 顶沿高光: 只留中间一段, 两端收进去, 避免和台面圆角打架。
-    make_box(s_screen, PLAT_X + PLAT_RIM_INSET, PLAT_FLOOR_Y,
-             PLAT_W - PLAT_RIM_INSET * 2, PLAT_RIM_H,
-             COL_PLAT_RIM, PLAT_RIM_H / 2);
+    make_box(s_screen, s_layout.plat_x + s_layout.plat_rim_inset,
+             s_layout.plat_floor_y,
+             s_layout.plat_w - s_layout.plat_rim_inset * 2, s_layout.plat_rim_h,
+             COL_PLAT_RIM, s_layout.plat_rim_h / 2);
 
     // 接触阴影: 半透明黑压在台面上, 位置取自脚底正下方。跳跃动作抬起时
     // 阴影不动 —— 它是"地面", 不是宠物的挂件。
-    lv_obj_t *shadow = make_box(s_screen, SCR_W / 2 - SHADOW_W / 2, SHADOW_Y,
-                                SHADOW_W, SHADOW_H, 0x000000, SHADOW_H / 2);
+    lv_obj_t *shadow = make_box(s_screen, PET_LAYOUT_SCR_W / 2 - s_layout.shadow_w / 2,
+                                s_layout.shadow_y, s_layout.shadow_w,
+                                s_layout.shadow_h, 0x000000,
+                                s_layout.shadow_h / 2);
     lv_obj_set_style_bg_opa(shadow, LV_OPA_40, 0);
 
     // 文字落在台身上: 台身就是原来的气泡, 只是换了块"水泥"。
     const lv_font_t *font = pet_font_body();
     const int text_h = font->line_height * 2;
     s_plat_text = make_label(s_screen, "", font, COL_MUTED);
-    lv_obj_set_size(s_plat_text, PLAT_TEXT_W, text_h);
+    lv_obj_set_size(s_plat_text, s_layout.plat_text_w, text_h);
     lv_label_set_long_mode(s_plat_text, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_style_text_align(s_plat_text, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(s_plat_text, PLAT_X + (PLAT_W - PLAT_TEXT_W) / 2,
-                   PLAT_BODY_Y + PLAT_TEXT_PAD);
+    lv_obj_set_pos(s_plat_text, s_layout.plat_text_x, s_layout.plat_text_y);
 }
 
 static void build_info(void)
 {
-    s_info_scrim = make_box(s_screen, 0, 0, SCR_W, SCR_H, 0x000000, 0);
+    s_info_scrim = make_box(s_screen, 0, 0, PET_LAYOUT_SCR_W, PET_LAYOUT_SCR_H,
+                            0x000000, 0);
     lv_obj_set_style_bg_opa(s_info_scrim, LV_OPA_70, 0);
 
     s_info_panel = make_box(s_info_scrim, INFO_X, INFO_Y, INFO_W, INFO_H,
@@ -613,18 +658,19 @@ static void build_info(void)
 // ---------------------------------------------------------------------------
 static void build_provision(void)
 {
-    s_prov_scrim = make_box(s_screen, 0, 0, SCR_W, SCR_H, COL_BG, 0);
+    s_prov_scrim = make_box(s_screen, 0, 0, PET_LAYOUT_SCR_W, PET_LAYOUT_SCR_H,
+                            COL_BG, 0);
 
     lv_obj_t *title = make_label(s_prov_scrim, PET_STR_PROV_TITLE,
                                  pet_font_title(), COL_INK);
-    lv_obj_set_width(title, SCR_W);
+    lv_obj_set_width(title, PET_LAYOUT_SCR_W);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_pos(title, 0, PROV_TITLE_Y);
 
     // 设备名要让用户能和 Mac 上扫到的那个对上, 否则家里有两个同类设备时不知道
     // 该连哪个。
     s_prov_name = make_label(s_prov_scrim, "", pet_font_body(), COL_MUTED);
-    lv_obj_set_width(s_prov_name, SCR_W);
+    lv_obj_set_width(s_prov_name, PET_LAYOUT_SCR_W);
     lv_obj_set_style_text_align(s_prov_name, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_pos(s_prov_name, 0, PROV_NAME_Y);
 
@@ -653,7 +699,7 @@ static void build_provision(void)
 
     lv_obj_t *hint = make_label(s_prov_scrim, PET_STR_PROV_HINT,
                                 pet_font_body(), COL_MUTED);
-    lv_obj_set_width(hint, SCR_W);
+    lv_obj_set_width(hint, PET_LAYOUT_SCR_W);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_pos(hint, 0, PROV_HINT_Y);
 
@@ -710,6 +756,32 @@ void pet_ui_build(void)
         return;
     }
 
+    // 换宠物的流程是「拆界面 -> 换包 -> 重建」, 所以这里可能是从传输页回来的:
+    // 先把传输页收掉, 免得两块钱屏幕叠着。
+    if (s_transfer_screen != NULL) {
+        lv_obj_delete(s_transfer_screen);
+        s_transfer_screen = NULL;
+        s_transfer_name = NULL;
+        s_transfer_msg = NULL;
+        s_transfer_bar = NULL;
+        s_transfer_fill = NULL;
+    }
+
+    // 舞台尺寸由当前宠物决定; 槽里没有宠物时用参照尺寸占位, 这样空槽的画面与
+    // 装了参照宠物时版式完全一致。
+    s_pet_ready = pet_atlas_ready();
+    int stage_w = s_pet_ready ? (int)pet_atlas_stage_width()
+                              : PET_LAYOUT_STAGE_W_REF;
+    int stage_h = s_pet_ready ? (int)pet_atlas_stage_height()
+                              : PET_LAYOUT_STAGE_H_REF;
+    s_layout_ok = pet_layout_for_stage(stage_w, stage_h, &s_layout);
+    if (!s_layout_ok) {
+        // pet_atlas_load() 已经按同一个判据拦过一次, 走到这里说明是内部不一致。
+        ESP_LOGE(TAG, "舞台 %dx%d 算不出可用版式", stage_w, stage_h);
+        bsp_lvgl_unlock();
+        return;
+    }
+
     // build/destroy 只负责对象, 状态(链路、Codex、文案、电量)留在模块里,
     // 这样从演示菜单回来重建界面时不会丢失已经同步到的状态。
     s_playing = PET_ANIM_COUNT;
@@ -718,7 +790,7 @@ void pet_ui_build(void)
 
     s_screen = lv_obj_create(NULL);
     lv_obj_remove_style_all(s_screen);
-    lv_obj_set_size(s_screen, SCR_W, SCR_H);
+    lv_obj_set_size(s_screen, PET_LAYOUT_SCR_W, PET_LAYOUT_SCR_H);
     lv_obj_set_style_bg_color(s_screen, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_bg_opa(s_screen, LV_OPA_COVER, 0);
     lv_screen_load(s_screen);
@@ -738,9 +810,11 @@ void pet_ui_build(void)
     // 放在定时器之后: 里面要按显隐调定时器周期。
     set_provision_visible_locked(s_prov_visible);
 
-    ESP_LOGI(TAG, "界面就绪: 舞台 %dx%d @ (%d,%d) 脚底 y=%d, 站台 %d..%d, 行高 %d",
-             PET_ATLAS_STAGE_W, PET_ATLAS_STAGE_H, STAGE_X, STAGE_Y, PLAT_FLOOR_Y,
-             PLAT_FLOOR_Y, PLAT_BODY_Y + PLAT_BODY_H,
+    ESP_LOGI(TAG, "界面就绪: 宠物 %s, 舞台 %dx%d @ (%d,%d) 脚底 y=%d, "
+                  "站台 %d..%d, 行高 %d",
+             pet_atlas_pet_id(), s_layout.stage_w, s_layout.stage_h,
+             s_layout.stage_x, s_layout.stage_y, s_layout.plat_floor_y,
+             s_layout.plat_floor_y, s_layout.plat_body_y + s_layout.plat_body_h,
              pet_font_body()->line_height);
     bsp_lvgl_unlock();
 }
@@ -757,6 +831,11 @@ void pet_ui_init(void)
     s_prov_pin_text[0] = '\0';
     s_prov_status_text[0] = '\0';
     s_prov_tone = COL_INK;
+    // 版式由 pet_ui_build() 算; 在这里先置成"还没有", 免得初始状态被误读成有宠物。
+    s_pet_ready = false;
+    s_layout_ok = false;
+    s_bad_frame_warned = false;
+    s_transfer_msg_text[0] = '\0';
 }
 
 void pet_ui_destroy(void)
@@ -774,6 +853,7 @@ void pet_ui_destroy(void)
     s_screen = NULL;
     s_sprite = NULL;
     s_stage = NULL;
+    s_stage_hint = NULL;
     s_plat_body = NULL;
     s_plat_text = NULL;
     s_dot = NULL;
@@ -926,4 +1006,182 @@ bool pet_ui_info_visible(void)
 pet_anim_t pet_ui_current_anim(void)
 {
     return s_playing;
+}
+
+// ---------------------------------------------------------------------------
+// 宠物传输页
+// ---------------------------------------------------------------------------
+// 为什么必须先把宠物界面拆掉: 图集是从 flash 上 mmap 出来的, 而换宠物要擦写同一
+// 块 flash —— 一边映射一边擦是未定义行为。宠物界面上的 s_sprite 正引用着那块内存
+// 里的图像描述符, 所以解除映射之前必须让这些对象先消失。
+//
+// 拆掉之后屏幕不能是黑的: 一份 1~3 MB 的包在 2.4 GHz Wi-Fi 上要传十几秒到几十秒,
+// 期间用户完全看不出设备在不在干活, 拔电就只剩半份包。所以这里顶上一块只有文字和
+// 进度条的屏幕。
+//
+// 这块屏幕上的一切都不引用图集, 所以它能在图集解除映射之后继续显示。
+static void build_transfer_locked(const char *pet_id)
+{
+    s_transfer_screen = lv_obj_create(NULL);
+    lv_obj_remove_style_all(s_transfer_screen);
+    lv_obj_set_size(s_transfer_screen, PET_LAYOUT_SCR_W, PET_LAYOUT_SCR_H);
+    lv_obj_set_style_bg_color(s_transfer_screen, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_opa(s_transfer_screen, LV_OPA_COVER, 0);
+    lv_screen_load(s_transfer_screen);
+
+    lv_obj_t *title = make_label(s_transfer_screen, PET_STR_TRANSFER_TITLE,
+                                 pet_font_title(), COL_INK);
+    lv_obj_set_width(title, PET_LAYOUT_SCR_W);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(title, 0, TRANS_TITLE_Y);
+
+    // 宠物 id 是 ASCII 且最长 31 字节, 一行放不下就用省略号收尾 —— 它是这里唯一
+    // 能让用户确认"发的是哪一只"的信息, 不写成固定宽度的框, 免得撑破版式。
+    s_transfer_name = make_label(s_transfer_screen, pet_id != NULL ? pet_id : "",
+                                 pet_font_body(), COL_ACCENT);
+    lv_obj_set_width(s_transfer_name, PET_LAYOUT_SCR_W - 2 * TRANS_MSG_X);
+    lv_label_set_long_mode(s_transfer_name, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_align(s_transfer_name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_transfer_name, TRANS_MSG_X, TRANS_NAME_Y);
+
+    // 进度条: 外框 + 填充。填充宽度按收到的比例算, 与顶栏电量条同一个套路。
+    lv_obj_t *track = make_box(s_transfer_screen, TRANS_BAR_X, TRANS_BAR_Y,
+                               TRANS_BAR_W, TRANS_BAR_H, COL_CARD, TRANS_BAR_H / 2);
+    lv_obj_set_style_border_width(track, 1, 0);
+    lv_obj_set_style_border_color(track, lv_color_hex(COL_CARD_EDGE), 0);
+
+    s_transfer_bar = track;
+    s_transfer_fill = make_box(track, 1, 1, 1, TRANS_BAR_H - 2, COL_ACCENT,
+                               (TRANS_BAR_H - 2) / 2);
+    lv_obj_set_style_bg_opa(s_transfer_fill, LV_OPA_TRANSP, 0);
+
+    s_transfer_msg = make_label(s_transfer_screen, "", pet_font_body(), COL_MUTED);
+    lv_obj_set_size(s_transfer_msg, TRANS_MSG_W, TRANS_MSG_H);
+    lv_label_set_long_mode(s_transfer_msg, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_align(s_transfer_msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_transfer_msg, TRANS_MSG_X, TRANS_MSG_Y);
+
+    lv_label_set_text(s_transfer_msg, s_transfer_msg_text);
+    lv_obj_set_style_text_color(s_transfer_msg, lv_color_hex(s_transfer_tone), 0);
+}
+
+static void refresh_transfer_locked(void)
+{
+    if (s_transfer_msg == NULL) return;
+
+    lv_label_set_text(s_transfer_msg, s_transfer_msg_text);
+    lv_obj_set_style_text_color(s_transfer_msg, lv_color_hex(s_transfer_tone), 0);
+
+    if (s_transfer_fill == NULL) return;
+    if (s_transfer_total == 0) return;   // 长度未知: 只让外框显示, 不假装有进度
+
+    uint32_t percent = (uint32_t)((uint64_t)s_transfer_seen * 100 / s_transfer_total);
+    if (percent > 100) percent = 100;
+    int width = (int)((TRANS_BAR_W - 2) * percent / 100);
+    if (width < 1) width = 1;
+    lv_obj_set_size(s_transfer_fill, width, TRANS_BAR_H - 2);
+    lv_obj_set_style_bg_opa(s_transfer_fill, LV_OPA_COVER, 0);
+}
+
+void pet_ui_begin_transfer(const char *pet_id, uint32_t total_bytes)
+{
+    if (!bsp_lvgl_lock(1000)) return;
+
+    // 先拆宠物界面 —— 顺序不能反: 对象还在的时候解除映射就是野指针。
+    if (s_anim_timer != NULL) {
+        lv_timer_delete(s_anim_timer);
+        s_anim_timer = NULL;
+    }
+    if (s_screen != NULL) {
+        lv_obj_delete(s_screen);
+        s_screen = NULL;
+    }
+    s_sprite = NULL;
+    s_stage = NULL;
+    s_stage_hint = NULL;
+    s_plat_body = NULL;
+    s_plat_text = NULL;
+    s_dot = NULL;
+    s_status = NULL;
+    s_bat_text = NULL;
+    s_bat_fill = NULL;
+    s_sleep = NULL;
+    s_info_scrim = NULL;
+    s_info_panel = NULL;
+    for (int i = 0; i < INFO_ROW_COUNT; i++) s_info_value[i] = NULL;
+    s_prov_scrim = NULL;
+    s_prov_name = NULL;
+    s_prov_pin = NULL;
+    s_prov_status = NULL;
+    s_prov_visible = false;
+    s_playing = PET_ANIM_COUNT;
+    s_frame = 0;
+    s_override = false;
+
+    s_transfer_total = total_bytes;
+    s_transfer_seen = 0;
+    s_transfer_tone = COL_MUTED;
+    snprintf(s_transfer_msg_text, sizeof(s_transfer_msg_text), "%s",
+             PET_STR_TRANSFER_ENABLING);
+
+    if (s_transfer_screen != NULL) {
+        lv_obj_delete(s_transfer_screen);
+        s_transfer_screen = NULL;
+    }
+    build_transfer_locked(pet_id);
+    refresh_transfer_locked();
+
+    ESP_LOGI(TAG, "传输页: %s, 声明 %u 字节", pet_id != NULL ? pet_id : "?",
+             (unsigned)total_bytes);
+    bsp_lvgl_unlock();
+}
+
+void pet_ui_set_transfer_progress(uint32_t received_bytes)
+{
+    if (!bsp_lvgl_lock(1000)) return;
+    if (s_transfer_screen == NULL) {
+        bsp_lvgl_unlock();
+        return;
+    }
+    s_transfer_seen = received_bytes;
+    refresh_transfer_locked();
+    bsp_lvgl_unlock();
+}
+
+void pet_ui_set_transfer_message(const char *text, pet_tone_t tone)
+{
+    if (!bsp_lvgl_lock(1000)) return;
+
+    snprintf(s_transfer_msg_text, sizeof(s_transfer_msg_text), "%s",
+             text != NULL ? text : "");
+    switch (tone) {
+    case PET_TONE_GOOD: s_transfer_tone = COL_GOOD; break;
+    case PET_TONE_BAD:  s_transfer_tone = COL_BAD;  break;
+    case PET_TONE_INFO:
+    default:            s_transfer_tone = COL_INK;  break;
+    }
+
+    refresh_transfer_locked();
+    bsp_lvgl_unlock();
+}
+
+void pet_ui_end_transfer(void)
+{
+    if (!bsp_lvgl_lock(1000)) return;
+
+    if (s_transfer_screen != NULL) {
+        lv_obj_delete(s_transfer_screen);
+        s_transfer_screen = NULL;
+    }
+    s_transfer_name = NULL;
+    s_transfer_msg = NULL;
+    s_transfer_bar = NULL;
+    s_transfer_fill = NULL;
+
+    bsp_lvgl_unlock();
+}
+
+bool pet_ui_transferring(void)
+{
+    return s_transfer_screen != NULL;
 }

@@ -1,4 +1,13 @@
 # Name,   Type, SubType, Offset,   Size,     Flags
+# 8 MB Flash 被四个分区占满, 没有留 OTA 槽 —— 宠物槽本身就占掉了大半个数据区。
+#
+# pets 是**单槽**的: 只装得下当前这一只宠物, 换宠物是"覆盖写"而不是"再来一份"。
+# 尺寸是照最胖的一只宠物(sophie, 未压缩 2.43 MiB)留的余量; 逐帧压缩后能放下三只,
+# 但那要额外付 75~90 KB RAM 的解码缓冲, 见 docs/development/engineering/codex-pet.md。
+#
+# subtype 用 0x40: ESP-IDF 把 data 的 0x00-0x3F 留给自己, 0x40 起才是应用自定义的。
+# 固件侧按 (data, 0x40) 查找, 见 main/pet_slot.c。
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x7f0000,
+factory,  app,  factory, 0x10000,  0x400000,
+pets,     data, 0x40,    0x410000, 0x3f0000,

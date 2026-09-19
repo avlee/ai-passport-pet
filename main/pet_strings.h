@@ -50,6 +50,21 @@
 #define PET_STR_SLEEP_MARK         "Zzz"
 
 // ---------------------------------------------------------------------------
+// 宠物槽(没有宠物 / 正在换宠物)
+// ---------------------------------------------------------------------------
+// 舞台区里的占位。舞台只有 PET_LAYOUT_STAGE_W_REF = 129px 宽, 放不下"用 XX 装"
+// 这种长句, 所以这里只说"没有什么", "怎么办"交给下面站台上的那句。
+#define PET_STR_NO_PET             "还没有宠物"
+// 站台(承载文本的那块)宽 PLAT_TEXT_W = 184px, 两行。
+#define PET_STR_PH_NO_PET          "在菜单栏应用里安装宠物"
+
+// 传输页(标题 20 px, 正文 16 px)。宠物 id 是 ASCII, 用 DOTS 模式截断, 不进文案表。
+#define PET_STR_TRANSFER_TITLE     "接收宠物"
+#define PET_STR_TRANSFER_ENABLING  "正在启用…"
+#define PET_STR_TRANSFER_FAILED    "宠物安装失败"
+#define PET_STR_TRANSFER_AGAIN     "请重新发送"
+
+// ---------------------------------------------------------------------------
 // 蓝牙配网页(标题 20 px, 正文 16 px)
 // ---------------------------------------------------------------------------
 #define PET_STR_PROV_TITLE         "蓝牙配网"
@@ -110,7 +125,13 @@
     X(prov_err_save,     PET_STR_PROV_ERR_SAVE,     16)        \
     X(prov_err_connect,  PET_STR_PROV_ERR_CONNECT,  16)        \
     X(prov_hint,         PET_STR_PROV_HINT,         16)        \
-    X(prov_hint_open,    PET_STR_PROV_HINT_OPEN,    16)
+    X(prov_hint_open,    PET_STR_PROV_HINT_OPEN,    16)        \
+    X(no_pet,            PET_STR_NO_PET,            16)        \
+    X(ph_no_pet,         PET_STR_PH_NO_PET,         16)        \
+    X(transfer_title,    PET_STR_TRANSFER_TITLE,    20)        \
+    X(transfer_enabling, PET_STR_TRANSFER_ENABLING, 16)        \
+    X(transfer_failed,   PET_STR_TRANSFER_FAILED,   16)        \
+    X(transfer_again,    PET_STR_TRANSFER_AGAIN,    16)
 
 typedef struct {
     const char   *key;   // 用于测试报告定位问题

@@ -41,7 +41,12 @@
 
 // 通过 hello 消息上报给 Bridge, 便于在 Mac 侧确认设备身份。
 #define PET_FIRMWARE_VERSION "0.1.0"
-#define PET_PACKAGE_ID "sophie-portrait"
+
+// 这里以前有一个 PET_PACKAGE_ID("sophie-portrait"), 现在**故意没有了**。
+// 宠物不再是编译期常量: 它躺在独立的 pets 分区里, 由 Pet Bridge 从 Mac 侧推下来。
+// 设备上报的宠物身份一律现读槽里那一份(pet_slot_pet_id()), 槽空则报 "none" ——
+// 菜单栏看到 none 就把默认那只推下来。留着编译期默认值只会造出第二个真相,
+// 而且在换过宠物之后它必然是错的。
 
 // TCP 重连退避(毫秒): 从最小值开始倍增, 上限为最大值。
 #define PET_BRIDGE_RETRY_MIN_MS 1000

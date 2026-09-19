@@ -33,7 +33,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FONT_BY_PX = {16: "pet_font_16", 20: "pet_font_20"}
 UI_C = REPO_ROOT / "main" / "pet_ui.c"
+LAYOUT_C = REPO_ROOT / "main" / "pet_layout.c"
+LAYOUT_H = REPO_ROOT / "main" / "pet_layout.h"
 DUMPER = REPO_ROOT / "tests" / "dump_pet_strings.c"
+
+# 布局常量分散在三个文件里: 屏幕尺寸与舞台的上下限在 pet_layout.h, 站台坐标在
+# pet_layout.c(那边有主机测试); 顶栏/信息面板/配网页/传输页与宠物无关, 在 pet_ui.c。
+# 两边都必须是整数字面量。
+CONSTANT_SOURCES = (UI_C, LAYOUT_C, LAYOUT_H)
 
 # 动态文案要按最坏情况量: 设备名最长 8 个十六进制位, IPv4 最长 15 个字符。
 WORST_DEVICE_NAME = "CodexPet-FFFFFFFF"
@@ -120,14 +127,16 @@ def measure(text: str, font) -> int:
 
 
 def ui_constant(name: str) -> int:
-    """读 main/pet_ui.c 里的布局常量(必须是整数字面量)。"""
-    src = UI_C.read_text(encoding="utf-8")
-    match = re.search(rf"^#define {name}\s+(\d+)\s*$", src, re.M)
-    if match is None:
-        raise AssertionError(
-            f"main/pet_ui.c 里找不到整数常量 {name} —— 布局常量必须写成整数字面量, "
-            f"预览工具和本测试都靠正则读它")
-    return int(match.group(1))
+    """读布局常量(必须是整数字面量), 依次在 pet_ui.c 与 pet_layout.c 里找。"""
+    for path in CONSTANT_SOURCES:
+        src = path.read_text(encoding="utf-8")
+        match = re.search(rf"^#define {name}\s+(\d+)\s*(?://.*)?$", src, re.M)
+        if match is not None:
+            return int(match.group(1))
+    raise AssertionError(
+        f"找不到整数常量 {name} —— 布局常量必须写成整数字面量, "
+        f"预览工具和本测试都靠正则读它(找过 "
+        f"{', '.join(p.name for p in CONSTANT_SOURCES)})")
 
 
 def main() -> int:
@@ -136,7 +145,10 @@ def main() -> int:
 
     status_w = ui_constant("PROV_STATUS_W")
     card_w = ui_constant("PROV_CARD_W")
-    scr_w = ui_constant("SCR_W")
+    scr_w = ui_constant("PET_LAYOUT_SCR_W")
+    trans_msg_w = ui_constant("TRANS_MSG_W")
+    plat_text_w = ui_constant("PLAT_TEXT_W")
+    stage_w_ref = ui_constant("PET_LAYOUT_STAGE_W_REF")
 
     # (说明, 框宽, 字号, 文案) —— 文案的拼装方式与 main/pet_app.c 的
     # on_provision_state() 保持一致(配网完成那条是 "文案 + 空格 + IP")。
@@ -157,6 +169,14 @@ def main() -> int:
         ("设备名(最长)", scr_w, 16, WORST_DEVICE_NAME),
         ("底部提示", scr_w, *strings["prov_hint"]),
         ("底部提示(未开窗)", scr_w, *strings["prov_hint_open"]),
+        # 空槽的画面: 舞台区那句要放得进舞台, 站台那句是两行标签(PLAT_TEXT_W)。
+        ("没有宠物(舞台)", stage_w_ref, *strings["no_pet"]),
+        ("没有宠物(站台)", plat_text_w, *strings["ph_no_pet"]),
+        # 传输页: 标题占满整屏, 三句说明落在 TRANS_MSG_W 里(允许换行, 但单句要放得下)。
+        ("传输页标题", scr_w, *strings["transfer_title"]),
+        ("传输页: 启用中", trans_msg_w, *strings["transfer_enabling"]),
+        ("传输页: 失败", trans_msg_w, *strings["transfer_failed"]),
+        ("传输页: 重发", trans_msg_w, *strings["transfer_again"]),
     ]
 
     failures = []

@@ -75,6 +75,55 @@ static void test_unknown_state_value_keeps_message(void)
     assert(strcmp(capture.messages[0].text, "t") == 0);
 }
 
+// 宠物包宣告。这一行后面跟的是**裸字节**, 所以解析器必须把 size / crc32 / id 三条
+// 都解出来; 少一条就没法判断该收多久、收对了没。
+static void test_pet_announce_message(void)
+{
+    pet_protocol_t protocol;
+    pet_protocol_init(&protocol);
+    capture_t capture = {0};
+
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"pet\",\"id\":\"sophie-portrait\",\"size\":1234567,"
+                "\"crc32\":3735928559}\n") == 1);
+    assert(capture.count == 1);
+    assert(capture.messages[0].type == PET_MSG_PET);
+    assert(strcmp(capture.messages[0].text, "sophie-portrait") == 0);
+    assert(capture.messages[0].pet_size == 1234567);
+    // 0xDEADBEEF: 大于 INT32_MAX, 走有符号解析就会变成负数。
+    assert(capture.messages[0].pet_crc32 == 0xDEADBEEFu);
+    assert(!capture.messages[0].truncated);
+}
+
+// 缺字段 / 长度荒唐的宣告一律丢弃, 而且**不回调** —— 一旦接受了半条宣告, 后面
+// 几 MB 的二进制就会被当成文本喂给行解析器, 整个流再也对不上。
+static void test_pet_announce_rejects_incomplete(void)
+{
+    pet_protocol_t protocol;
+    pet_protocol_init(&protocol);
+    capture_t capture = {0};
+
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"pet\",\"id\":\"x\",\"size\":100}\n") == 0);  // 少 crc32
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"pet\",\"id\":\"x\",\"crc32\":1}\n") == 0);    // 少 size
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"pet\",\"size\":100,\"crc32\":1}\n") == 0);    // 少 id
+    // 比头部还短的"包"没有意义。
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"pet\",\"id\":\"x\",\"size\":8,\"crc32\":1}\n") == 0);
+    // 超出 uint32 的长度是非法输入, 不能截断成另一个数。
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"pet\",\"id\":\"x\",\"size\":4294967296,"
+                "\"crc32\":1}\n") == 0);
+    // id 太长(包头里只有 32 字节) —— 接受了的话回执报出去的 id 就和真正装上的
+    // 那只对不上。
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"pet\",\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+                "\"size\":100000,\"crc32\":1}\n") == 0);
+    assert(capture.count == 0);
+}
+
 static void test_text_only_message(void)
 {
     pet_protocol_t protocol;
@@ -237,6 +286,8 @@ int main(void)
     test_crlf_and_blank_lines();
     test_unknown_type_is_ignored();
     test_unknown_state_value_keeps_message();
+    test_pet_announce_message();
+    test_pet_announce_rejects_incomplete();
     test_text_only_message();
     test_escapes_and_unicode();
     test_raw_utf8_passthrough();

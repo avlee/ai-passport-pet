@@ -20,6 +20,7 @@
 #include "pet_protocol.h"
 #include "pet_provision.h"
 #include "pet_settings.h"
+#include "pet_slot.h"
 #include "pet_strings.h"
 #include "pet_ui.h"
 
@@ -102,6 +103,117 @@ static void on_bridge_message(const pet_message_t *msg, void *user)
 }
 
 // ---------------------------------------------------------------------------
+// 宠物包接收
+// ---------------------------------------------------------------------------
+// 这一段跑在 bridge 任务上, 而且是在**收字节的过程中**被反复调用, 所以每个回调都
+// 必须短: 真正耗时的擦写在 pet_slot 里(它自己按 16 KB 一段让出 CPU), 这里只更新
+// 屏幕上的进度。
+//
+// 一次传输的完整顺序(不能颠倒):
+//   on_pet_begin   拆界面(引用着 mmap 的图像描述符) -> 解除映射 -> 擦掉槽头部
+//   on_pet_data    边收边写, 顺便报进度
+//   on_pet_end     核对长度与 CRC -> 重新映射 -> 重建界面
+//
+// 中途掉线会走 on_pet_end(false): 槽的头部在 begin 时就擦掉了, 所以这个时候
+// 槽里既没有旧宠物也没有新宠物 —— 界面必须回到"还没有宠物", 不能停在传输页上。
+static uint32_t s_pet_size;
+static uint32_t s_pet_crc;
+static bool     s_pet_rx_failed;
+
+static esp_err_t on_pet_begin(const char *pet_id, uint32_t size, uint32_t crc32,
+                              void *user)
+{
+    (void)user;
+
+    // 配网时蓝牙和 Wi-Fi 同时在跑; 再压一次几十秒的 flash 擦写会让两边都超时。
+    // 菜单栏收到失败回执后会隔一会儿重试, 所以这里拒收是安全的。
+    if (pet_provision_active()) {
+        ESP_LOGW(TAG, "配网进行中, 拒绝接收宠物包");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (pet_slot_writing()) {
+        ESP_LOGW(TAG, "上一份宠物包还在写, 拒绝接收新的");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // 先拆界面再解除映射: 顺序反了, 界面上的图像描述符就指向一块已经归还的
+    // MMU 窗口。pet_ui_begin_transfer() 会把宠物界面整块删掉并顶上一块不引用
+    // 图集的进度屏 —— 传输期间屏幕不会黑。
+    pet_ui_begin_transfer(pet_id, size);
+    pet_atlas_unload();
+
+    s_pet_size = size;
+    s_pet_crc = crc32;
+    s_pet_rx_failed = false;
+
+    const esp_err_t err = pet_slot_begin(size);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "无法开始接收宠物包: %s", pet_slot_last_error());
+        s_pet_rx_failed = true;
+        pet_ui_set_transfer_message(PET_STR_TRANSFER_FAILED, PET_TONE_BAD);
+        return err;
+    }
+    return ESP_OK;
+}
+
+static void on_pet_data(const uint8_t *data, size_t len, void *user)
+{
+    (void)user;
+    // 已经失败就别再写了 —— slot 会把后续每一段都拒掉, 只会把日志刷满。
+    if (s_pet_rx_failed) return;
+
+    if (pet_slot_write(data, len) != ESP_OK) {
+        ESP_LOGE(TAG, "写宠物包失败: %s", pet_slot_last_error());
+        pet_slot_abort();
+        s_pet_rx_failed = true;
+        pet_ui_set_transfer_message(PET_STR_TRANSFER_FAILED, PET_TONE_BAD);
+        return;
+    }
+    pet_ui_set_transfer_progress(pet_slot_written());
+}
+
+static void on_pet_end(bool ok, void *user)
+{
+    (void)user;
+
+    bool installed = false;
+
+    if (ok && !s_pet_rx_failed) {
+        // finish() 自己核对长度与整包 CRC32(它是边收边算的, 不用把 3 MB 从 flash
+        // 里读回来)。
+        const esp_err_t err = pet_slot_finish(s_pet_size, s_pet_crc);
+        if (err == ESP_OK && pet_atlas_load()) {
+            installed = true;
+        } else {
+            ESP_LOGE(TAG, "宠物包校验失败: %s", pet_slot_last_error());
+        }
+    } else {
+        pet_slot_abort();
+    }
+
+    if (installed) {
+        ESP_LOGI(TAG, "宠物已换成 %s", pet_atlas_pet_id());
+        pet_ui_end_transfer();
+        pet_ui_build();   // 新宠物的舞台尺寸可能不同, 界面必须按它重建
+    } else {
+        // 失败要在屏幕上留一会儿: 立刻收回的话用户只会看到界面闪一下, 根本不知道
+        // 刚才发生了什么。停顿期间链路是空闲的, 压住 bridge 任务两秒没有代价。
+        pet_ui_set_transfer_message(PET_STR_TRANSFER_FAILED "\n" PET_STR_TRANSFER_AGAIN,
+                                    PET_TONE_BAD);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+
+        // 槽这时是空的(头部已在 begin 时擦掉), 所以底下是"还没有宠物"的画面;
+        // 但也要把槽重新挂一遍: 万一失败发生在 finish 之后, 槽里其实是有东西的。
+        pet_ui_end_transfer();
+        (void)pet_atlas_load();
+        pet_ui_build();
+    }
+
+    s_pet_rx_failed = false;
+    (void)pet_bridge_notify_pet_done(installed);
+}
+
+// ---------------------------------------------------------------------------
 // 蓝牙配网
 // ---------------------------------------------------------------------------
 // 这台设备原先靠"改 pet_config_local.h 再重新烧录"换网络, 换个 Wi-Fi 就得重编一次。
@@ -113,6 +225,9 @@ static void on_bridge_message(const pet_message_t *msg, void *user)
 static const pet_bridge_sink_t s_bridge_sink = {
     .on_message = on_bridge_message,
     .on_link = on_bridge_link,
+    .on_pet_begin = on_pet_begin,
+    .on_pet_data = on_pet_data,
+    .on_pet_end = on_pet_end,
     .user = NULL,
 };
 
@@ -422,7 +537,11 @@ static void input_task(void *arg)
 // ---------------------------------------------------------------------------
 esp_err_t pet_app_start(void)
 {
-    pet_atlas_init();
+    // 宠物先就位, 界面才知道该按多大的舞台摆版式。槽是空的不是错误: 界面会显示
+    // "还没有宠物", 菜单栏连上来看到 hello 里的 pet=none 会自己推一只下来。
+    (void)pet_slot_init();
+    (void)pet_atlas_load();
+
     pet_fonts_init();
     check_string_coverage();
 

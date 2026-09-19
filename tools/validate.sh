@@ -14,8 +14,30 @@ usage() {
     echo "Usage: $0 [--all|--static|--firmware]" >&2
 }
 
+# 挑一个能真正跑"图集 -> .pet"的解释器。PET_PYTHON 给定了就照用, 不再探测 ——
+# 显式指定的东西不该被悄悄换掉。
+pick_pet_python() {
+    local candidate
+    if [[ -n "${PET_PYTHON:-}" ]]; then
+        printf '%s' "${PET_PYTHON}"
+        return 0
+    fi
+    # python3 走 PATH: 激活过的 venv 本来就会被它命中, 所以最常见的情况在第一个候选
+    # 就解决了。后面几个是没激活 venv 时的常见落点。都不行就用 PET_PYTHON 指定。
+    for candidate in python3 .venv/bin/python3 "${HOME:-}/.venv/bin/python3" \
+        /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+        if command -v "${candidate}" >/dev/null 2>&1 &&
+            "${candidate}" -c 'import PIL' >/dev/null 2>&1; then
+            printf '%s' "${candidate}"
+            return 0
+        fi
+    done
+    printf 'python3'
+}
+
 run_static_checks() {
     local actionlint_bin
+    local pet_python
     local test_dir
 
     python3 tools/check_repo.py
@@ -77,11 +99,20 @@ run_static_checks() {
         tests/test_pet_protocol.c main/pet_protocol.c main/pet_state.c \
         -o "${test_dir}/test_pet_protocol"
     "${test_dir}/test_pet_protocol"
+    # 宠物包格式: 帧表/状态表的布局一旦写错, 表现是"动画错位"或"花屏", 全都能正常
+    # 编译运行 —— 所以格式的每一条约束都在主机上单独钉一遍。
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
-        tests/test_pet_atlas.c main/pet_atlas_validate.c \
-        main/pet_atlas_sophie_portrait.c \
-        -o "${test_dir}/test_pet_atlas"
-    "${test_dir}/test_pet_atlas"
+        tests/test_pet_pkg.c main/pet_pkg.c main/pet_state.c \
+        -o "${test_dir}/test_pet_pkg"
+    "${test_dir}/test_pet_pkg"
+    # 版式: 舞台尺寸现在是运行时的, 算错的后果同样是静默的(宠物整体偏几像素)。
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_pet_layout.c main/pet_layout.c \
+        -o "${test_dir}/test_pet_layout"
+    "${test_dir}/test_pet_layout"
+    # 预览工具把同一套版式算术在 Python 里又写了一遍(它编译不了 C), 两份实现跑偏
+    # 只会让预览图骗人 —— 拿上面的 C 逐字段对照。不需要 Pillow。
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_pet_layout_mirror.py
     # 蓝牙配网: 命令解析与状态拼装是纯字符串逻辑。这一层的错误只会表现成"界面一直
     # 停在等待配对", 所以在主机上把边界和拒绝路径钉死。
     # -Itests/host_stubs 给出 pet_settings.h 需要的 esp_err.h 替身(只在这一条命令里,
@@ -98,6 +129,22 @@ run_static_checks() {
     # 满屏被配网页盖住, 看起来就是死机。这条把提示语和按键处理钉在一起。
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_pet_button_semantics.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_pet_bridge.py
+    # 宠物包是跨语言契约(Python 写字节, C 按结构体读), 错开了只会静默拒收。
+    # 这条让生成器真正写出来的字节走一遍设备解析器, 并逐字节确认三条 CRC 各自
+    # 守住了范围。
+    #
+    # 解释器要**优先挑带 Pillow 的**: 换宠物第一步是"图集 -> .pet", 只有那几个
+    # 模块用得到 Pillow。拿一个没装 Pillow 的 python3 硬跑也能过 —— 它会跳过整条
+    # 打包管线, 于是门禁全绿而那段代码一行都没被执行到。真机上就撞过一次:
+    # 桥接被 GUI 用系统 python 拉起, 启动一切正常, 只有换宠物报"内部错误"。
+    # PET_PYTHON 可以显式指定(给了就照用, 不再探测)。
+    pet_python="$(pick_pet_python)"
+    if "${pet_python}" -c 'import PIL' >/dev/null 2>&1; then
+        echo "[host] 宠物打包用 ${pet_python}（有 Pillow）"
+    else
+        echo "[host] 没找到带 Pillow 的解释器, '图集 -> .pet' 那一段会被跳过"
+    fi
+    PYTHONDONTWRITEBYTECODE=1 "${pet_python}" tests/test_pet_package.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_deep_sleep_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_check_repo.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_verify_firmware.py

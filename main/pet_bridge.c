@@ -21,6 +21,8 @@
 #include "lwip/sockets.h"
 #include "nvs_flash.h"
 #include "pet_config.h"
+#include "pet_pkg.h"
+#include "pet_slot.h"
 
 static const char *TAG = "pet_bridge";
 
@@ -31,8 +33,8 @@ static const char *TAG = "pet_bridge";
 #define PET_BRIDGE_TASK_PRIORITY 5
 // 单次 select 的等待上限, 决定了对 stop 请求的响应速度。
 #define PET_BRIDGE_SELECT_TIMEOUT_MS 500
-// 一次最多处理多少接收字节。
-#define PET_BRIDGE_RX_CHUNK 512
+// 一次最多处理多少接收字节。传输宠物包时这里就是每次 recv 的块大小, 所以别太小。
+#define PET_BRIDGE_RX_CHUNK 1024
 
 static pet_settings_t s_settings;
 static pet_bridge_sink_t s_sink;
@@ -48,16 +50,96 @@ static atomic_bool s_online;
 static bool s_ready;
 static uint32_t s_generation;  // 每次 start/stop 递增, 用于让旧任务自行退出
 
+// ---------------------------------------------------------------------------
+// 宠物包接收
+// ---------------------------------------------------------------------------
+// 线路上的形态: 一行 {"type":"pet","id":...,"size":N,"crc32":...} 之后, 紧跟 N 个
+// **裸字节**。不套 base64 是因为 3 MB 的包多出 33% 的传输量, 而这段是整条链路最
+// 慢的一步; 直接流式写进 flash 也省掉一次完整的 RAM 缓冲(那点堆根本不够)。
+//
+// 代价是"行模式"和"二进制模式"要在同一根流上切换, 而两者可能落在同一个 recv 里,
+// 所以切换到二进制之后剩下的字节必须按计数消费, 不能再喂给行解析器。
+typedef struct {
+    bool     active;
+    bool     discard;    // 应用拒收(槽放不下/正在配网): 读完丢掉, 只为保持同步
+    uint32_t remaining;  // 还差多少字节
+    uint32_t total;
+    char     id[PET_PKG_ID_MAX];
+} pet_rx_t;
+
+static pet_rx_t s_pet_rx;
+// 流里还夹着没读完的二进制, 却已经收到了下一个宣告 —— 两边对不上了, 没法就地
+// 重新同步, 只能断开重连。置位后 pump_socket() 立刻返回假。
+static bool s_rx_desync;
+
 // 这些函数由 bridge / 事件任务调用, 因此把回调包一层, 保证 sink 已经设置好。
 static void emit_link(pet_link_state_t link)
 {
     if (s_sink_valid && s_sink.on_link) s_sink.on_link(link, s_sink.user);
 }
 
+static bool pet_data_sink_ready(void)
+{
+    return s_sink_valid && !s_pet_rx.discard && s_sink.on_pet_data != NULL;
+}
+
+// 处理一条 {"type":"pet",...} 宣告。**不把它转发给 on_message**: 应用要从
+// on_pet_begin/on_pet_data/on_pet_end 这条路径感知传输, 多一条消息只会让人以为
+// 有两个数据源。
+static void arm_pet_rx(const pet_message_t *msg)
+{
+    if (s_pet_rx.active) {
+        ESP_LOGE(TAG, "上一份宠物包还差 %u 字节没读完, 断开链路重新对齐",
+                 (unsigned)s_pet_rx.remaining);
+        s_rx_desync = true;
+        return;
+    }
+
+    const uint32_t size = msg->pet_size;
+    bool accepted = false;
+
+    if (size > PET_BRIDGE_PET_MAX_BYTES) {
+        ESP_LOGW(TAG, "宠物包声明 %u 字节, 超过上限 %u, 拒收", (unsigned)size,
+                 (unsigned)PET_BRIDGE_PET_MAX_BYTES);
+    } else {
+        if (s_sink_valid && s_sink.on_pet_begin != NULL) {
+            accepted = s_sink.on_pet_begin(msg->text, size, msg->pet_crc32,
+                                          s_sink.user) == ESP_OK;
+        }
+        if (!accepted) ESP_LOGW(TAG, "应用拒收宠物包 %s(%u 字节), 收完即丢",
+                                msg->text, (unsigned)size);
+    }
+
+    s_pet_rx.active = true;
+    s_pet_rx.discard = !accepted;
+    s_pet_rx.remaining = size;
+    s_pet_rx.total = size;
+    // 解析器已经拒过长过 PET_PKG_ID_MAX 的 id, 这里用 strlcpy 只是为了不触发
+    // -Wformat-truncation(编译器看不到另一侧的长度校验)。
+    strlcpy(s_pet_rx.id, msg->text, sizeof(s_pet_rx.id));
+}
+
+static void finish_pet_rx(bool ok)
+{
+    if (!s_pet_rx.active) return;
+
+    s_pet_rx.active = false;
+    s_pet_rx.remaining = 0;
+
+    if (!s_pet_rx.discard && s_sink_valid && s_sink.on_pet_end != NULL) {
+        s_sink.on_pet_end(ok, s_sink.user);
+    }
+    s_pet_rx.discard = false;
+}
+
 // 签名要匹配 pet_msg_cb_t(第二个参数是 user, 这里不用), 否则类型不兼容。
 static void emit_message(const pet_message_t *msg, void *user)
 {
     (void)user;
+    if (msg->type == PET_MSG_PET) {
+        arm_pet_rx(msg);
+        return;
+    }
     if (s_sink_valid && s_sink.on_message) s_sink.on_message(msg, s_sink.user);
 }
 
@@ -173,10 +255,12 @@ esp_err_t pet_bridge_notify(const char *type, const char *text)
 
 static void send_hello(void)
 {
+    // pet 报的是槽里**当前**那只 —— 它现在是运行时的, 换一只不用重刷固件。
+    // "none" 是有意义的值: 菜单栏看到它就把默认那只推下来。
     char line[PET_PROTOCOL_LINE_MAX];
     snprintf(line, sizeof(line),
              "{\"type\":\"hello\",\"fw\":\"%s\",\"pet\":\"%s\"}\n",
-             PET_FIRMWARE_VERSION, PET_PACKAGE_ID);
+             PET_FIRMWARE_VERSION, pet_slot_pet_id());
     if (send_line(line) != ESP_OK) {
         ESP_LOGW(TAG, "hello 发送失败");
     }
@@ -200,6 +284,29 @@ esp_err_t pet_bridge_notify_battery(int soc_percent)
 {
     atomic_store(&s_last_soc, soc_percent);
     return send_battery(soc_percent);
+}
+
+esp_err_t pet_bridge_notify_pet_done(bool ok)
+{
+    // 成功时报的是**槽里那只**(从包头读出来的), 不是宣告里那只 —— 万一对面发错了
+    // 文件, 这一条就是菜单栏发现真相的地方。失败时才退回宣告里的 id, 好让它知道
+    // 是哪一次尝试失败了。
+    const char *id = ok ? pet_slot_pet_id() : s_pet_rx.id;
+
+    // 转义一遍: id 虽然由解析器限了长度, 但里面的引号/反斜杠会把这一行 JSON 拼坏。
+    char escaped[PET_PKG_ID_MAX * 2];
+    if (!pet_protocol_escape(id, escaped, sizeof(escaped))) {
+        escaped[0] = '\0';
+    }
+
+    char line[PET_PROTOCOL_LINE_MAX];
+    snprintf(line, sizeof(line), "{\"type\":\"petdone\",\"id\":\"%s\",\"ok\":%s}\n",
+             escaped, ok ? "true" : "false");
+    const esp_err_t err = send_line(line);
+
+    // 换成功了就把新的身份也报一遍: 菜单栏据此更新"现在是哪只", 不必等重连。
+    if (ok) send_hello();
+    return err;
 }
 
 // ---------------------------------------------------------------------------
@@ -281,9 +388,49 @@ static void close_socket(void)
     }
 }
 
+// 按当前模式消费一批刚收到的字节。返回 true 表示链路仍然健康。
+//
+// 关键在"一次只喂一个字节给行解析器": 宣告那一行结束时, 同一批 recv 里往往已经
+// 跟着几百字节的二进制载荷, 按整块喂进去它们会被当成文本来解析。逐字节喂没有
+// 性能问题 —— 真正占流量的 3 MB 载荷是整块消费的, 走行解析的只有 JSON 行本身。
+static bool consume_rx(pet_protocol_t *protocol, const char *data, size_t len)
+{
+    size_t offset = 0;
+
+    while (offset < len) {
+        if (s_pet_rx.active) {
+            if (s_pet_rx.remaining == 0) {
+                // 不该发生(收满就前移到结束态了), 但真发生的话这里会死循环。
+                s_rx_desync = true;
+                return false;
+            }
+
+            size_t take = len - offset;
+            if (take > s_pet_rx.remaining) take = s_pet_rx.remaining;
+
+            if (pet_data_sink_ready()) {
+                s_sink.on_pet_data((const uint8_t *)data + offset, take,
+                                   s_sink.user);
+            }
+            offset += take;
+            s_pet_rx.remaining -= (uint32_t)take;
+            if (s_pet_rx.remaining == 0) finish_pet_rx(true);
+            continue;
+        }
+
+        pet_protocol_feed(protocol, data + offset, 1, emit_message, NULL);
+        offset++;
+        if (s_rx_desync) return false;
+    }
+    return true;
+}
+
 // 返回 true 表示链路仍然健康。
 static bool pump_socket(pet_protocol_t *protocol, int64_t *last_rx_us)
 {
+    // 流已经对不上(二进制没读完就来了新宣告), 本地没法重新同步, 交给外层重连。
+    if (s_rx_desync) return false;
+
     char buffer[PET_BRIDGE_RX_CHUNK];
 
     fd_set read_set;
@@ -299,6 +446,8 @@ static bool pump_socket(pet_protocol_t *protocol, int64_t *last_rx_us)
     }
     if (ready == 0) {
         // 对端静默可能是拔网线/睡死; 超过空闲上限就主动断开重连。
+        // 传输中不算空闲: 擦 flash 会把这一拍拖长, 而载荷本身不刷新 last_rx_us
+        // 之外的东西 —— 这里靠 last_rx_us 就够了, 因为每收到数据都会更新它。
         return (esp_timer_get_time() - *last_rx_us) <
                (int64_t)PET_BRIDGE_IDLE_TIMEOUT_MS * 1000;
     }
@@ -306,8 +455,7 @@ static bool pump_socket(pet_protocol_t *protocol, int64_t *last_rx_us)
     const ssize_t received = recv(s_socket, buffer, sizeof(buffer), 0);
     if (received > 0) {
         *last_rx_us = esp_timer_get_time();
-        pet_protocol_feed(protocol, buffer, (size_t)received, emit_message, NULL);
-        return true;
+        return consume_rx(protocol, buffer, (size_t)received);
     }
     if (received == 0) {
         ESP_LOGI(TAG, "对端关闭连接");
@@ -362,6 +510,8 @@ static void bridge_task(void *arg)
         backoff_ms = PET_BRIDGE_RETRY_MIN_MS;
         logged_backoff = 0;
         pet_protocol_init(&protocol);
+        s_rx_desync = false;
+        memset(&s_pet_rx, 0, sizeof(s_pet_rx));
         last_rx_us = esp_timer_get_time();
         // 必须先置 online 再发 hello: send_line() 会用 s_online 判断链路是否可用,
         // 顺序反了 hello 会被自己挡掉(实测就是这条一直发不出去)。
@@ -377,6 +527,10 @@ static void bridge_task(void *arg)
         while (!atomic_load(&s_stop) && generation == s_generation) {
             if (!pump_socket(&protocol, &last_rx_us)) break;
         }
+
+        // 传到一半断线: 必须通知应用。槽的头部在 begin 时就已经擦掉了, 所以这时
+        // 槽里既没有旧宠物也没有新宠物 —— 应用要据此把界面切回"还没有宠物"。
+        finish_pet_rx(false);
 
         set_online(false);
         close_socket();

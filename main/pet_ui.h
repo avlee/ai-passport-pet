@@ -1,6 +1,6 @@
 // main/pet_ui.h
 // Codex 宠物界面: 一块直接立在背景上的宠物舞台 + 状态标签 + 站台(承载文本)
-// + 信息面板 + 蓝牙配网页。
+// + 信息面板 + 蓝牙配网页 + 宠物传输页。
 //
 // 设计目标(用户第一条要求): 屏幕上的宠物要和 ChatGPT App 里的看起来一致,
 // 且动画流畅。为此:
@@ -10,11 +10,17 @@
 //      来自素材本身, 与 ChatGPT 里的表现一致, 不是我们另加的动画。
 //   3. 帧间隔直接取图集里的 duration, 不额外插值, 也不做固定帧率。
 //
-// 线程约定: 本文件的每个函数都会自己加 LVGL 锁, 因此可以从任意任务调用,
-// 但【不能在已持有 LVGL 锁时调用】(锁不可重入)。
+// 版式: 舞台尺寸现在是**运行时**的(每只宠物图集的裁剪区并集不同), 所以坐标不再
+// 是这里的常量, 而是 main/pet_layout.c 按当前宠物算出来的 pet_layout_t。
+//
+// 线程约定: 本文件的每个函数都会自己加 LVGL 锁, 因此可以从任意任务调用。
+// 那把锁是递归互斥量(esp_lvgl_port 用 xSemaphoreCreateRecursiveMutex), 所以
+// 从已持锁的路径里再调一次是安全的 —— 文件内部因此仍保留 *_locked 版本,
+// 只是为了避免重复取锁的开销, 不是因为会死锁。
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "pet_settings.h"
 #include "pet_state.h"
@@ -76,3 +82,29 @@ void pet_ui_set_provision(const char *device_name, const char *pin,
 
 // 当前正在播放的动画行(调试/日志用)。
 pet_anim_t pet_ui_current_anim(void);
+
+// ---------------------------------------------------------------------------
+// 宠物传输页
+// ---------------------------------------------------------------------------
+// 换宠物的第一步必须把图集从 flash 上解除映射 —— 一边 mmap 一边擦写同一块 flash
+// 是未定义行为 —— 而宠物界面上正挂着指向那块 mmap 的图像描述符。所以只能先把宠物
+// 界面整个拆掉。
+//
+// 拆掉之后不能留一块黑屏: 那几秒钟用户完全不知道设备在干什么, 拔电就废了半份包。
+// 于是这里另建一块只有文字和进度条的屏幕顶上, 传完由调用方
+// pet_atlas_load() + pet_ui_build() 重建宠物界面。
+
+// 拆掉宠物界面, 换成传输页。total_bytes 为 0 时进度条按不确定处理。
+void pet_ui_begin_transfer(const char *pet_id, uint32_t total_bytes);
+
+// 更新进度。没在传输时是空操作。
+void pet_ui_set_transfer_progress(uint32_t received_bytes);
+
+// 改传输页底部那行说明(如"正在启用…"/失败原因)。没在传输时是空操作。
+void pet_ui_set_transfer_message(const char *text, pet_tone_t tone);
+
+// 拆掉传输页。调用方随后负责 pet_ui_build()。
+void pet_ui_end_transfer(void);
+
+// 是否正停在传输页上。
+bool pet_ui_transferring(void);

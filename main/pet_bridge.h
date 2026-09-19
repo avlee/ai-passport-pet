@@ -20,8 +20,26 @@ typedef struct {
     void (*on_message)(const pet_message_t *msg, void *user);
     // 链路状态变化: 只会是 PET_LINK_OFFLINE / PET_LINK_CONNECTING / PET_LINK_ONLINE。
     void (*on_link)(pet_link_state_t link, void *user);
+
+    // --- 宠物包传输 ---------------------------------------------------------
+    // 收到 {"type":"pet",...} 宣告后问一次: 收不收? 返回 ESP_OK 表示收, bridge
+    // 会把紧随其后的 size 个字节按二进制喂给 on_pet_data。
+    //
+    // 返回非 ESP_OK(比如槽里放不下、正在配网)时 bridge **仍会把这 size 个字节
+    // 读完丢掉** —— 链路必须保持同步, 否则后面所有文本都会被当成二进制吃掉。
+    // 所以拒绝是安全的, 但别指望对面知道: 主动回条消息说明比较好。
+    esp_err_t (*on_pet_begin)(const char *pet_id, uint32_t size, uint32_t crc32,
+                              void *user);
+    void (*on_pet_data)(const uint8_t *data, size_t len, void *user);
+    // 载荷收完或被中断。ok 为假表示字节数没凑齐(链路断了 / 对端提前关闭)。
+    void (*on_pet_end)(bool ok, void *user);
+
     void *user;
 } pet_bridge_sink_t;
+
+// 宠物包长度上限。分区是 3.94 MB, 加上这个上限是为了在宣告阶段就拒掉荒唐的值,
+// 而不是先擦掉槽再发现收不完。
+#define PET_BRIDGE_PET_MAX_BYTES (4u * 1024u * 1024u)
 
 // 初始化 NVS / netif / event loop 与 Wi-Fi STA, 并按 settings 配好凭据。
 // 可重复调用; 已配置时会用新凭据重配。
@@ -42,6 +60,11 @@ esp_err_t pet_bridge_notify(const char *type, const char *text);
 // 要在下一次电量变化(最多 5 秒一拍)之前一直显示"未知"。
 // 未连接时不算错误, 只是没人接收。
 esp_err_t pet_bridge_notify_battery(int soc_percent);
+
+// 一次宠物包接收结束。ok 为真时还会顺手补发一次 hello —— 换的宠物变了, 菜单栏
+// 得知道新的 pet id, 靠 petdone 一条报文同时把"结束了"和"现在是谁"说清楚。
+// id 用的是宣告里那个, 由 bridge 自己记着, 调用方不用再传。
+esp_err_t pet_bridge_notify_pet_done(bool ok);
 
 // 当前是否已连接(供 UI 查询)。
 bool pet_bridge_is_online(void);

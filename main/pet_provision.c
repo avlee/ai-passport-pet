@@ -25,6 +25,8 @@
 #include "os/os_mbuf.h"
 #include "pet_config.h"
 #include "pet_provision_parse.h"
+// 配网信息里的 pet 字段报的是槽里当前那只, 不再是编译期常量。
+#include "pet_slot.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
@@ -271,7 +273,7 @@ static bool build_info_json(char *out, size_t size)
         out, size,
         "{\"device\":\"%s\",\"fw\":\"%s\",\"pet\":\"%s\",\"configured\":%s,"
         "\"ssid\":\"%s\",\"host\":\"%s\",\"port\":%u,\"paired\":%s}",
-        s_device_name, PET_FIRMWARE_VERSION, PET_PACKAGE_ID,
+        s_device_name, PET_FIRMWARE_VERSION, pet_slot_pet_id(),
         pet_settings_is_configured(&current) ? "true" : "false", ssid, host,
         (unsigned)current.port, paired ? "true" : "false");
 

@@ -7,12 +7,13 @@ idf_component_register(
     SRCS "main.c"
          "pet_app.c"
          "pet_ui.c"
+         "pet_layout.c"
          "pet_state.c"
          "pet_protocol.c"
          "pet_settings.c"
+         "pet_pkg.c"
+         "pet_slot.c"
          "pet_atlas.c"
-         "pet_atlas_sophie_portrait.c"
-         "pet_atlas_validate.c"
          "pet_fonts.c"
          "pet_strings.c"
          "pet_bridge.c"
@@ -31,10 +32,12 @@ idf_component_register(
          "demo_ble.c"
          "demo_low_power.c"
     INCLUDE_DIRS "."
-    REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
-    # 逐帧提取出来的宠物图集(RGB565A8)。由 tools/gen_pet_assets.py 生成,
-    # 链接成 _binary_pet_sophie_portrait_bin_start/_end, 见 pet_atlas.c。
-    EMBED_FILES "assets/pet_sophie_portrait.bin"
+    # esp_partition / spi_flash: 宠物槽要从 pets 分区读并 mmap。
+    REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_partition esp_timer
+             esp_wifi nvs_flash spi_flash
+    # 宠物不再是编译期资源: 它躺在 partitions.csv 里那个 `pets` 分区中, 由
+    # tools/gen_pet_package.py 生成 .pet 包后经 WiFi 从菜单栏应用推下来。
+    # 所以这里没有 EMBED_FILES —— 换宠物不需要重新编译, 更不需要重新烧录。
 )
 
 # 生成的字库源文件体积很大(~10 MB 源码), 按 assets/README.md 的约定放在仓库根的

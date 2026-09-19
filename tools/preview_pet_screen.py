@@ -1,123 +1,280 @@
 #!/usr/bin/env python3
-"""把宠物界面渲染成 PNG 预览, 不接真机也能看版式。
+"""把宠物界面渲染成预览 PNG, 不接真机也能看版式。
 
-为什么要从"生成产物"而不是从源图集画:
-  - 帧表从 main/pet_atlas_<pet>_portrait.c 解析, 像素从
-    main/assets/pet_<pet>_portrait.bin 读 —— 也就是固件真正烧进去的那份字节。
-    所以这个预览同时也在验证生成脚本的裁剪偏移和 blob 布局是不是对的:
-    如果偏移算错, 预览里的宠物立刻会缺一块或错位。
-  - 布局常量从 main/pet_ui.c 里解析, 不复制一份, 避免两边慢慢跑偏。
+编辑器里看不到那块 240x320 的屏, 所以预览是唯一能"眼见为实"的途径。为了让它真的
+可信, 这里不复制任何一份数据, 全部从源头读:
 
-文字用系统 CJK 字体近似(设备上用的是子集化的 Noto Sans CJK SC), 所以字形会有
-细微差别, 位置和字号是准的。
+  * 像素与帧表来自一份 **.pet 包**(默认用 tools/gen_pet_package.py 现打一份)。
+    用包而不是源图集, 是因为要看的正是设备会收到的那串字节 —— 打包时的裁剪偏移
+    算错, 预览里立刻缺一块或错位。``--package`` 还可以直接指一个现成的 .pet,
+    用来确认"设备上那份到底是什么样"。
+  * 布局常量从 main/pet_layout.h/.c 与 main/pet_ui.c 的 #define 解析;
+    配色从 pet_ui.c 的 COL_* 解析; 文案从 main/pet_strings.h 解析。
+  * 字体行高与基线从 assets/fonts/pet_font_{16,20}.c 读。
+
+文字用系统 CJK 字体近似(设备上是子集化的 Noto Sans CJK SC), 所以字形有细微差别;
+**位置是按 LVGL 的算法算的**, 不是估的:
+
+    基线 = 行框顶 + line_height - base_line
+
+(见 lvgl 的 lv_draw_label.c:626; base_line 的口径是"从行框底边量起", 见生成字体里
+的注释。)行高与基线都取自生成字体, 所以换字体/换字号这边会自动跟上。
 
 用法:
-    python3 tools/preview_pet_screen.py                       # 每个状态一张
-    python3 tools/preview_pet_screen.py --anim working        # 只画指定动作
-    python3 tools/preview_pet_screen.py --frame 3             # 画该动作的第 3 帧
-    python3 tools/preview_pet_screen.py --battery 95%         # 指定顶栏电量
+    python3 tools/preview_pet_screen.py                     # 全部屏, 每屏一张
+    python3 tools/preview_pet_screen.py --pet li-muwan      # 换一只宠物出图
+    python3 tools/preview_pet_screen.py --package out.pet   # 用现成的包
+    python3 tools/preview_pet_screen.py --anim working      # 只画指定动作的屏
+    python3 tools/preview_pet_screen.py --frame 3           # 画该动作的第 3 帧
+    python3 tools/preview_pet_screen.py --battery 95%       # 指定顶栏电量
     python3 tools/preview_pet_screen.py --out-dir /tmp/preview
 """
 
 from __future__ import annotations
 
 import argparse
+import math
+import os
 import re
+import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+# 出图当然要 Pillow, 但 tests/test_pet_layout_mirror.py 只借走下面的版式算术
+# (它要在没有 Pillow 的解释器上也能跑), 所以这里不强求。
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:   # pragma: no cover - 只在没装 Pillow 的解释器上走到
+    Image = ImageDraw = ImageFont = None   # type: ignore[assignment]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-# 与 main/pet_ui.c 的调色板保持一致。颜色是十六进制常量, 正则抓不到, 只能抄 —
-# 改了 pet_ui.c 的 COL_* 就要回来一起改。
-COLORS = {
-    "COL_BG": (0x0B, 0x0F, 0x14),
-    "COL_CARD": (0x16, 0x20, 0x2A),
-    "COL_CARD_EDGE": (0x22, 0x32, 0x3F),
-    "COL_PLAT_FLOOR": (0x22, 0x34, 0x44),
-    "COL_PLAT_RIM": (0x3E, 0x63, 0x83),
-    "COL_PLAT_BODY": (0x13, 0x1B, 0x24),
-    "COL_INK": (0xE8, 0xF1, 0xF5),
-    "COL_MUTED": (0x7C, 0x93, 0xA3),
-    "COL_ACCENT": (0x4C, 0xC2, 0xFF),
-    "COL_GOOD": (0x4A, 0xDE, 0x80),
-    "COL_WARN": (0xFB, 0xBF, 0x24),
-    "COL_BAD": (0xF8, 0x71, 0x71),
-}
+import gen_pet_package as gen  # noqa: E402  (路径在上面设好了)
 
-# 状态 -> (状态文字, 圆点颜色, 站台占位文案, 动作行, 是否睡眠)
+LAYOUT_H = REPO_ROOT / "main" / "pet_layout.h"
+LAYOUT_C = REPO_ROOT / "main" / "pet_layout.c"
+UI_C = REPO_ROOT / "main" / "pet_ui.c"
+STRINGS_H = REPO_ROOT / "main" / "pet_strings.h"
+FONT_C = {16: REPO_ROOT / "assets" / "fonts" / "pet_font_16.c",
+          20: REPO_ROOT / "assets" / "fonts" / "pet_font_20.c"}
+
+# 布局常量分散在三个文件里: 屏幕尺寸与舞台上下限在 pet_layout.h, 站台坐标在
+# pet_layout.c(那边有主机测试), 顶栏/配网页/传输页与宠物无关, 在 pet_ui.c。
+# 三处都必须写成整数字面量 —— 宏算式这里读不懂、会被静默漏掉。
+CONSTANT_SOURCES = (LAYOUT_H, LAYOUT_C, UI_C)
+
+# 状态屏。(文件名后缀, 状态文案键, 圆点颜色, 站台文案键, 动作, 是否睡眠)
+# 动作名必须与 .pet 的状态表一致(main/pet_state.h 的 pet_anim_t)。
 SCENES = [
-    ("idle",        "空闲",     "COL_GOOD",  "等待 Codex 任务", "idle",    False),
-    ("working",     "工作中",   "COL_ACCENT", "Codex 正在执行", "running", False),
-    ("waiting",     "等待确认", "COL_WARN",  "需要你确认",      "waiting", False),
-    ("ready",       "已完成",   "COL_GOOD",  "任务已完成",      "review",  False),
-    ("failed",      "出错了",   "COL_BAD",   "任务中断",        "failed",  False),
-    ("offline",     "离线",     "COL_MUTED", "未连接 Codex",    "idle",    True),
+    ("idle",    "PET_STR_STATUS_IDLE",    "COL_GOOD",   "PET_STR_PH_IDLE",    "idle",    False),
+    ("working", "PET_STR_STATUS_WORKING", "COL_ACCENT", "PET_STR_PH_WORKING", "running", False),
+    ("waiting", "PET_STR_STATUS_WAITING", "COL_WARN",   "PET_STR_PH_WAITING", "waiting", False),
+    ("ready",   "PET_STR_STATUS_READY",   "COL_GOOD",   "PET_STR_PH_READY",   "review",  False),
+    ("failed",  "PET_STR_STATUS_FAILED",  "COL_BAD",    "PET_STR_PH_FAILED",  "failed",  False),
+    ("offline", "PET_STR_STATUS_OFFLINE", "COL_MUTED",  "PET_STR_PH_OFFLINE", "idle",    True),
 ]
 
-# 字体候选: macOS 上优先苹方/冬青黑, Linux 上退到 Noto。
+# 与宠物无关的三块屏: 空槽 / 传输页 / 配网页。
+STATIC_SCREENS = ("nopet", "transfer", "prov")
+
+# 设备上的字体是子集化的 Noto Sans CJK SC; 这里只求"字形像", 位置另算。
+# 注意 PingFang.ttc 在较新的 macOS 上已经不在这个路径, 且 FreeType 也打不开它 ——
+# 排在后面当兜底即可。
 FONT_CANDIDATES = [
     "/System/Library/Fonts/PingFang.ttc",
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
 ]
 
 
-def parse_layout(pet_ui: Path) -> dict[str, int]:
-    """从 main/pet_ui.c 抓布局常量, 避免在这里再抄一份。
+# ---------------------------------------------------------------------------
+# 从源码里读真值
+# ---------------------------------------------------------------------------
+def parse_defines(paths: tuple[Path, ...]) -> dict[str, int]:
+    """解析 #define 的整数字面量(十进制或 0x 十六进制), 多个来源合并。
 
-    只认整数字面量。pet_ui.c 里的长度/坐标因此都写成字面量, 互相之间的等式
-    由那边的 _Static_assert 保证 —— 写成宏算式这边会静默漏掉, 预览就会错位。
-    行尾的 // 注释允许存在。
+    只认字面量: 布局常量写成宏算式这边读不到, 所以那份约定(见 main/pet_layout.h)
+    必须守住, 常量之间的等式由那边的 _Static_assert 在编译期兜住。
+    同一个名字出现在多个文件里且值不一致时直接报错 —— 那说明两份真值跑偏了。
     """
-    source = pet_ui.read_text(encoding="utf-8")
-    layout: dict[str, int] = {}
-    for name, value in re.findall(r"^#define\s+([A-Z_0-9]+)\s+(-?\d+)\s*(?://.*)?$",
-                                  source, re.MULTILINE):
-        layout[name] = int(value)
-    return layout
+    merged: dict[str, int] = {}
+    origin: dict[str, str] = {}
+    for path in paths:
+        pattern = (r"^#define\s+([A-Z][A-Z_0-9]*)\s+"
+                   r"(0[xX][0-9A-Fa-f]+|-?\d+)\s*(?://.*)?$")
+        for name, raw in re.findall(pattern, path.read_text(encoding="utf-8"),
+                                    re.MULTILINE):
+            value = int(raw, 0)
+            if name in merged and merged[name] != value:
+                raise SystemExit(f"常量 {name} 在 {origin[name]} 与 {path.name} 里"
+                                 f"不一致: {merged[name]} vs {value}")
+            merged[name] = value
+            origin[name] = path.name
+    return merged
 
 
-def parse_font_line_height(font_c: Path) -> int:
-    """读 LVGL 生成字体的行高。
+def parse_strings(path: Path) -> dict[str, str]:
+    """界面文案。设备上显示什么, 预览就画什么 —— 不在这里再抄一遍中文。"""
+    return dict(re.findall(r'^#define\s+(PET_STR_[A-Z_0-9]+)\s+"([^"]*)"\s*$',
+                           path.read_text(encoding="utf-8"), re.MULTILINE))
 
-    这里以前写死 21, 而设备上是 31: 预览的文本块因此比真机矮了一截, 看版式会
-    被误导(真机上两行文本是 62 px, 不是 42)。字体文件是生成产物, 直接读真值。
+
+def parse_font_metrics(font_c: Path) -> tuple[int, int]:
+    """生成字体的 (行高, 基线)。见文件头对基线的说明。"""
+    source = font_c.read_text(encoding="utf-8")
+    line_height = re.search(r"\.line_height\s*=\s*(\d+)", source)
+    base_line = re.search(r"\.base_line\s*=\s*(\d+)", source)
+    if line_height is None or base_line is None:
+        raise SystemExit(f"{font_c} 里找不到 line_height / base_line")
+    return int(line_height.group(1)), int(base_line.group(1))
+
+
+def rgb(value: int) -> tuple[int, int, int]:
+    return ((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF)
+
+
+def layout_for_stage(stage_w: int, stage_h: int,
+                     consts: dict[str, int]) -> dict[str, int]:
+    """按舞台尺寸算版式 —— main/pet_layout.c 的 pet_layout_for_stage() 的镜像。
+
+    真值在那边的 C 代码里(tests/test_pet_layout.c 逐条钉住), 这里是同一套算术的
+    第二份实现。算错的表现是"预览看着居中、真机偏几像素", 两边都不报错, 所以由
+    tests/test_pet_layout_mirror.py 逐字段对照, 别让两份实现悄悄跑偏。
+
+    水平居中, 竖直方向**按脚底对齐台面反推** —— 所以换一只不同高度的宠物时, 站台
+    不动, 是宠物自己站上去。
     """
-    match = re.search(r"\.line_height\s*=\s*(\d+)",
-                      font_c.read_text(encoding="utf-8"))
-    if match is None:
-        raise ValueError(f"{font_c} 里找不到 line_height")
-    return int(match.group(1))
+    if not (consts["PET_LAYOUT_STAGE_W_MIN"] <= stage_w
+            <= consts["PET_LAYOUT_STAGE_W_MAX"]):
+        raise SystemExit(f"舞台宽 {stage_w} 超出 "
+                         f"{consts['PET_LAYOUT_STAGE_W_MIN']}.."
+                         f"{consts['PET_LAYOUT_STAGE_W_MAX']}(见 main/pet_layout.h)")
+    if stage_h < consts["PET_LAYOUT_STAGE_H_MIN"]:
+        raise SystemExit(f"舞台高 {stage_h} 小于下限 {consts['PET_LAYOUT_STAGE_H_MIN']}")
+
+    stage_x = (consts["PET_LAYOUT_SCR_W"] - stage_w) // 2
+    stage_y = consts["PLAT_FLOOR_Y"] + 1 - stage_h
+    if stage_y < consts["PET_LAYOUT_STAGE_TOP_MIN"]:
+        raise SystemExit(f"舞台 {stage_w}x{stage_h} 顶边会压到顶部状态行"
+                         f"(y {stage_y} < {consts['PET_LAYOUT_STAGE_TOP_MIN']})")
+
+    return {
+        "stage_x": stage_x, "stage_y": stage_y,
+        "stage_w": stage_w, "stage_h": stage_h,
+
+        "plat_x": consts["PLAT_X"], "plat_w": consts["PLAT_W"],
+        "plat_radius": consts["PLAT_RADIUS"],
+        "plat_floor_y": consts["PLAT_FLOOR_Y"],
+        "plat_floor_h": consts["PLAT_FLOOR_H"],
+        "plat_floor_radius": consts["PLAT_FLOOR_RADIUS"],
+        "plat_rim_h": consts["PLAT_RIM_H"],
+        "plat_rim_inset": consts["PLAT_RIM_INSET"],
+        "plat_body_y": consts["PLAT_BODY_Y"],
+        "plat_body_h": consts["PLAT_BODY_H"],
+        "plat_text_x": consts["PLAT_X"]
+                        + (consts["PLAT_W"] - consts["PLAT_TEXT_W"]) // 2,
+        "plat_text_y": consts["PLAT_BODY_Y"] + consts["PLAT_TEXT_PAD"],
+        "plat_text_w": consts["PLAT_TEXT_W"],
+
+        "shadow_y": consts["SHADOW_Y"], "shadow_w": consts["SHADOW_W"],
+        "shadow_h": consts["SHADOW_H"],
+
+        "sleep_x": consts["SLEEP_X"], "sleep_y": consts["SLEEP_Y"],
+    }
 
 
-def parse_atlas(header: Path, source: Path) -> tuple[dict[str, int], list[dict]]:
-    """解析生成的头文件常量与 .c 里的帧表。"""
-    constants = {}
-    for name, value in re.findall(r"^#define\s+(PET_ATLAS_[A-Z_0-9]+)\s+(\d+)\s*$",
-                                  header.read_text(encoding="utf-8"), re.MULTILINE):
-        constants[name] = int(value)
+def frame_rect(frame: dict, crop: tuple[int, int, int, int]) -> dict[str, int]:
+    """一帧在舞台里的落点 —— main/pet_layout.c 的 pet_layout_frame_rect() 的镜像。
 
-    # 每个动作一个 C 数组: static const pet_atlas_frame_t NAME_FRAMES[] = {
-    #     offset, x, y, w, h, duration }, ...
-    frames: list[dict] = []
-    for block in re.finditer(
-        r"static const pet_atlas_frame_t (\w+)_FRAMES\[\] = \{(.*?)\n\};",
-        source.read_text(encoding="utf-8"), re.DOTALL,
-    ):
-        for numbers in re.findall(r"\{\s*(\d+),\s*(-?\d+),\s*(-?\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*\}",
-                                  block.group(2)):
-            offset, x, y, w, h, duration = (int(n) for n in numbers)
-            frames.append({
-                "name": block.group(1).lower(),
-                "offset": offset, "x": x, "y": y, "w": w, "h": h,
-                "duration": duration,
-            })
-    return constants, frames
+    crop 是包头的 (stage_x, stage_y, stage_w, stage_h), 即**所有帧裁剪框的并集**,
+    也是每帧裁剪原点要减掉的基准。别拿版式里的 stage_x/stage_y 来代入这个参数:
+    那是舞台在**屏幕上**的落点, 在另一个坐标系里, 减错了宠物会整体左上偏移并被
+    舞台裁掉一角(设备侧真机上错过一次, 本函数存在的理由就是让两边能对得上)。
+
+    帧的裁剪框必须含在舞台裁剪框里 —— pet_pkg_parse() 保证舞台就是所有帧裁剪框的
+    并集, 所以对合法的包这一定成立; 不成立说明包坏了, 宁可报错也不要贴出错位的帧。
+    """
+    x0, y0, w0, h0 = crop
+    if not (x0 <= frame["x"] and y0 <= frame["y"]
+            and frame["x"] + frame["w"] <= x0 + w0
+            and frame["y"] + frame["h"] <= y0 + h0):
+        raise SystemExit(
+            f"帧裁剪框 {frame['w']}x{frame['h']} @ ({frame['x']},{frame['y']}) "
+            f"超出舞台裁剪框 {w0}x{h0} @ ({x0},{y0}) —— 包与版式对不上")
+
+    return {"x": frame["x"] - x0, "y": frame["y"] - y0,
+            "w": frame["w"], "h": frame["h"]}
 
 
+# ---------------------------------------------------------------------------
+# 文字
+# ---------------------------------------------------------------------------
+def load_font(size: int):
+    for path in FONT_CANDIDATES:
+        if Path(path).exists():
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+    print("警告: 找不到可用的 CJK 字体, 退回 Pillow 内置位图字体(汉字会变成方块)",
+          file=sys.stderr)
+    return ImageFont.load_default()
+
+
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_w: float) -> list[str]:
+    """按字符折行。中文没有词边界, 所以逐字累计到超宽为止。
+
+    只用来"看起来对", 精确宽度由 tests/test_pet_ui_text_fit.py 按 LVGL 的
+    逐字形取整算法负责 —— 那边才是判定文案会不会被折行的地方。
+    """
+    lines: list[str] = []
+    current = ""
+    for ch in text:
+        if current and draw.textlength(current + ch, font=font) > max_w:
+            lines.append(current)
+            current = ch
+        else:
+            current += ch
+    if current:
+        lines.append(current)
+    return lines
+
+
+def draw_line(draw: ImageDraw.ImageDraw, text: str, font, metrics: tuple[int, int],
+              x: float, top_y: float, color, align: str = "left",
+              box_w: float = 0.0) -> None:
+    """画一行, 基线按 LVGL 的算法落位(见文件头)。top_y 是行框顶。"""
+    line_height, base_line = metrics
+    baseline = top_y + line_height - base_line
+    if align != "left":
+        width = draw.textlength(text, font=font)
+        x = x + (box_w - width if align == "right" else (box_w - width) / 2)
+    draw.text((x, baseline), text, font=font, fill=color, anchor="ls")
+
+
+def draw_block(draw: ImageDraw.ImageDraw, text: str, font,
+               metrics: tuple[int, int], box_x: float, box_w: float,
+               top_y: float, color, align: str = "center") -> int:
+    """在固定宽度的框里画一段(可能折行的)文字, 返回行数。
+
+    LVGL 的定宽标签把第一行贴在内容区顶边, 所以第 k 行的行框顶 =
+    top_y + k * line_height。
+    """
+    line_height = metrics[0]
+    lines = wrap_text(draw, text, font, box_w)
+    for index, line in enumerate(lines):
+        draw_line(draw, line, font, metrics, box_x,
+                  top_y + index * line_height, color, align, box_w)
+    return len(lines)
+
+
+# ---------------------------------------------------------------------------
+# 图形
+# ---------------------------------------------------------------------------
 def rgb565a8_to_image(blob: bytes, offset: int, w: int, h: int) -> Image.Image:
     """把 blob 里的一帧 RGB565A8 解成 RGBA。
 
@@ -127,7 +284,7 @@ def rgb565a8_to_image(blob: bytes, offset: int, w: int, h: int) -> Image.Image:
     color = blob[offset:offset + stride * h]
     alpha = blob[offset + stride * h:offset + stride * h + w * h]
     if len(color) < stride * h or len(alpha) < w * h:
-        raise ValueError(f"blob 越界: offset={offset} w={w} h={h}")
+        raise SystemExit(f"包里的帧数据越界: offset={offset} w={w} h={h}")
 
     try:
         rgb = Image.frombytes("RGB", (w, h), color, "raw", "BGR;16")
@@ -146,27 +303,56 @@ def rgb565a8_to_image(blob: bytes, offset: int, w: int, h: int) -> Image.Image:
     return rgb
 
 
-def load_font(size: int) -> ImageFont.FreeTypeFont:
-    for path in FONT_CANDIDATES:
-        if Path(path).exists():
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                continue
-    return ImageFont.load_default()
-
-
-def text_width(draw: ImageDraw.ImageDraw, text: str,
-               font: ImageFont.FreeTypeFont) -> int:
-    box = draw.textbbox((0, 0), text, font=font)
-    return box[2] - box[0]
-
-
 def rounded_mask(width: int, height: int, radius: int) -> Image.Image:
     mask = Image.new("L", (width, height), 0)
     ImageDraw.Draw(mask).rounded_rectangle(
         (0, 0, width - 1, height - 1), radius=radius, fill=255)
     return mask
+
+
+def paste_platform(board: Image.Image, layout: dict[str, int],
+                   colors: dict[str, tuple[int, int, int]]) -> None:
+    """画站台: 台身 + 台面(竖直渐变) + 台面顶沿高光 + 脚底接触阴影。
+
+    分层顺序与 main/pet_ui.c 的 build_platform() 一一对应, 而且必须在宠物之前
+    调用 —— 真机上宠物压在台面之上, 预览也要一样, 否则脚会被台面盖掉。
+    """
+    plat_x, plat_w = layout["plat_x"], layout["plat_w"]
+
+    body = Image.new("RGBA", (plat_w, layout["plat_body_h"]),
+                     colors["COL_PLAT_BODY"] + (255,))
+    board.paste(body, (plat_x, layout["plat_body_y"]),
+                rounded_mask(plat_w, layout["plat_body_h"], layout["plat_radius"]))
+    ImageDraw.Draw(board).rounded_rectangle(
+        (plat_x, layout["plat_body_y"],
+         plat_x + plat_w - 1, layout["plat_body_y"] + layout["plat_body_h"] - 1),
+        radius=layout["plat_radius"], outline=colors["COL_CARD_EDGE"], width=1)
+
+    # 台面: 台身色到台面色的竖直渐变, 用逐行填充做, 与 LV_GRAD_DIR_VER 等价。
+    floor_h = layout["plat_floor_h"]
+    floor = Image.new("RGBA", (plat_w, floor_h), (0, 0, 0, 0))
+    paint = ImageDraw.Draw(floor)
+    top, bottom = colors["COL_PLAT_FLOOR"], colors["COL_PLAT_BODY"]
+    for row in range(floor_h):
+        t = row / max(floor_h - 1, 1)
+        paint.line((0, row, plat_w - 1, row),
+                   fill=tuple(round(a + (b - a) * t) for a, b in zip(top, bottom))
+                   + (255,))
+    board.paste(floor, (plat_x, layout["plat_floor_y"]),
+                rounded_mask(plat_w, floor_h, layout["plat_floor_radius"]))
+
+    ImageDraw.Draw(board).rounded_rectangle(
+        (plat_x + layout["plat_rim_inset"], layout["plat_floor_y"],
+         plat_x + plat_w - 1 - layout["plat_rim_inset"],
+         layout["plat_floor_y"] + layout["plat_rim_h"] - 1),
+        radius=layout["plat_rim_h"] // 2, fill=colors["COL_PLAT_RIM"])
+
+    shadow = Image.new("RGBA", (layout["shadow_w"], layout["shadow_h"]), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (0, 0, layout["shadow_w"] - 1, layout["shadow_h"] - 1),
+        radius=layout["shadow_h"] // 2, fill=(0, 0, 0, 102))   # LV_OPA_40
+    board.paste(shadow, (board.width // 2 - layout["shadow_w"] // 2,
+                         layout["shadow_y"]), shadow)
 
 
 def parse_battery(text: str) -> int | None:
@@ -175,203 +361,374 @@ def parse_battery(text: str) -> int | None:
     return max(0, min(100, int(value))) if value.isdigit() else None
 
 
-def paste_platform(board: Image.Image, layout: dict[str, int]) -> None:
-    """画站台: 台身 + 台面(竖直渐变) + 台面顶沿高光 + 脚底接触阴影。
-
-    分层顺序与 main/pet_ui.c 的 build_platform() 一一对应, 而且必须在宠物之前
-    调用 —— 真机上宠物压在台面之上, 预览也要一样, 否则脚会被台面盖掉。
-    """
-    plat_x, plat_w = layout["PLAT_X"], layout["PLAT_W"]
-
-    body = Image.new("RGBA", (plat_w, layout["PLAT_BODY_H"]),
-                     COLORS["COL_PLAT_BODY"] + (255,))
-    board.paste(body, (plat_x, layout["PLAT_BODY_Y"]),
-                rounded_mask(plat_w, layout["PLAT_BODY_H"], layout["PLAT_RADIUS"]))
-    ImageDraw.Draw(board).rounded_rectangle(
-        (plat_x, layout["PLAT_BODY_Y"],
-         plat_x + plat_w - 1, layout["PLAT_BODY_Y"] + layout["PLAT_BODY_H"] - 1),
-        radius=layout["PLAT_RADIUS"], outline=COLORS["COL_CARD_EDGE"], width=1)
-
-    # 台面: 台身色到台面色的竖直渐变, 用逐行填充做, 与 LV_GRAD_DIR_VER 等价。
-    floor_h = layout["PLAT_FLOOR_H"]
-    floor = Image.new("RGBA", (plat_w, floor_h), (0, 0, 0, 0))
-    paint = ImageDraw.Draw(floor)
-    top, bottom = COLORS["COL_PLAT_FLOOR"], COLORS["COL_PLAT_BODY"]
-    for row in range(floor_h):
-        t = row / max(floor_h - 1, 1)
-        color = tuple(round(a + (b - a) * t) for a, b in zip(top, bottom))
-        paint.line((0, row, plat_w - 1, row), fill=color + (255,))
-    board.paste(floor, (plat_x, layout["PLAT_FLOOR_Y"]),
-                rounded_mask(plat_w, floor_h, layout["PLAT_FLOOR_RADIUS"]))
-
-    ImageDraw.Draw(board).rounded_rectangle(
-        (plat_x + layout["PLAT_RIM_INSET"], layout["PLAT_FLOOR_Y"],
-         plat_x + plat_w - 1 - layout["PLAT_RIM_INSET"],
-         layout["PLAT_FLOOR_Y"] + layout["PLAT_RIM_H"] - 1),
-        radius=layout["PLAT_RIM_H"] // 2, fill=COLORS["COL_PLAT_RIM"])
-
-    shadow = Image.new("RGBA", (layout["SHADOW_W"], layout["SHADOW_H"]), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).rounded_rectangle(
-        (0, 0, layout["SHADOW_W"] - 1, layout["SHADOW_H"] - 1),
-        radius=layout["SHADOW_H"] // 2, fill=(0, 0, 0, 102))   # LV_OPA_40
-    board.paste(shadow, (board.width // 2 - layout["SHADOW_W"] // 2,
-                         layout["SHADOW_Y"]), shadow)
-
-
-def render(scene: tuple, layout: dict[str, int], constants: dict[str, int],
-           frames: list[dict], blob: bytes, frame_index: int | None,
-           battery_text: str = "82%", body_line_height: int = 31) -> Image.Image:
-    key, status_text, dot_color, plate_text, anim, asleep = scene
-
-    board = Image.new("RGB", (240, 320), COLORS["COL_BG"])
-    draw = ImageDraw.Draw(board)
-
-    # 宠物身下不再有底色; "地面"由站台和接触阴影交代。
-    paste_platform(board, layout)
-
-    stage = Image.new("RGBA", (constants["PET_ATLAS_STAGE_W"],
-                               constants["PET_ATLAS_STAGE_H"]), (0, 0, 0, 0))
-    candidates = [f for f in frames if f["name"] == anim] or [frames[0]]
-    chosen = candidates[(frame_index or 0) % len(candidates)]
-    sprite = rgb565a8_to_image(blob, chosen["offset"], chosen["w"], chosen["h"])
-    if asleep:
-        alpha = sprite.getchannel("A").point(lambda v: int(v * 0.4))
-        sprite.putalpha(alpha)
-    stage.alpha_composite(
-        sprite,
-        (chosen["x"] - constants["PET_ATLAS_STAGE_X"],
-         chosen["y"] - constants["PET_ATLAS_STAGE_Y"]))
-    board.paste(stage, (layout["STAGE_X"], layout["STAGE_Y"]), stage)
-
-    # 状态圆点 + 文字
-    draw.ellipse((layout["ROW_DOT_X"], layout["ROW_DOT_Y"],
-                  layout["ROW_DOT_X"] + layout["ROW_DOT_D"] - 1,
-                  layout["ROW_DOT_Y"] + layout["ROW_DOT_D"] - 1),
-                 fill=COLORS[dot_color])
-    title_font = load_font(20)
-    draw.text((layout["STATUS_X"], layout["STATUS_Y"] - 4), status_text,
-              font=title_font, fill=COLORS["COL_INK"])
+def draw_top_row(board: Image.Image, draw: ImageDraw.ImageDraw, c: dict[str, int],
+                 colors: dict[str, tuple[int, int, int]],
+                 status: str, dot: str, battery_text: str,
+                 fonts: dict[int, object],
+                 metrics: dict[int, tuple[int, int]]) -> None:
+    """顶栏: 左 = 状态圆点 + 状态文字, 右 = 电量(数字 + 电池图形)。"""
+    draw.ellipse((c["ROW_DOT_X"], c["ROW_DOT_Y"],
+                  c["ROW_DOT_X"] + c["ROW_DOT_D"] - 1,
+                  c["ROW_DOT_Y"] + c["ROW_DOT_D"] - 1), fill=colors[dot])
+    draw_line(draw, status, fonts[20], metrics[20], c["STATUS_X"], c["STATUS_Y"],
+              colors["COL_INK"])
 
     # 电量: 文字与填充比例都跟着 --battery 走, 默认 82% 只是示意值。
     # 未读数时固件显示 "--" 且填充不可见, 这里保持一致, 方便和真机对照。
-    body_font = load_font(16)
     soc = parse_battery(battery_text)
     battery_color = ("COL_GOOD" if soc is None or soc >= 50
                      else "COL_WARN" if soc >= 20 else "COL_BAD")
-    draw.text((layout["BAT_TEXT_X"] + layout["BAT_TEXT_W"]
-               - text_width(draw, battery_text, body_font),
-               layout["BAT_TEXT_Y"] - 1),
-              battery_text, font=body_font,
-              fill=COLORS["COL_MUTED" if soc is None else battery_color])
+    draw_line(draw, battery_text, fonts[16], metrics[16], c["BAT_TEXT_X"],
+              c["BAT_TEXT_Y"], colors["COL_MUTED" if soc is None else battery_color],
+              align="right", box_w=c["BAT_TEXT_W"])
+
     draw.rounded_rectangle(
-        (layout["BAT_BODY_X"], layout["BAT_BODY_Y"],
-         layout["BAT_BODY_X"] + layout["BAT_BODY_W"] - 1,
-         layout["BAT_BODY_Y"] + layout["BAT_BODY_H"] - 1),
-        radius=3, outline=COLORS["COL_MUTED"], width=1)
+        (c["BAT_BODY_X"], c["BAT_BODY_Y"],
+         c["BAT_BODY_X"] + c["BAT_BODY_W"] - 1,
+         c["BAT_BODY_Y"] + c["BAT_BODY_H"] - 1),
+        radius=3, outline=colors["COL_MUTED"], width=1)
     draw.rounded_rectangle(
-        (layout["BAT_CAP_X"], layout["BAT_CAP_Y"],
-         layout["BAT_CAP_X"] + layout["BAT_CAP_W"] - 1,
-         layout["BAT_CAP_Y"] + layout["BAT_CAP_H"] - 1),
-        radius=1, fill=COLORS["COL_MUTED"])
+        (c["BAT_CAP_X"], c["BAT_CAP_Y"],
+         c["BAT_CAP_X"] + c["BAT_CAP_W"] - 1,
+         c["BAT_CAP_Y"] + c["BAT_CAP_H"] - 1),
+        radius=1, fill=colors["COL_MUTED"])
     if soc is not None:
-        fill_w = max(int(layout["BAT_FILL_MAX_W"] * soc / 100), 1)
+        width = max(int(c["BAT_FILL_MAX_W"] * soc / 100), 1)
         draw.rounded_rectangle(
-            (layout["BAT_FILL_X"], layout["BAT_FILL_Y"],
-             layout["BAT_FILL_X"] + fill_w - 1,
-             layout["BAT_FILL_Y"] + layout["BAT_FILL_H"] - 1),
-            radius=1, fill=COLORS[battery_color])
+            (c["BAT_FILL_X"], c["BAT_FILL_Y"],
+             c["BAT_FILL_X"] + width - 1,
+             c["BAT_FILL_Y"] + c["BAT_FILL_H"] - 1),
+            radius=1, fill=colors[battery_color])
 
-    # 睡眠标记
-    if asleep:
-        draw.text((layout["STAGE_X"] + layout["SLEEP_X"],
-                   layout["STAGE_Y"] + layout["SLEEP_Y"]),
-                  "Zzz", font=body_font, fill=COLORS["COL_ACCENT"])
 
-    # 文本落在台身上: 真机上是一个 PLAT_TEXT_W x (行高x2) 的居中标签, 预览只画
-    # 一行。行高从生成字体里读, 所以字体换了这边也跟着走 —— 以前写死 21, 真机
-    # 是 31, 文本块的位置是碰巧对上的。
-    line_top = layout["PLAT_BODY_Y"] + layout["PLAT_TEXT_PAD"]
-    text_y = line_top + (body_line_height - body_font.size) // 2
-    color = COLORS["COL_INK"] if not plate_text.startswith("等待 Codex") else COLORS["COL_MUTED"]
-    draw.text((layout["PLAT_X"] + layout["PLAT_W"] // 2
-               - text_width(draw, plate_text, body_font) // 2,
-               text_y + 2),
-              plate_text, font=body_font, fill=color)
-
-    # 与 BSP 一致的 30 px 圆角黑边(BSP_LVGL_SCREEN_RADIUS)
-    mask = rounded_mask(240, 320, 30)
-    out = Image.new("RGB", (240, 320), (0, 0, 0))
-    out.paste(board, (0, 0), mask)
-    out.info["scene"] = key
+def finish(board: Image.Image, key: str) -> Image.Image:
+    """与 BSP 一致的 30 px 圆角黑边(BSP_LVGL_SCREEN_RADIUS)。"""
+    out = Image.new("RGB", (board.width, board.height), (0, 0, 0))
+    out.paste(board, (0, 0), rounded_mask(board.width, board.height, 30))
+    out.info["screen"] = key
     return out
+
+
+# ---------------------------------------------------------------------------
+# 三块屏
+# ---------------------------------------------------------------------------
+class Renderer:
+    """把常量/字体/文案凑在一起, 免得每个渲染函数都拖着七个参数。"""
+
+    def __init__(self, consts: dict[str, int], strings: dict[str, str],
+                 metrics: dict[int, tuple[int, int]]) -> None:
+        self.c = consts
+        self.s = strings
+        self.metrics = metrics
+        self.colors = {name: rgb(value) for name, value in consts.items()
+                       if name.startswith("COL_")}
+        self.fonts = {size: load_font(size) for size in (16, 20)}
+
+    def new_board(self) -> tuple[Image.Image, ImageDraw.ImageDraw]:
+        size = (self.c["PET_LAYOUT_SCR_W"], self.c["PET_LAYOUT_SCR_H"])
+        board = Image.new("RGB", size, self.colors["COL_BG"])
+        return board, ImageDraw.Draw(board)
+
+    # ---- 宠物界面 -----------------------------------------------------
+    def pet_screen(self, scene: tuple, package: dict, frame_index: int | None,
+                   battery_text: str) -> Image.Image:
+        key, status_key, dot, plate_key, anim, asleep = scene
+        board, draw = self.new_board()
+        layout = layout_for_stage(package["stage"][2], package["stage"][3], self.c)
+        paste_platform(board, layout, self.colors)
+
+        # 动作 -> 帧区间由包里的状态表给(与设备侧 pet_atlas_frame() 同源)。
+        state = next((s for s in package["states"] if s["name"] == anim), None)
+        if state is None:
+            raise SystemExit(f"包里没有动作 {anim!r}; "
+                             f"可选: {', '.join(s['name'] for s in package['states'])}")
+        chosen = package["frames"][state["first"]
+                                   + (frame_index or 0) % state["count"]]
+
+        sprite = rgb565a8_to_image(package["blob"], chosen["offset"],
+                                  chosen["w"], chosen["h"])
+        if asleep:
+            sprite.putalpha(sprite.getchannel("A").point(lambda v: int(v * 0.4)))
+
+        # 每帧在图集单元格里的裁剪原点不同, 扣掉**舞台在图集单元格里的裁剪原点**
+        # (包头的 stage_x/stage_y, 也就是所有帧裁剪框的并集原点)才是它在舞台里的
+        # 落点 —— 动作里的位移(跑动、跳跃)就是这么来的。设备侧同一条式子, 由
+        # pet_layout_frame_rect() 算(tests/test_pet_layout_mirror.py 两边对照)。
+        #
+        # 注意 base 是 package["stage"][:2], **不是** layout["stage_x"]/"stage_y":
+        # 后者是舞台上屏幕的落点(129 px 宽的舞台: 单元格里 31, 屏幕上 55), 拿它来减
+        # 会让宠物整体左上偏移并被舞台裁掉一角。预览曾经是对的, 设备侧错过一次。
+        rect = frame_rect(chosen, package["stage"])
+        layer = Image.new("RGBA", (layout["stage_w"], layout["stage_h"]), (0, 0, 0, 0))
+        layer.alpha_composite(sprite, (rect["x"], rect["y"]))
+        board.paste(layer, (layout["stage_x"], layout["stage_y"]), layer)
+
+        if asleep:
+            # 睡眠标记是舞台的子对象, 坐标相对舞台左上角; 设备上是 LV_OPA_70。
+            mark = Image.new("RGBA", (layout["stage_w"], layout["stage_h"]), (0, 0, 0, 0))
+            ink = self.colors["COL_ACCENT"] + (179,)   # 179/255 ≈ LV_OPA_70
+            draw_line(ImageDraw.Draw(mark), self.s["PET_STR_SLEEP_MARK"],
+                      self.fonts[16], self.metrics[16], layout["sleep_x"],
+                      layout["sleep_y"], ink)
+            board.paste(mark, (layout["stage_x"], layout["stage_y"]), mark)
+
+        draw_top_row(board, draw, self.c, self.colors, self.s[status_key], dot,
+                     battery_text, self.fonts, self.metrics)
+        self.draw_plat_text(draw, self.s[plate_key], layout)
+        return finish(board, key)
+
+    def draw_plat_text(self, draw: ImageDraw.ImageDraw, text: str,
+                       layout: dict[str, int]) -> None:
+        """台身正面的文本块: 两行高, 居中, 宽度 PLAT_TEXT_W。
+
+        一律用 COL_MUTED —— 设备上只有 Bridge 真的下发过文本才转成 COL_INK, 而预览
+        画的都是"还没有文本"的占位状态(placeholder_text 那几条)。
+        """
+        draw_block(draw, text, self.fonts[16], self.metrics[16],
+                   layout["plat_text_x"], layout["plat_text_w"],
+                   layout["plat_text_y"], self.colors["COL_MUTED"])
+
+    def no_pet_screen(self, battery_text: str) -> Image.Image:
+        """空槽: 舞台区一句占位(lv_obj_center), 站台上告诉用户去哪儿装。"""
+        board, draw = self.new_board()
+        layout = layout_for_stage(self.c["PET_LAYOUT_STAGE_W_REF"],
+                                  self.c["PET_LAYOUT_STAGE_H_REF"], self.c)
+        paste_platform(board, layout, self.colors)
+
+        draw_block(draw, self.s["PET_STR_NO_PET"], self.fonts[16], self.metrics[16],
+                   layout["stage_x"], layout["stage_w"],
+                   layout["stage_y"]
+                   + (layout["stage_h"] - self.metrics[16][0]) // 2,
+                   self.colors["COL_MUTED"])
+
+        draw_top_row(board, draw, self.c, self.colors,
+                     self.s["PET_STR_STATUS_OFFLINE"], "COL_MUTED", battery_text,
+                     self.fonts, self.metrics)
+        self.draw_plat_text(draw, self.s["PET_STR_PH_NO_PET"], layout)
+        return finish(board, "nopet")
+
+    def transfer_screen(self, pet_id: str, percent: int, message: str,
+                        tone: str, battery_text: str) -> Image.Image:
+        """传输页: 宠物界面已经拆掉(图集要解除映射), 它顶上, 只有文字和进度条。"""
+        board, draw = self.new_board()
+        scr_w = self.c["PET_LAYOUT_SCR_W"]
+
+        draw_block(draw, self.s["PET_STR_TRANSFER_TITLE"], self.fonts[20],
+                   self.metrics[20], 0, scr_w, self.c["TRANS_TITLE_Y"],
+                   self.colors["COL_INK"])
+        draw_block(draw, pet_id, self.fonts[16], self.metrics[16],
+                   self.c["TRANS_MSG_X"], scr_w - 2 * self.c["TRANS_MSG_X"],
+                   self.c["TRANS_NAME_Y"], self.colors["COL_ACCENT"])
+
+        bar_x, bar_w = self.c["TRANS_BAR_X"], self.c["TRANS_BAR_W"]
+        bar_y, bar_h = self.c["TRANS_BAR_Y"], self.c["TRANS_BAR_H"]
+        draw.rounded_rectangle((bar_x, bar_y, bar_x + bar_w - 1, bar_y + bar_h - 1),
+                               radius=bar_h // 2, fill=self.colors["COL_CARD"],
+                               outline=self.colors["COL_CARD_EDGE"], width=1)
+        if percent > 0:
+            fill_w = max((bar_w - 2) * min(percent, 100) // 100, 1)
+            draw.rounded_rectangle((bar_x + 1, bar_y + 1, bar_x + fill_w,
+                                    bar_y + bar_h - 2),
+                                   radius=(bar_h - 2) // 2,
+                                   fill=self.colors["COL_ACCENT"])
+
+        draw_block(draw, message, self.fonts[16], self.metrics[16],
+                   self.c["TRANS_MSG_X"], self.c["TRANS_MSG_W"],
+                   self.c["TRANS_MSG_Y"], self.colors[tone])
+        return finish(board, "transfer")
+
+    def prov_screen(self, device: str, pin: str, status: str, tone: str) -> Image.Image:
+        """蓝牙配网页: 不透明全屏覆盖层, 配对码是唯一的焦点。"""
+        board, draw = self.new_board()
+        scr_w = self.c["PET_LAYOUT_SCR_W"]
+
+        draw_block(draw, self.s["PET_STR_PROV_TITLE"], self.fonts[20],
+                   self.metrics[20], 0, scr_w, self.c["PROV_TITLE_Y"],
+                   self.colors["COL_INK"])
+        draw_block(draw, device, self.fonts[16], self.metrics[16], 0, scr_w,
+                   self.c["PROV_NAME_Y"], self.colors["COL_MUTED"])
+
+        card_x, card_w = self.c["PROV_CARD_X"], self.c["PROV_CARD_W"]
+        card_y, card_h = self.c["PROV_CARD_Y"], self.c["PROV_CARD_H"]
+        draw.rounded_rectangle((card_x, card_y, card_x + card_w - 1,
+                                card_y + card_h - 1),
+                               radius=16, fill=self.colors["COL_CARD"],
+                               outline=self.colors["COL_ACCENT"], width=1)
+
+        # 20 px 的字体下 "1234" 四个数字挤在一起念不清, 设备上拉开成一格一个。
+        spaced = " ".join(pin) if len(pin) == 4 else "- - - -"
+        draw_block(draw, self.s["PET_STR_PROV_PIN_LABEL"], self.fonts[16],
+                   self.metrics[16], card_x, card_w,
+                   card_y + self.c["PROV_PIN_LABEL_Y"], self.colors["COL_MUTED"])
+        draw_block(draw, spaced, self.fonts[20], self.metrics[20], card_x, card_w,
+                   card_y + self.c["PROV_PIN_Y"], self.colors["COL_ACCENT"])
+
+        draw_block(draw, status, self.fonts[16], self.metrics[16],
+                   self.c["PROV_STATUS_X"], self.c["PROV_STATUS_W"],
+                   self.c["PROV_STATUS_Y"], self.colors[tone])
+        draw_block(draw, self.s["PET_STR_PROV_HINT"], self.fonts[16],
+                   self.metrics[16], 0, scr_w, self.c["PROV_HINT_Y"],
+                   self.colors["COL_MUTED"])
+        return finish(board, "prov")
+
+
+# ---------------------------------------------------------------------------
+# 找宠物 / 打包
+# ---------------------------------------------------------------------------
+def find_pet(spec: str) -> Path:
+    """--pet 可以是目录、仓库里的 assets/pets/<id>, 或 ~/.codex/pets/<id>。"""
+    candidates = [Path(os.path.expanduser(spec)),
+                  REPO_ROOT / "assets" / "pets" / spec,
+                  Path.home() / ".codex" / "pets" / spec]
+    for path in candidates:
+        if path.is_dir() and (path / "pet.json").is_file():
+            return path
+    raise SystemExit(f"找不到宠物 {spec!r}(找过 "
+                     + ", ".join(str(p) for p in candidates) + ")")
+
+
+def load_package(args) -> tuple[dict, Path | None]:
+    """返回 (解析好的包, 宠物目录或 None)。"""
+    if args.package:
+        path = Path(os.path.expanduser(args.package))
+        if not path.is_file():
+            raise SystemExit(f"没有这个文件: {path}")
+        return gen.parse_package(path.read_bytes()), None
+
+    pet_dir = find_pet(args.pet)
+    package, _stats = gen.build_package(pet_dir)
+    return gen.parse_package(package), pet_dir
+
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+def list_pets() -> None:
+    seen: dict[str, list[str]] = {}
+    for label, root in (("仓库", REPO_ROOT / "assets" / "pets"),
+                        ("Codex", Path.home() / ".codex" / "pets")):
+        if root.is_dir():
+            for entry in sorted(root.iterdir()):
+                if (entry / "pet.json").is_file():
+                    seen.setdefault(entry.name, []).append(label)
+    if not seen:
+        print("没找到任何宠物(pet.json)")
+        return
+    for name, where in seen.items():
+        print(f"  {name:<24} {'/'.join(where)}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="渲染宠物界面预览 PNG")
-    parser.add_argument("--pet-id", default="sophie-portrait")
-    parser.add_argument("--anim", help="只渲染指定动作行(如 working/idle)")
+    parser.add_argument("--pet", default="sophie-portrait",
+                        help="宠物 id 或目录(默认 sophie-portrait)")
+    parser.add_argument("--package", help="直接读一份现成的 .pet, 不用 --pet")
+    parser.add_argument("--list", action="store_true", help="列出可用的宠物")
+    parser.add_argument("--screen", default="all",
+                        help="逗号分隔: all / pet / " + " / ".join(STATIC_SCREENS))
+    parser.add_argument("--anim", help="只渲染指定动作的宠物屏(如 idle/working)")
     parser.add_argument("--frame", type=int, default=None, help="指定帧序号")
-    parser.add_argument("--out-dir", type=Path,
-                        default=REPO_ROOT / "assets" / "pets"
-                        / "sophie-portrait" / "preview")
-    parser.add_argument("--scale", type=int, default=2, help="输出放大倍数")
     parser.add_argument("--battery", default="82%",
                         help="顶栏电量, 如 95%% 或 -- (表示未读到)")
+    parser.add_argument("--pin", default="1234", help="配网页上的配对码")
+    parser.add_argument("--device", default="CodexPet-75B4",
+                        help="配网页上的设备名(CodexPet-MAC 后两字节)")
+    parser.add_argument("--transfer-percent", type=int, default=42,
+                        help="传输页进度条百分比")
+    parser.add_argument("--transfer-failed", action="store_true",
+                        help="画传输失败那一屏, 而不是正在接收")
+    parser.add_argument("--out-dir", type=Path,
+                        help="默认 assets/pets/<pet>/preview, 没有就 build/preview")
+    parser.add_argument("--scale", type=int, default=2, help="输出放大倍数")
     args = parser.parse_args()
 
-    slug = args.pet_id.replace("-", "_")
-    header = REPO_ROOT / "main" / f"pet_atlas_{slug}.h"
-    source = REPO_ROOT / "main" / f"pet_atlas_{slug}.c"
-    blob_path = REPO_ROOT / "main" / "assets" / f"pet_{slug}.bin"
-    for path in (header, source, blob_path):
-        if not path.exists():
-            print(f"缺少生成产物 {path}; 先运行 tools/gen_pet_assets.py")
-            return 1
+    if Image is None:
+        raise SystemExit("出预览图需要 Pillow(pip install pillow); "
+                         "只要版式算术的话见 tests/test_pet_layout_mirror.py")
 
-    font_c = REPO_ROOT / "assets" / "fonts" / "pet_font_16.c"
-    if not font_c.exists():
-        print(f"缺少生成产物 {font_c}; 先运行 tools/gen_pet_fonts.py")
+    if args.list:
+        list_pets()
+        return 0
+
+    wanted = [s.strip() for s in args.screen.split(",") if s.strip()]
+    unknown = [s for s in wanted if s not in ("all", "pet", *STATIC_SCREENS)]
+    if unknown:
+        parser.error(f"--screen 不认识: {', '.join(unknown)}")
+    want_pet = "all" in wanted or "pet" in wanted
+    want_static = {s for s in wanted if s in STATIC_SCREENS}
+    if "all" in wanted:
+        want_static = set(STATIC_SCREENS)
+
+    consts = parse_defines(CONSTANT_SOURCES)
+    strings = parse_strings(STRINGS_H)
+    metrics = {size: parse_font_metrics(path) for size, path in FONT_C.items()}
+    renderer = Renderer(consts, strings, metrics)
+
+    package = None
+    pet_dir = None
+    if want_pet:
+        package, pet_dir = load_package(args)
+        print(f"包 {package['id']} ({package['display']}): "
+              f"{len(package['frames'])} 帧, {package['blob_size'] / 1024 / 1024:.2f} MiB, "
+              f"舞台 {package['stage'][2]}x{package['stage'][3]} @ "
+              f"({package['stage'][0]},{package['stage'][1]})")
+
+    # 默认落在宠物自己的 preview/ 下(仓库里那份就是这么存的), 否则去 build/。
+    out_dir = args.out_dir
+    if out_dir is None:
+        local = pet_dir / "preview" if pet_dir is not None else None
+        out_dir = local if local is not None and local.is_dir() \
+            else REPO_ROOT / "build" / "preview"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"输出目录 {out_dir}")
+
+    images: list[tuple[str, Image.Image]] = []
+    if want_pet and package is not None:
+        for scene in SCENES:
+            if args.anim and scene[4] != args.anim:
+                continue
+            images.append((scene[0], renderer.pet_screen(
+                scene, package, args.frame, args.battery)))
+
+    if "nopet" in want_static:
+        images.append(("nopet", renderer.no_pet_screen(args.battery)))
+    if "transfer" in want_static:
+        if args.transfer_failed:
+            images.append(("transfer-failed", renderer.transfer_screen(
+                args.pet, 0, strings["PET_STR_TRANSFER_FAILED"], "COL_BAD",
+                args.battery)))
+        else:
+            images.append(("transfer", renderer.transfer_screen(
+                args.pet, args.transfer_percent, strings["PET_STR_TRANSFER_ENABLING"],
+                "COL_MUTED", args.battery)))
+    if "prov" in want_static:
+        images.append(("prov", renderer.prov_screen(
+            args.device, args.pin, strings["PET_STR_PROV_CONNECTED"], "COL_INK")))
+
+    if not images:
+        print(f"没有匹配 --screen={args.screen} --anim={args.anim} 的屏", file=sys.stderr)
         return 1
 
-    layout = parse_layout(REPO_ROOT / "main" / "pet_ui.c")
-    constants, frames = parse_atlas(header, source)
-    body_line_height = parse_font_line_height(font_c)
-    # 床垫(bin)按需读: 2.4 MB, 一次读进来比反复 seek 简单。
-    blob = blob_path.read_bytes()
-    print(f"帧表 {len(frames)} 帧, blob {len(blob)} 字节, "
-          f"舞台 {constants['PET_ATLAS_STAGE_W']}x{constants['PET_ATLAS_STAGE_H']}, "
-          f"正文行高 {body_line_height}")
-
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    rendered = 0
-    for scene in SCENES:
-        if args.anim and scene[4] != args.anim:
-            continue
-        image = render(scene, layout, constants, frames, blob, args.frame,
-                       args.battery, body_line_height)
+    for key, image in images:
         if args.scale > 1:
             image = image.resize((image.width * args.scale, image.height * args.scale),
                                  Image.NEAREST)
-        out = args.out_dir / f"screen-{scene[0]}.png"
-        image.save(out)
-        print(f"  -> {out}")
-        rendered += 1
+        path = out_dir / f"screen-{key}.png"
+        image.save(path)
+        print(f"  -> {path}")
 
-    if rendered == 0:
-        print(f"没有匹配 --anim={args.anim} 的场景; "
-              f"可选: {', '.join(s[4] for s in SCENES)}")
-        return 1
-
-    # 再把所有状态拼成一张联系表, 方便一眼比较。
-    sheets = [Image.open(args.out_dir / f"screen-{s[0]}.png") for s in SCENES
-              if not args.anim or s[4] == args.anim]
-    sheet = Image.new("RGB", (sum(i.width for i in sheets) + 12 * (len(sheets) - 1),
-                              max(i.height for i in sheets)), (0, 0, 0))
-    x = 0
-    for image in sheets:
-        sheet.paste(image, (x, 0))
-        x += image.width + 12
-    sheet_path = args.out_dir / "screen-all.png"
+    # 全部拼成一张联系表, 方便一眼比较。屏多了就排成方阵, 免得拉到几千像素宽。
+    thumbnails = [Image.open(out_dir / f"screen-{key}.png") for key, _ in images]
+    columns = len(thumbnails) if len(thumbnails) <= 6 else math.ceil(math.sqrt(len(thumbnails)))
+    gap = 12
+    rows = math.ceil(len(thumbnails) / columns)
+    sheet = Image.new("RGB", (columns * thumbnails[0].width + gap * (columns - 1),
+                              rows * thumbnails[0].height + gap * (rows - 1)),
+                      (0, 0, 0))
+    for index, thumb in enumerate(thumbnails):
+        sheet.paste(thumb, ((index % columns) * (thumb.width + gap),
+                            (index // columns) * (thumb.height + gap)))
+    sheet_path = out_dir / "screen-all.png"
     sheet.save(sheet_path)
     print(f"  -> {sheet_path}")
     return 0

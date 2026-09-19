@@ -3,6 +3,10 @@
 
 #include <string.h>
 
+// 只为 PET_PKG_HEADER_SIZE 一个常量: 收到"接下来是宠物包"时先拦掉明显荒唐的长度。
+// 本文件与 pet_pkg 一样不依赖 ESP-IDF/LVGL, 引用它不会破坏主机可测性。
+#include "pet_pkg.h"
+
 // ---------------------------------------------------------------------------
 // UTF-8 工具
 // ---------------------------------------------------------------------------
@@ -213,6 +217,26 @@ static bool json_get_string(const char *line, const char *key, char *out,
     return true;
 }
 
+// 读取 line 中 key 对应的无符号整数值。找不到或不是合法数字返回 false。
+// CRC32 会超过 INT32_MAX, 所以不能走有符号解析; 也刻意不接受负数、小数和指数 ——
+// 协议里这三个字段都是十进制整数, 出现别的写法就说明对面不是我们的 Bridge。
+static bool json_get_u32(const char *line, const char *key, uint32_t *out)
+{
+    const char *p = find_key(line, key);
+    if (p == NULL) return false;
+    while (is_space(*p)) p++;
+    if (*p < '0' || *p > '9') return false;
+
+    uint64_t value = 0;
+    while (*p >= '0' && *p <= '9') {
+        value = value * 10 + (uint64_t)(*p - '0');
+        if (value > 0xFFFFFFFFull) return false;  // 溢出: 当成非法, 不要截断成别的数
+        p++;
+    }
+    *out = (uint32_t)value;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // 行解析
 // ---------------------------------------------------------------------------
@@ -233,6 +257,26 @@ static bool parse_line(const char *line, pet_msg_cb_t cb, void *user)
         msg.type = PET_MSG_TEXT;
     } else if (strcmp(type, "ping") == 0) {
         msg.type = PET_MSG_PING;
+    } else if (strcmp(type, "pet") == 0) {
+        // 宠物包宣告。id/size/crc32 缺一不可 —— 少一个就没法判断该收多久、收对了没,
+        // 所以不完整的宣告直接丢弃(不回调), 后面的字节会继续被当成文本解析, 结果是
+        // 一堆无法识别的行 —— 但那也远好过把二进制当成包写进 flash。
+        if (!json_get_string(line, "id", msg.text, sizeof(msg.text), &truncated) ||
+            !json_get_u32(line, "size", &msg.pet_size) ||
+            !json_get_u32(line, "crc32", &msg.pet_crc32)) {
+            return false;
+        }
+        // id 要能放下, 也要能放进包头的 pet_id[32] —— 否则回执里报出去的 id 和
+        // 真正装上的那只对不上, 菜单栏会一直以为换错了。
+        if (truncated || msg.text[0] == '\0' ||
+            strlen(msg.text) >= PET_PKG_ID_MAX) {
+            return false;
+        }
+        if (msg.pet_size < PET_PKG_HEADER_SIZE) return false;
+        msg.type = PET_MSG_PET;
+        msg.has_text = true;
+        cb(&msg, user);
+        return true;
     } else {
         return false;  // 未知类型直接忽略, 便于协议向前扩展。
     }
