@@ -20,8 +20,6 @@ final class StatusMenuController: NSObject {
     private let bubbleItem = NSMenuItem()
     private let sessionItem = NSMenuItem()
     private let errorItem = NSMenuItem()
-    private let repoItem = NSMenuItem()
-    private let pythonItem = NSMenuItem()
     private let watchItem = NSMenuItem()
 
     /// 宠物子菜单。与顶层菜单相反, 这一份是每次按需重建的 —— 它平时是合上的, 不会
@@ -65,7 +63,7 @@ final class StatusMenuController: NSObject {
         menu.autoenablesItems = false
 
         for item in [bridgeItem, deviceItem, batteryItem, codexItem,
-                     bubbleItem, sessionItem, errorItem, repoItem] {
+                     bubbleItem, sessionItem, errorItem] {
             item.isEnabled = false
         }
         batteryItem.isHidden = true
@@ -139,18 +137,8 @@ final class StatusMenuController: NSObject {
         menu.addItem(diagnosticsItem)
         menu.addItem(.separator())
 
-        repoItem.action = #selector(chooseRepo)
-        repoItem.target = self
-        repoItem.isEnabled = true
-        menu.addItem(repoItem)
-
-        // 换宠物要靠这个解释器把图集打成 .pet, 所以它得带 Pillow。标题里直接写出
-        // 当前用的是哪个, 免得用户以为"设置过了"其实设置的是另一个。
-        pythonItem.action = #selector(choosePython)
-        pythonItem.target = self
-        pythonItem.isEnabled = true
-        menu.addItem(pythonItem)
-
+        // 解释器路径**不放在这里**: 它是一个能改坏、改坏了又找不回原样的东西, 而它只在
+        // "换宠物"这一步才有讲究。改成在「关于」里只读显示, 要改走命令行(见 README)。
         let aboutItem = NSMenuItem(title: "关于 Codex Pet Bridge",
                                    action: #selector(showAbout), keyEquivalent: "")
         aboutItem.target = self
@@ -213,16 +201,6 @@ final class StatusMenuController: NSObject {
         errorItem.isHidden = snapshot.lastError == nil
 
         watchItem.state = snapshot.watchingCodex ? .on : .off
-        repoItem.title = "项目目录：\(BridgeSettings.load().repoPath)"
-
-        // python 那一条带上有无 Pillow: 那正是"能不能换宠物"的前提。
-        var python = "python：\(BridgeSettings.load().pythonPath)"
-        switch snapshot.petPackAvailable {
-        case .some(true):  python += "（有 Pillow）"
-        case .some(false): python += "（⚠︎ 没有 Pillow）"
-        case .none:        break
-        }
-        pythonItem.title = python
 
         refreshPetMenu(snapshot)
     }
@@ -269,12 +247,12 @@ final class StatusMenuController: NSObject {
         }
 
         // 打包是桥接侧那台 python 干的活。缺 Pillow 时**没缓存过的**那几只点了必然
-        // 失败, 所以先在顶上说清楚缺什么、去哪儿改, 而不是让用户点一只消失一只。
+        // 失败, 所以先在顶上说清楚缺什么、去哪儿看, 而不是让用户点一只消失一只。
         let unpackable = snapshot.petPackAvailable == false
             && snapshot.pets.contains { !$0.cached && $0.problem == nil }
         if unpackable {
             petMenu.addItem(disabledPetItem("⚠︎ 无法打包：\(snapshot.petPackHint ?? "桥接的 python 没有 Pillow")"))
-            petMenu.addItem(disabledPetItem("   在下面的「选择 python3…」里换成装了 Pillow 的解释器"))
+            petMenu.addItem(disabledPetItem("   在「关于」里能看到是哪个解释器, 换上带 Pillow 的见 README"))
             petMenu.addItem(.separator())
         }
 
@@ -459,8 +437,8 @@ final class StatusMenuController: NSObject {
         let snapshot = supervisor.snapshot
         var lines = [
             "Codex Pet Bridge \(BuildConfig.version)",
-            "项目目录: \(settings.repoPath)",
-            "python: \(settings.pythonPath)",
+            "桥接脚本: \(settings.scriptPath ?? "未找到（包不完整）")",
+            "python: \(settings.pythonPath)（\(settings.pythonSourceLabel)）",
             "打包: \(snapshot.petPackAvailable.map { $0 ? "可用" : "不可用（缺 Pillow）" } ?? "未知")",
             "端口: \(settings.port)",
             "控制通道: \(BridgePaths.socketPath)",
@@ -486,96 +464,37 @@ final class StatusMenuController: NSObject {
         pasteboard.setString(lines.joined(separator: "\n"), forType: .string)
     }
 
-    @objc private func chooseRepo() {
-        NSApp.activate(ignoringOtherApps: true)
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.message = "选择 ai-passport 项目目录（里面应有 tools/pet_bridge.py）"
-        panel.directoryURL = URL(fileURLWithPath: BridgeSettings.load().repoPath)
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        let script = url.appendingPathComponent("tools/pet_bridge.py")
-        guard FileManager.default.isReadableFile(atPath: script.path) else {
-            let alert = NSAlert()
-            alert.messageText = "这个目录里没有 tools/pet_bridge.py"
-            alert.informativeText = "请选择 ai-passport 项目根目录。"
-            alert.runModal()
-            return
-        }
-        UserDefaults.standard.set(url.path, forKey: PrefKey.repoPath)
-        supervisor.restart()
-    }
-
-    /// 换 python 解释器。换宠物要靠它把图集打成 `.pet`, 所以先用 `import PIL` 验一遍 ——
-    /// 没 Pillow 的解释器不是不能跑桥接, 而是**只有换宠物会失败**, 那种"一半能用"最难查。
-    @objc private func choosePython() {
-        let settings = BridgeSettings.load()
-        NSApp.activate(ignoringOtherApps: true)
-
-        let alert = NSAlert()
-        alert.messageText = "选择 python3"
-        alert.informativeText = "把图集打成设备要收的 .pet 需要 Pillow。留空则改为自动探测。"
-        alert.addButton(withTitle: "使用")
-        alert.addButton(withTitle: "取消")
-
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        field.stringValue = settings.pythonPath
-        field.placeholderString = "/usr/bin/python3"
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.isEmpty {
-            UserDefaults.standard.removeObject(forKey: PrefKey.pythonPath)
-            supervisor.restart()
-            return
-        }
-
-        // 路径打错和"没装 Pillow"都会让换宠物失败, 但两句话该说得不一样。
-        guard FileManager.default.isExecutableFile(atPath: text) else {
-            let bad = NSAlert()
-            bad.messageText = "这个路径不可执行"
-            bad.informativeText = "找不到可执行的 \(text)"
-            bad.runModal()
-            return
-        }
-        if !BridgeSettings.canImportPillow(text) {
-            let warn = NSAlert()
-            warn.messageText = "这个 python 没有 Pillow"
-            warn.informativeText = """
-                桥接本体还能跑, 但「换宠物」会失败 —— 打包那一步需要 Pillow。
-
-                可以给它装上：
-                \(text) -m pip install Pillow
-
-                仍然改用它吗？
-                """
-            warn.addButton(withTitle: "仍然使用")
-            warn.addButton(withTitle: "取消")
-            guard warn.runModal() == .alertFirstButtonReturn else { return }
-        }
-
-        UserDefaults.standard.set(text, forKey: PrefKey.pythonPath)
-        supervisor.restart()
-    }
-
+    /// 「关于」是**唯一**能看到解释器路径的地方 —— 它只读, 不会被误改。
+    ///
+    /// 解释器决定"换宠物"能不能把图集打成 `.pet`(要 Pillow), 所以路径、来源(自动探测还是
+    /// 命令行指定)、有无 Pillow 都在这里交代清楚: 出问题时要能一眼看全, 而不是去猜
+    /// "当初改的是哪一个"。菜单里那个能改路径的入口已经拿掉了。
     @objc private func showAbout() {
         let settings = BridgeSettings.load()
+        let hasPillow = settings.pythonHasPillow
+        let pillow = hasPillow ? "有 Pillow" : "⚠︎ 没有 Pillow"
+
+        var lines = [
+            "把 Mac 上的 Codex 状态推给 AI Passport 上的宠物。",
+            "",
+            "python 解释器：\(settings.pythonPath)（\(settings.pythonSourceLabel) · \(pillow)）",
+        ]
+        if !hasPillow {
+            lines.append("    换宠物要把图集打成 .pet, 这一步需要 Pillow。可以这样装：")
+            lines.append("    \(settings.pythonPath) -m pip install Pillow")
+        }
+        lines += [
+            "桥接脚本：\(settings.scriptPath ?? "未找到（包不完整）")",
+            "桥接端口：\(settings.port)",
+            "控制通道：\(BridgePaths.socketPath)",
+            "",
+            "设备是 TCP 客户端, 会主动连到这台 Mac, 所以设备侧只需要填对 IP 和端口。",
+        ]
+
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Codex Pet Bridge \(BuildConfig.version)"
-        alert.informativeText = """
-            把 Mac 上的 Codex 状态推给 AI Passport 上的宠物。
-
-            项目目录：\(settings.repoPath)
-            桥接端口：\(settings.port)
-            控制通道：\(BridgePaths.socketPath)
-
-            设备是 TCP 客户端, 会主动连到这台 Mac, 所以设备侧只需要填对 IP 和端口。
-            """
+        alert.informativeText = lines.joined(separator: "\n")
         alert.runModal()
     }
 

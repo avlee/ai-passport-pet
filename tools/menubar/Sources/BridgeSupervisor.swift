@@ -215,20 +215,24 @@ final class BridgeSupervisor {
         snapshot.watchingCodex = settings.watchCodex
         snapshot.lastError = nil
 
-        guard settings.scriptExists else {
-            snapshot.lastError = "找不到 \(settings.scriptPath), 请在菜单里重新选择项目目录"
+        // 桥接脚本只有一个来源: 应用包内。正常构建出来的包一定带着
+        // bridge/pet_bridge.py, 走到这里说明包不完整。
+        guard let scriptPath = settings.scriptPath else {
+            snapshot.lastError = "应用包内没有 bridge/pet_bridge.py —— 这个包不完整，"
+                + "请重新用 tools/menubar/build.sh 构建"
             publish()
             return
         }
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: settings.pythonPath)
-        var arguments = [settings.scriptPath,
+        var arguments = [scriptPath,
                          "--port", String(settings.port),
                          "--control", BridgePaths.socketPath]
         if !settings.watchCodex { arguments.append("--no-codex") }
         task.arguments = arguments
-        task.currentDirectoryURL = URL(fileURLWithPath: settings.repoPath)
+        // 工作目录必须真实存在, 否则 Process 会在 chdir 上直接抛错。
+        task.currentDirectoryURL = URL(fileURLWithPath: settings.workingDirectory)
 
         if let handle = openLogFile() {
             logHandle = handle
