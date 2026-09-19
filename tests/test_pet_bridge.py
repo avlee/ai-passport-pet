@@ -15,6 +15,7 @@ This runs on the host and needs no ESP-IDF.
 from __future__ import annotations
 
 import contextlib
+import functools
 import io
 import json
 import os
@@ -24,13 +25,15 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
-import pet_bridge  # noqa: E402  (path set up above)
+import gen_pet_package  # noqa: E402  (path set up above)
+import pet_bridge  # noqa: E402
 
 
 def build_device_parser(workdir: str) -> str:
@@ -329,6 +332,215 @@ def test_control_channel_drives_the_device() -> None:
             link.detach()
 
 
+def test_pet_swap_end_to_end() -> None:
+    """换宠物: 控制通道上的 pets / petxfer / petdone, 以及真正发到线上去的字节。
+
+    为什么必须在这里钉: 菜单栏应用(工具目录下的 Swift)自己没有测试挂具, 它只认这几
+    个事件的名字和字段。字段一改, Swift 那边是**静默**失效 —— 编译照过, 菜单里那
+    一项就是不动或者空着。
+
+    刻意不用 Pillow: 把 .pet 预放进缓存并按打包器的口径写好 stamp, 于是这只"宠物"
+    的来源就是这个测试自己拼的字节, 走的仍然是真实的宣告 + 原始字节路径。
+    """
+    blob = bytes(range(256)) * 12            # 3 KB, 够跨过好几个发送分片
+    frames = [{"offset": i * 256, "x": i, "y": 0, "w": 16, "h": 16,
+               "duration": 100 + i} for i in range(12)]
+    states = [{"name": "idle", "first": 0, "count": 12}]
+    package, stats = gen_pet_package.assemble_package(
+        "test-pet", "测试宠物", blob, frames, states)
+
+    with tempfile.TemporaryDirectory(prefix="pet-swap-") as workdir:
+        pets_dir = Path(workdir) / "pets"
+        pet_dir = pets_dir / "test-pet"
+        pet_dir.mkdir(parents=True)
+        manifest = {"id": "test-pet", "displayName": "测试宠物",
+                    "spriteVersionNumber": 2, "spritesheetPath": "spritesheet.webp"}
+        (pet_dir / "pet.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (pet_dir / "spritesheet.webp").write_bytes(b"fake atlas")
+
+        cache_dir = Path(workdir) / "cache"
+        cache_dir.mkdir()
+        (cache_dir / "test-pet.pet").write_bytes(package)
+        # 缓存命中判据就是这份 stamp; 用库自己的算法算, 免得格式两边各写一份。
+        (cache_dir / "test-pet.stamp").write_text(
+            pet_bridge.PetLibrary._stamp(pet_dir, manifest), encoding="utf-8")
+
+        library = pet_bridge.PetLibrary(pets_dir, cache_dir)
+
+        socket_path = os.path.join(workdir, "bridge.sock")
+        assert len(socket_path.encode()) < 104, "AF_UNIX 路径过长"
+
+        link = pet_bridge.DeviceLink()
+        installer = pet_bridge.PetInstaller(link, library)
+        hub = pet_bridge.ControlHub(socket_path)
+        link.on_event = hub.publish
+
+        local, peer = socket.socketpair()
+        client = None
+        device_bytes = bytearray()
+        device_error: list[str] = []
+
+        def fake_device() -> None:
+            """设备侧: 读一行宣告, 再按 size 收原始字节, 最后回 petdone。"""
+            try:
+                peer.settimeout(5.0)
+                buffer = b""
+                while b"\n" not in buffer:
+                    buffer += peer.recv(4096)
+                line, buffer = buffer.split(b"\n", 1)
+                announce = json.loads(line.decode("utf-8").strip())
+                assert announce["type"] == "pet", announce
+                assert announce["id"] == "test-pet", announce
+                assert announce["size"] == len(package), announce
+                assert announce["crc32"] == zlib.crc32(package) & 0xFFFFFFFF, announce
+
+                device_bytes.extend(buffer)
+                while len(device_bytes) < announce["size"]:
+                    chunk = peer.recv(65536)
+                    if not chunk:
+                        break
+                    device_bytes.extend(chunk)
+
+                peer.sendall(b'{"type":"petdone","id":"test-pet","ok":1}\n')
+            except Exception as exc:   # 断言失败不能只留在子线程里
+                device_error.append(f"{type(exc).__name__}: {exc}")
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                link.attach(local, "192.168.0.108:58136")
+            threading.Thread(target=pet_bridge.read_device,
+                             args=(link, local,
+                                   functools.partial(pet_bridge.settle_pet_transfer,
+                                                     hub, installer, library)),
+                             daemon=True, name="fake-device-reader").start()
+            threading.Thread(target=fake_device, daemon=True,
+                             name="fake-device").start()
+
+            assert library.scan()[0]["cached"] is True, "缓存没命中, 后面会去调 Pillow"
+            hub.on_command = pet_bridge.build_command_router(link, None, library,
+                                                            installer)
+            hub.start()
+
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(8.0)
+            client.connect(socket_path)
+            reader = client.makefile("rb")
+            json.loads(reader.readline())      # 吃掉 snapshot
+
+            def send(payload: dict) -> None:
+                client.sendall(json.dumps(payload).encode() + b"\n")
+
+            # 1) 列表: 菜单栏照着 items 建子菜单, 字段名错了那一项就是空的。
+            send({"cmd": "petlist"})
+            event = json.loads(reader.readline())
+            assert event["event"] == "pets", event
+            assert event["pets_dir"] == str(pets_dir), event
+            assert event["busy"] is False, event
+            assert event["slot_bytes"] == pet_bridge.PET_SLOT_BYTES, event
+            assert event["items"] == [{"id": "test-pet", "display": "测试宠物",
+                                       "cached": True, "size": len(package),
+                                       "error": None}], event
+
+            # 2) 换宠物: 成功命令没有回执, 只有事件。收集到 petdone 为止。
+            send({"cmd": "pet", "id": "test-pet"})
+            events = []
+            while True:
+                event = json.loads(reader.readline())
+                events.append(event)
+                if event["event"] == "petdone":
+                    break
+
+            kinds = [e["event"] for e in events]
+            assert kinds[-1] == "petdone", kinds
+            transfers = [e for e in events if e["event"] == "petxfer"]
+            states_seen = [e["state"] for e in transfers]
+            assert states_seen[0] == "preparing", states_seen
+            assert "sending" in states_seen, states_seen
+            assert states_seen[-1] == "sent", states_seen
+            for entry in transfers:
+                assert entry["id"] == "test-pet", entry
+                assert entry["total"] in (0, len(package)), entry
+                assert 0 <= entry["sent"] <= len(package), entry
+            # 最后一条 sending 必须报满 —— 进度停在 99% 就是分片算错了。
+            assert transfers[-2]["sent"] == len(package), transfers[-2]
+
+            done = events[-1]
+            assert done == {"event": "petdone", "id": "test-pet", "ok": True}, done
+
+            # 3) 线上必须一个字节不差: 中间混进一行 JSON 就整包错位。
+            assert not device_error, device_error
+            assert bytes(device_bytes) == package, (
+                f"设备收到 {len(device_bytes)} 字节, 包里是 {len(package)}")
+
+            # 4) 收尾。设备给了结论之后, 半路连上来的客户端重放 snapshot 也必须看到
+            #    终局: last 收成 done, 而且**不能**留着最后一帧 petxfer(sent) ——
+            #    菜单栏按事件名排序合并快照, petdone 排在 petxfer 前面, 留着的
+            #    "sent" 会把它盖回去, 那行进度就永远停在"等设备确认"。
+            #
+            #    settle 跑在设备读线程里, 与客户端读到的 petdone 之间**没有**先后保证,
+            #    所以这里等它落地再断言。上一版没等, 于是偶发(其实是必发)假失败。
+            def settled() -> dict:
+                deadline = time.time() + 3.0
+                while True:
+                    state = hub.snapshot()["state"]
+                    if state.get("pets", {}).get("last", {}).get("state") in ("done", "failed"):
+                        return state
+                    assert time.time() < deadline, "等收尾超时"
+                    time.sleep(0.02)
+
+            state = settled()
+            assert state["pets"]["last"]["state"] == "done", state["pets"]["last"]
+            assert "petxfer" not in state, sorted(state)
+            # 打包成功后 cached 要翻真 —— 否则"已经打过的包"在菜单里还是"未打包"。
+            assert state["pets"]["items"][0]["cached"] is True, state["pets"]["items"]
+        finally:
+            if client is not None:
+                client.close()
+            local.close()
+            peer.close()
+            link.detach()
+
+
+def test_missing_pillow_is_explained_not_an_internal_error() -> None:
+    """缺 Pillow 时必须说清"是解释器挑错了", 而不是一句"内部错误"。
+
+    gen_pet_package 是**惰性**导入 PIL 的(为了让 tests/test_pet_package.py 在没有
+    Pillow 的解释器上也能跑), 所以那句 ImportError 不是从 `import gen_pet_package`
+    抛出来的 —— 兜在它上面的友好提示永远不会触发, 最后落进通用的 except Exception,
+    变成 "内部错误: No module named 'PIL'"。真机上就是这么撞的: 菜单栏点一下没结果,
+    日志里只有一句无从下手的"内部错误"。这里把它钉住。
+    """
+    pets_dir = Path(tempfile.mkdtemp(prefix="pets-nopil-"))
+    cache_dir = Path(tempfile.mkdtemp(prefix="pets-nopil-cache-"))
+    entry = pets_dir / "test-pet"
+    entry.mkdir()
+    (entry / "pet.json").write_text(json.dumps({
+        "id": "test-pet", "displayName": "测试宠物", "spriteVersionNumber": 2,
+        "spritesheetPath": "spritesheet.webp",
+    }), encoding="utf-8")
+    (entry / "spritesheet.webp").write_bytes(b"\x00" * 32)
+
+    library = pet_bridge.PetLibrary(pets_dir=pets_dir, cache_dir=cache_dir)
+    assert library.scan()[0]["cached"] is False, "缓存不该命中, 否则不会走到打包"
+
+    # 假装这个解释器没有 Pillow。不能真卸 Pillow —— 别的用例要靠它建夹具。
+    library._pil_version = staticmethod(lambda: None)   # type: ignore[method-assign]
+
+    # 菜单栏靠 packer 在**点之前**就提示, 所以这里也得对。
+    assert library.packer()["available"] is False
+    assert "Pillow" in (library.describe()["packer"]["hint"] or "")
+
+    try:
+        library.package("test-pet")
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "Pillow" in message, message
+        assert sys.executable in message, f"报错里要说清是哪个解释器: {message}"
+        assert "内部错误" not in message, message
+    else:
+        raise AssertionError("没有 Pillow 却打包成功了?")
+
+
 def main() -> int:
     failures = []
     tests = [
@@ -339,6 +551,9 @@ def main() -> int:
         ("server_accepts_device_and_delivers_state",
          test_server_accepts_device_and_delivers_state),
         ("control_channel_drives_the_device", test_control_channel_drives_the_device),
+        ("pet_swap_end_to_end", test_pet_swap_end_to_end),
+        ("missing_pillow_is_explained",
+         test_missing_pillow_is_explained_not_an_internal_error),
     ]
 
     with tempfile.TemporaryDirectory(prefix="pet-bridge-") as workdir:

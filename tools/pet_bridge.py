@@ -50,6 +50,13 @@ Codex 会把每一轮对话写成 rollout JSONL: ~/.codex/sessions/YYYY/MM/DD/ro
     watch    是否跟随日志        enabled
     device   设备上报            kind(hello/poke), fw, pet
     battery  设备电量            soc(0..100, null 表示读不到)
+    pets     可选宠物列表        pets_dir, cache_dir, slot_bytes, packer, items[],
+                                 busy, last
+                                 packer.available 为假表示这台桥接缺 Pillow,
+                                 打不出 .pet —— 换宠物之前就该告诉用户
+    petxfer  换宠物进度          id, state(preparing/sending/sent/failed),
+                                 sent, total, message
+    petdone  设备确认结果        id(槽里**真正**装上的那只), ok
     pong     ping 的回应
     error    命令出错            message
 
@@ -58,12 +65,23 @@ Codex 会把每一轮对话写成 rollout JSONL: ~/.codex/sessions/YYYY/MM/DD/ro
     {"cmd":"text","text":"..."}                      只换气泡文字
     {"cmd":"raw","payload":{...}}                    直接发一行 JSON
     {"cmd":"watch","enabled":false}                  开关日志跟随
+    {"cmd":"petlist"}                                重新扫描并广播 pets
+    {"cmd":"pet","id":"sophie-portrait"}             换宠物(后台传输, 立刻返回)
     {"cmd":"snapshot"}                               重发一次全量状态
     {"cmd":"ping"}
 
     注意: 这是一个**事件流**, 不是一问一答。命令成功不回执 —— 结果会以对应的事件
-    广播出来(state/text/watch/...); 只有出错才会多收到一条 error。客户端按事件
-    更新状态即可, 不要去配"发一条收一条"。
+    广播出来(state/text/watch/pets/petxfer/...); 只有出错才会多收到一条 error。
+    客户端按事件更新状态即可, 不要去配"发一条收一条"。
+
+    换宠物的时序: 发 {"cmd":"pet"} 之后, 先是若干条 petxfer(sending, 带 sent/total
+    进度), 发完一条 petxfer(sent), 然后等设备的 petdone(ok)。**petdone 才是结论** ——
+    设备要核对长度与整包 CRC 再重新映射, "发完了"和"装上了"是两件事。成功时设备
+    还会补发一条 hello, 菜单栏以它为准更新"当前是哪只"。
+
+    结论一到, 桥接会补发一条 pets: last 收成终局(done/failed), items 里的 cached
+    也重扫过了。同时 petxfer 会从 snapshot 里撤掉 —— 它是进度不是状态, 留着最后一帧
+    "sent", 中途接入的客户端重放快照时会把终点状态盖回去。
 
 控制通道只是**观察和驱动**上的补充, 协议的唯一定义仍然是本文件里发往设备的
 那几条 JSON —— 所以 tests/test_pet_bridge.py 的两端互校依然覆盖全部下行报文。
@@ -72,6 +90,8 @@ Codex 会把每一轮对话写成 rollout JSONL: ~/.codex/sessions/YYYY/MM/DD/ro
     working 正在重构登录模块
     text 只改文字不改状态
     waiting / ready / failed / idle
+    pets
+    pet sophie-portrait
     raw {"type":"state","state":"jumping"}
     status
     quit
@@ -81,6 +101,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import glob
 import json
 import os
@@ -88,6 +109,7 @@ import socket
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -104,6 +126,13 @@ PING_INTERVAL_S = 5.0
 # 多久没有 Codex 事件就把宠物切回 idle。
 CODEX_IDLE_AFTER_S = 45.0
 CODEX_SESSIONS_GLOB = os.path.expanduser("~/.codex/sessions/**/rollout-*.jsonl")
+
+# 推送宠物包时的分片大小。只影响进度事件的密度(约 200 次一条 3 MB 的包)。
+PET_SEND_CHUNK = 16384
+
+# Codex 的宠物源目录与设备侧槽的容量上限(partitions.csv 里 pets 分区 = 0x3f0000)。
+PETS_DIR = Path(os.path.expanduser("~/.codex/pets"))
+PET_SLOT_BYTES = 0x3F0000
 
 VALID_STATES = ("idle", "working", "waiting", "ready", "failed")
 
@@ -207,6 +236,354 @@ class DeviceLink:
         # 单独一种事件名: 只换文字不该把最近一次的 state 从 snapshot 里顶掉。
         self._publish({"event": "text", "text": squashed, "delivered": ok})
         return ok
+
+    def send_pet(self, pet_id: str, package: bytes) -> bool:
+        """把一份宠物包推给设备: 先一行宣告, 紧跟 size 个**裸字节**。
+
+        为什么不套 base64: 一只宠物 1~3.4 MB, 编码要多传 33%, 而这一步本来就要
+        几十秒(设备边收边擦 flash, 是整条链路上最慢的一环)。设备侧也是按裸字节
+        流式写进分区的, 没有多余的 RAM 去放一份完整的副本。
+
+        整个过程必须在 `_lock` 里发完 —— 设备收到宣告之后就切进"二进制模式"了,
+        这时要是插进去一条 ping 或 state, 那几个字节会被当成包体写进 flash, 整包
+        从此错位。代价是传输期间其他发送方会阻塞(心跳延后发, 无害); 这是正确的
+        取舍, 不要为了"不卡心跳"把宣告和载荷拆开锁。
+        """
+        announce = json.dumps(
+            {"type": "pet", "id": pet_id, "size": len(package),
+             "crc32": zlib.crc32(package) & 0xFFFFFFFF},
+            ensure_ascii=False,
+        ).encode("utf-8") + b"\r\n"
+
+        total = len(package)
+        with self._lock:
+            sock = self._sock
+            if sock is None:
+                return False
+            try:
+                sock.sendall(announce)
+                view = memoryview(package)
+                sent = 0
+                while sent < total:
+                    chunk = view[sent:sent + PET_SEND_CHUNK]
+                    sock.sendall(chunk)
+                    sent += len(chunk)
+                    # 分片上报进度: 整包丢给 sendall 的话, 界面上几十秒都不会动一下。
+                    self._publish({"event": "petxfer", "id": pet_id, "state": "sending",
+                                   "sent": sent, "total": total})
+                return True
+            except OSError as exc:
+                print(f"[pet] 发送失败({exc}), 断开连接", flush=True)
+
+        # 走到这里说明写失败, 在锁外收尾避免重入。
+        self.detach()
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 宠物库: 扫描 Codex 的宠物目录, 按需生成设备能收的 .pet
+# ---------------------------------------------------------------------------
+# 设备那条 3.94 MB 的 pets 分区只装得下一只, 所以这台 Mac 上的"宠物列表"就是
+# ~/.codex/pets 下的各个目录 —— 换宠物 = 把另一只重新打包推下去。
+#
+# 打包用 tools/gen_pet_package.py 的同一份实现(不重写一份): 包格式是跨语言的
+# 契约, 只能有一个源头。它需要 Pillow, 所以是惰性导入 —— 没装 Pillow 时"列表"
+# 照常能看, 只是装不了, 报错也说得清楚。
+DEFAULT_PET_CACHE = (
+    os.path.expanduser("~/Library/Application Support/CodexPetBridge/pets")
+    if sys.platform == "darwin"
+    else os.path.expanduser("~/.cache/codex-pet-bridge/pets")
+)
+
+
+class PetLibrary:
+    """~/.codex/pets 的目录视图 + .pet 的按需生成与缓存。
+
+    缓存键是"源图集的大小与改动时间" —— 只要图集没动就不再重新切帧(一只 3 MB
+    的宠物要切 57 帧、逐像素转 RGB565, 每次点菜单都做一遍太浪费)。
+    """
+
+    def __init__(self, pets_dir: Path = PETS_DIR, cache_dir: Path | None = None) -> None:
+        self.pets_dir = Path(pets_dir)
+        self.cache_dir = Path(cache_dir) if cache_dir else Path(DEFAULT_PET_CACHE)
+        self._lock = threading.Lock()
+        self._index: dict[str, dict] = {}
+
+    # -- 扫描 ---------------------------------------------------------------
+    def scan(self) -> list[dict]:
+        """列出可用的宠物。只读 pet.json, 不切帧 —— 菜单要立刻能弹出来。"""
+        items: list[dict] = []
+        again: dict[str, dict] = {}
+
+        for entry in sorted(self.pets_dir.iterdir()) if self.pets_dir.is_dir() else []:
+            if not entry.is_dir() or not (entry / "pet.json").is_file():
+                continue
+            try:
+                with (entry / "pet.json").open(encoding="utf-8") as handle:
+                    manifest = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                items.append({"id": entry.name, "display": entry.name, "source": str(entry),
+                              "error": f"pet.json 读不出来: {exc}"})
+                continue
+
+            pet_id = str(manifest.get("id") or entry.name)
+            item = {
+                "id": pet_id,
+                "display": str(manifest.get("displayName") or pet_id),
+                "source": str(entry),
+                "version": manifest.get("spriteVersionNumber"),
+            }
+            if item["version"] != 2:
+                item["error"] = f"只支持 spriteVersionNumber=2, 这里是 {item['version']!r}"
+            stamp = self._stamp(entry, manifest)
+            cached = self.cache_dir / f"{pet_id}.pet"
+            item["stamp"] = stamp
+            item["cached"] = bool(stamp) and cached.is_file() and \
+                self._cached_stamp(pet_id) == stamp
+            if item["cached"]:
+                item["size"] = cached.stat().st_size
+            items.append(item)
+            again[pet_id] = item
+
+        with self._lock:
+            self._index = again
+        return items
+
+    def entries(self) -> list[dict]:
+        """最近一次 scan() 的结果(没扫过就扫一遍)。"""
+        if not self._index:
+            return self.scan()
+        return list(self._index.values())
+
+    @staticmethod
+    def _stamp(entry: Path, manifest: dict) -> str:
+        sheet = entry / str(manifest.get("spritesheetPath", "spritesheet.webp"))
+        try:
+            stat = sheet.stat()
+        except OSError:
+            return ""
+        return f"{sheet.name}:{stat.st_size}:{int(stat.st_mtime)}"
+
+    def _cached_stamp(self, pet_id: str) -> str:
+        sidecar = self.cache_dir / f"{pet_id}.stamp"
+        try:
+            return sidecar.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    # -- 打包能力 -----------------------------------------------------------
+    @staticmethod
+    def _pil_version() -> str | None:
+        """返回当前解释器的 Pillow 版本, 没有就返回 None。"""
+        try:
+            import PIL  # noqa: F401  只用来问一句"在不在"
+        except ImportError:
+            return None
+        return str(getattr(PIL, "__version__", "?"))
+
+    def packer(self) -> dict:
+        """报给菜单: 这台桥接能不能把图集打成 .pet。
+
+        让菜单在**点之前**就知道"点了也会失败", 而不是点完看一句报错 ——
+        解释器挑错(比如 GUI 启动时 PATH 里只有 /usr/bin/python3)是很常见的坑,
+        从"换宠物失败"这个现象很难反推回去。
+        """
+        version = self._pil_version()
+        return {
+            "available": version is not None,
+            "python": sys.executable,
+            "pillow": version,
+            "hint": None if version else
+                    f"当前 python({sys.executable})没有 Pillow, 打不出 .pet",
+        }
+
+    # -- 生成 ---------------------------------------------------------------
+    def package(self, pet_id: str) -> tuple[bytes, dict]:
+        """取这只宠物的 .pet 字节与元信息, 必要时先生成。
+
+        返回 (bytes, {"id","display","total","stage"})。失败抛 RuntimeError,
+        消息是可以直接显示给用户的中文。
+        """
+        entry = None
+        for candidate in self.entries():
+            if candidate["id"] == pet_id:
+                entry = candidate
+                break
+        if entry is None:
+            raise RuntimeError(f"没有这只宠物: {pet_id}(可用: "
+                               f"{', '.join(e['id'] for e in self.entries()) or '无'})")
+        if entry.get("error"):
+            raise RuntimeError(f"{pet_id}: {entry['error']}")
+
+        cached = self.cache_dir / f"{pet_id}.pet"
+        if entry.get("cached") and cached.is_file():
+            return cached.read_bytes(), self._meta(pet_id, entry)
+
+        try:
+            import gen_pet_package
+        except ImportError as exc:
+            raise RuntimeError(f"找不到 gen_pet_package: {exc}") from exc
+
+        # Pillow 查在这里而不是靠 build_package 抛 ImportError: gen_pet_package 是
+        # **惰性**导入 PIL 的(为了让 tests/test_pet_package.py 在没有 Pillow 的解释器上
+        # 也能跑), 所以缺 Pillow 时抛出来的那条 ImportError 只会在切帧那一步冒出来,
+        # 混在一堆别的原因里 —— 之前就变成过一句没头没脑的"内部错误"。
+        if self._pil_version() is None:
+            raise RuntimeError(
+                f"打包 {pet_id} 需要 Pillow, 但桥接跑在 {sys.executable} 上, 它没有 Pillow。"
+                f"在菜单栏的「选择 python3…」里换成装了 Pillow 的解释器, "
+                f"或者给它装上: {sys.executable} -m pip install Pillow")
+
+        try:
+            packet, stats = gen_pet_package.build_package(Path(entry["source"]))
+        except SystemExit as exc:  # 生成器用 SystemExit 报"这只不合适"
+            raise RuntimeError(str(exc)) from exc
+
+        if stats["total"] > PET_SLOT_BYTES:
+            raise RuntimeError(
+                f"包 {stats['total'] / 1024 / 1024:.2f} MiB 超过设备的宠物槽 "
+                f"({PET_SLOT_BYTES / 1024 / 1024:.2f} MiB)")
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # 先写临时文件再改名: 中途崩了不会留下一个半截的缓存被当成"已生成"。
+        tmp = cached.with_suffix(".pet.part")
+        tmp.write_bytes(packet)
+        tmp.replace(cached)
+        (self.cache_dir / f"{pet_id}.stamp").write_text(entry["stamp"], encoding="utf-8")
+
+        entry["cached"] = True
+        entry["size"] = stats["total"]
+        entry["stage"] = stats["stage"]
+        return packet, self._meta(pet_id, entry)
+
+    @staticmethod
+    def _meta(pet_id: str, entry: dict) -> dict:
+        return {"id": pet_id, "display": entry.get("display", pet_id),
+                "total": entry.get("size", 0), "stage": entry.get("stage")}
+
+    def describe(self) -> dict:
+        """给控制通道/菜单用的列表。"""
+        return {
+            "pets_dir": str(self.pets_dir),
+            "cache_dir": str(self.cache_dir),
+            "slot_bytes": PET_SLOT_BYTES,
+            "packer": self.packer(),
+            "items": [
+                {"id": item["id"], "display": item["display"],
+                 "cached": bool(item.get("cached")), "size": item.get("size", 0),
+                 "error": item.get("error")}
+                for item in self.entries()
+            ],
+        }
+
+
+class PetInstaller:
+    """把"换宠物"做成一次后台传输, 顺便把进度广播出去。
+
+    为什么必须在后台线程里跑: 一只宠物在 2.4 GHz Wi-Fi 上要传几十秒, 而设备每次
+    收到一块都要先擦 flash 才写得进去。发在控制通道的读线程里会把那个客户端卡住
+    那么久 —— 菜单栏看起来就像点了没反应。
+    """
+
+    def __init__(self, link: DeviceLink, library: PetLibrary) -> None:
+        self.link = link
+        self.library = library
+        self._busy = threading.Lock()
+        # 最近一次传输的结局, 供 snapshot 用。
+        self.last: dict = {"id": "", "state": "idle", "sent": 0, "total": 0}
+
+    @property
+    def busy(self) -> bool:
+        return self._busy.locked()
+
+    def start(self, pet_id: str) -> str | None:
+        """None 表示已经开始; 否则返回一句可以直接显示的失败原因。"""
+        if not self.link.connected:
+            return "设备还没连上"
+        if not self._busy.acquire(blocking=False):
+            return "已经有一次换宠物在进行"
+
+        try:
+            thread = threading.Thread(target=self._run, args=(pet_id,),
+                                      daemon=True, name="pet-install")
+            thread.start()
+        except RuntimeError as exc:  # 起不了线程: 别把锁漏掉
+            self._busy.release()
+            return f"无法启动传输线程: {exc}"
+        return None
+
+    def _publish(self, event: dict) -> None:
+        self.last = {**self.last, **{k: v for k, v in event.items() if k != "event"}}
+        self.link._publish(event)
+
+    def note_done(self, pet_id: str, ok: bool) -> None:
+        """设备给出的结论。把 last 收尾成终局。
+
+        不这么做的话 last 会停在 "sent", 而它正是客户端中途接入时用来对齐进度行的
+        那一份 —— 用户会看到一行永远不动、也不告诉你结果的"等设备确认"。
+        """
+        total = self.last.get("total", 0)
+        self.last = {"id": pet_id or self.last.get("id", ""),
+                     "state": "done" if ok else "failed",
+                     "sent": total if ok else self.last.get("sent", 0),
+                     "total": total}
+        if not ok:
+            self.last["message"] = "设备拒收了这个包"
+
+    def _run(self, pet_id: str) -> None:
+        try:
+            self._publish({"event": "petxfer", "id": pet_id, "state": "preparing",
+                           "sent": 0, "total": 0})
+            print(f"[pet] 准备 {pet_id}…", flush=True)
+            packet, meta = self.library.package(pet_id)
+            total = len(packet)
+            self._publish({"event": "petxfer", "id": pet_id, "state": "sending",
+                           "sent": 0, "total": total})
+            print(f"[pet] 推送 {pet_id}: {total / 1024 / 1024:.2f} MiB", flush=True)
+
+            ok = self.link.send_pet(pet_id, packet)
+            if not ok:
+                self._publish({"event": "petxfer", "id": pet_id, "state": "failed",
+                               "sent": 0, "total": total,
+                               "message": "链路中断, 设备那边槽是空的"})
+                print("[pet] 传输中断", flush=True)
+                return
+
+            # 发完不等于装上: 设备还要核对长度与整包 CRC, 再重新映射。它会回一条
+            # petdone —— 在那之前只能算"发出去了"。
+            self._publish({"event": "petxfer", "id": pet_id, "state": "sent",
+                           "sent": total, "total": total})
+            print(f"[pet] {pet_id} 已发完, 等设备确认…", flush=True)
+        except RuntimeError as exc:
+            self._publish({"event": "petxfer", "id": pet_id, "state": "failed",
+                           "sent": 0, "total": 0, "message": str(exc)})
+            print(f"[pet] {exc}", flush=True)
+        except Exception as exc:  # 传输线程不该把异常吞掉, 但也不能带崩进程
+            self._publish({"event": "petxfer", "id": pet_id, "state": "failed",
+                           "sent": 0, "total": 0, "message": f"内部错误: {exc}"})
+            print(f"[pet] 内部错误: {exc}", flush=True)
+        finally:
+            self._busy.release()
+
+
+def settle_pet_transfer(hub: ControlHub, installer: PetInstaller,
+                        library: PetLibrary, pet_id: str, ok: bool) -> None:
+    """设备给出结论(petdone)之后的收尾。
+
+    两件事都是为了"半路连上来的客户端看到的仍然是对的":
+    - `last` 收成终局, 不然它停在 "sent";
+    - `petxfer` 报的是**进度不是状态**, 结论一到就从快照里撤掉 —— 菜单栏重放
+      snapshot 时按事件名排序合并, `petdone` 排在 `petxfer` 前面, 留着那帧
+      "sent" 会把它盖回去, 于是进度行永远停在"等设备确认"。
+    顺手重扫列表: 打包成功后 cached 才翻真。
+
+    单独成函数而不是写在 main 里的闭包, 是为了让它能被 tests/test_pet_bridge.py
+    直接调 —— 这段"收尾"只有真机跑完一次传输才看得见, 靠人会漏。
+    """
+    installer.note_done(pet_id, ok)
+    library.scan()
+    hub.forget("petxfer")
+    hub.publish({"event": "pets", **library.describe(), "last": installer.last})
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +734,8 @@ class CodexWatcher(threading.Thread):
 # ---------------------------------------------------------------------------
 # 服务端
 # ---------------------------------------------------------------------------
-def serve(link: DeviceLink, bind: str, port: int) -> None:
+def serve(link: DeviceLink, bind: str, port: int,
+          on_petdone: Callable[[str, bool], None] | None = None) -> None:
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((bind, port))
@@ -383,14 +761,15 @@ def serve(link: DeviceLink, bind: str, port: int) -> None:
         link.detach()
         link.attach(conn, f"{addr[0]}:{addr[1]}")
 
-        threading.Thread(target=read_device, args=(link, conn),
+        threading.Thread(target=read_device, args=(link, conn, on_petdone),
                          daemon=True, name="device-reader").start()
         threading.Thread(target=ping_loop, args=(link,),
                          daemon=True, name="keepalive").start()
 
 
-def read_device(link: DeviceLink, conn: socket.socket) -> None:
-    """读设备发回来的消息(hello / battery / poke / pong)。"""
+def read_device(link: DeviceLink, conn: socket.socket,
+                on_petdone: Callable[[str, bool], None] | None = None) -> None:
+    """读设备发回来的消息(hello / battery / poke / pong / petdone)。"""
     buffer = b""
     try:
         while True:
@@ -428,6 +807,20 @@ def read_device(link: DeviceLink, conn: socket.socket) -> None:
                         soc = None
                     print(f"[recv] 电量 {soc if soc is not None else '未知'}", flush=True)
                     link._publish({"event": "battery", "soc": soc})
+                elif mtype == "petdone":
+                    # 设备那边的真正结论: 它核对过长度和整包 CRC, 并且重新映射过了。
+                    # id 是**设备槽里那一只**, 不是我们发过去的那只 —— 发错文件时
+                    # 这就是唯一能看出来地方。
+                    pet_id = message.get("id") or ""
+                    ok = bool(message.get("ok"))
+                    print(f"[recv] 换宠物{'成功' if ok else '失败'}: {pet_id}", flush=True)
+                    link._publish({"event": "petdone", "id": pet_id, "ok": ok})
+                    # 换宠物的收尾不在这条线上做完: last 要收成终局, 列表要重扫
+                    # (打包成功后 cached 才翻真)。由 main 里那个回调统一处理。
+                    if on_petdone is not None:
+                        on_petdone(pet_id, ok)
+                    # 成功时设备紧接着还会补发一条 hello, 菜单栏以那条为准更新"当前
+                    # 是哪只"; 这里不重复上报, 免得两个来源打架。
                 elif mtype != "pong":
                     print(f"[recv] {message}", flush=True)
     except OSError:
@@ -480,6 +873,17 @@ class ControlHub:
                 client.sendall(line)
             except OSError:
                 self._drop(client)
+
+    def forget(self, *names: str) -> None:
+        """把某几类事件从"最新一份"里拿掉。
+
+        给**有结论之后就过时**的事件用: petxfer 报的是进度, 设备给出 petdone 之后
+        再留着最后一帧(sent), 新接入的客户端重放 snapshot 时(菜单栏按事件名排序
+        合并) 就会拿它当最终状态 —— 那行进度会永远停在"等设备确认"。
+        """
+        with self._lock:
+            for name in names:
+                self._latest.pop(name, None)
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -575,7 +979,9 @@ class ControlHub:
             client.sendall((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
 
 
-def build_command_router(link: DeviceLink, watcher: "CodexWatcher | None"):
+def build_command_router(link: DeviceLink, watcher: "CodexWatcher | None",
+                         library: "PetLibrary | None" = None,
+                         installer: "PetInstaller | None" = None):
     """把控制通道的命令翻译成与终端 REPL 相同的调用。
 
     成功返回 None(结果由事件广播体现), 失败返回一条 error 事件。刻意不做逐条回执:
@@ -613,6 +1019,30 @@ def build_command_router(link: DeviceLink, watcher: "CodexWatcher | None"):
             watcher.set_enabled(bool(command.get("enabled")))
             return None
 
+        # --- 宠物 ---
+        if name == "petlist":
+            if library is None:
+                return {"event": "error", "message": "宠物库未启用"}
+            # 重新扫一遍: 用户可能刚在 Codex 里下了新宠物, 不该要求重启桥接。
+            library.scan()
+            payload = library.describe()
+            if installer is not None:
+                payload["busy"] = installer.busy
+                payload["last"] = installer.last
+            link._publish({"event": "pets", **payload})
+            return None
+
+        if name == "pet":
+            if library is None or installer is None:
+                return {"event": "error", "message": "宠物库未启用"}
+            pet_id = command.get("id")
+            if not isinstance(pet_id, str) or not pet_id:
+                return {"event": "error", "message": "缺少 id"}
+            problem = installer.start(pet_id)
+            if problem is not None:
+                return {"event": "error", "message": problem}
+            return None
+
         return {"event": "error", "message": f"未知命令: {name}"}
 
     return handle
@@ -624,6 +1054,8 @@ def build_command_router(link: DeviceLink, watcher: "CodexWatcher | None"):
 HELP = """可用命令:
   <state> [文字]      推一个状态; state ∈ idle/working/waiting/ready/failed
   text <文字>         只更新气泡文字, 不改状态
+  pets                列出 Codex 里可用的宠物(~/.codex/pets)
+  pet <id>            把某一只打包推给设备, 换掉槽里那只
   raw <JSON>          直接发一行 JSON
   status              打印当前连接与状态
   quit                退出
@@ -631,6 +1063,7 @@ HELP = """可用命令:
   working 正在重构登录模块
   ready 改完了, 跑一下测试
   text 只是换一句话
+  pet sophie-portrait
 """
 
 
@@ -647,7 +1080,9 @@ def apply_state(link: DeviceLink, watcher: CodexWatcher | None,
     link.send_state(state, text or None, source="manual")
 
 
-def repl(link: DeviceLink, watcher: CodexWatcher | None) -> None:
+def repl(link: DeviceLink, watcher: CodexWatcher | None,
+         library: "PetLibrary | None" = None,
+         installer: "PetInstaller | None" = None) -> None:
     print(HELP, flush=True)
     for line in sys.stdin:
         line = line.strip()
@@ -664,12 +1099,33 @@ def repl(link: DeviceLink, watcher: CodexWatcher | None) -> None:
             print(f"[status] 设备={link.peer or '未连接'} codex状态={state}",
                   flush=True)
             continue
+        if line == "pets":
+            if library is None:
+                print("[err] 宠物库未启用", flush=True)
+                continue
+            for item in library.describe()["items"]:
+                mark = "已打包" if item["cached"] else "未打包"
+                note = f"  ({item['error']})" if item["error"] else ""
+                print(f"  {item['id']:<24} {item['display']:<12} {mark}{note}",
+                      flush=True)
+            continue
 
         head, _, rest = line.partition(" ")
         rest = rest.strip()
 
         if head == "text":
             link.send_text(rest)
+            continue
+        if head == "pet":
+            if library is None or installer is None:
+                print("[err] 宠物库未启用", flush=True)
+                continue
+            if not rest:
+                print("[err] 用法: pet <id>; 敲 pets 看有哪些", flush=True)
+                continue
+            problem = installer.start(rest)
+            if problem is not None:
+                print(f"[err] {problem}", flush=True)
             continue
         if head == "raw":
             try:
@@ -716,6 +1172,12 @@ def main() -> int:
     parser.add_argument("--control", metavar="SOCKET",
                         help="额外开一个本地控制通道(AF_UNIX socket 路径), "
                              "供菜单栏/GUI 读取状态并下发命令")
+    parser.add_argument("--pets-dir", default=str(PETS_DIR),
+                        help=f"Codex 的宠物源目录, 默认 {PETS_DIR}")
+    parser.add_argument("--pet-cache", default=DEFAULT_PET_CACHE,
+                        help=f"生成的 .pet 缓存目录, 默认 {DEFAULT_PET_CACHE}")
+    parser.add_argument("--no-pets", action="store_true",
+                        help="关掉换宠物能力(设备没刷 pets 分区时用)")
     args = parser.parse_args()
 
     if args.list_sessions:
@@ -742,9 +1204,34 @@ def main() -> int:
     else:
         print("[codex] 已禁用会话跟随(--no-codex)", flush=True)
 
+    # 宠物库。--no-pets 时整套换宠物能力关掉(那台设备可能没刷 pets 分区)。
+    library: PetLibrary | None = None
+    installer: PetInstaller | None = None
+    if not args.no_pets:
+        library = PetLibrary(Path(os.path.expanduser(args.pets_dir)),
+                             Path(os.path.expanduser(args.pet_cache)))
+        installer = PetInstaller(link, library)
+        # 启动就扫一次: 控制通道一连上来就能拿到最新的列表(publish 早于客户端接入
+        # 也没关系, ControlHub 会把它留作 snapshot 的一份)。
+        found = library.scan()
+        print(f"[pets] {len(found)} 只可用: "
+              f"{', '.join(item['id'] for item in found) or '无'}", flush=True)
+        print(f"[pets] 源 {library.pets_dir}", flush=True)
+        print(f"[pets] 缓存 {library.cache_dir}", flush=True)
+        if hub is not None:
+            hub.publish({"event": "pets", **library.describe(),
+                         "last": installer.last})
+    else:
+        print("[pets] 已禁用宠物库(--no-pets)", flush=True)
+
+    # 收尾(见 settle_pet_transfer)。三样缺一就关掉, 与 --no-pets 是同一套条件。
+    on_petdone: Callable[[str, bool], None] | None = None
+    if hub is not None and installer is not None and library is not None:
+        on_petdone = functools.partial(settle_pet_transfer, hub, installer, library)
+
     if hub is not None:
         hub.publish({"event": "watch", "enabled": watcher is not None})
-        hub.on_command = build_command_router(link, watcher)
+        hub.on_command = build_command_router(link, watcher, library, installer)
         try:
             hub.start()
         except OSError as exc:
@@ -753,12 +1240,12 @@ def main() -> int:
             link.on_event = None
             hub = None
 
-    threading.Thread(target=serve, args=(link, args.bind, args.port),
+    threading.Thread(target=serve, args=(link, args.bind, args.port, on_petdone),
                      daemon=True, name="server").start()
 
     if sys.stdin.isatty():
         try:
-            repl(link, watcher)
+            repl(link, watcher, library, installer)
         except KeyboardInterrupt:
             pass
     else:
