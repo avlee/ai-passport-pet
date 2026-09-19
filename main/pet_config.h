@@ -1,8 +1,11 @@
 // main/pet_config.h
 // Codex 宠物应用的可配置项。
 //
-// 第一次开机(或清空 NVS 后)会把这些默认值写进 NVS, 之后一律以 NVS 为准,
-// 所以改完这里需要重新烧录, 或者先清空 NVS。
+// 配置来源优先级:
+//   1) main/pet_config_local.h —— 本机覆盖, 已加入 .gitignore, 适合放网络凭据;
+//   2) 本文件下面的编译期默认值。
+// 仅当 NVS 里已存在一整套显式覆盖(由 pet_settings_save 写入)时才以 NVS 为准;
+// 本文件不会在开机时把默认值写回 NVS, 所以改完这里重新烧录即刻生效, 不必清 NVS。
 //
 // 不想把网络凭据写进本文件? 在 main/ 下新建 pet_config_local.h 覆盖下面的宏,
 // 该文件名已加入 .gitignore, 不会被提交。
