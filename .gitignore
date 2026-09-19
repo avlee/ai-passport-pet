@@ -19,3 +19,5 @@ main/pet_config_local.h
 # 工具在本地产生的临时文件与状态目录, 不是源码
 .tmp/
 .workbuddy/
+# 本机自备的备选宠物素材, 来源与许可未确认, 不随仓库分发
+assets/pets/li-muwan/
