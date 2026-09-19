@@ -19,26 +19,31 @@ static const char *TAG = "pet_ui";
 // 布局。屏幕 240x320, 四角被 BSP 强制成 30 px 圆角(见 bsp_display.h), 所以
 // 靠边的元素都要躲开角落的弧线, 下面这些数值是照着力学算好的:
 //
-//   y   6 .. 28   状态圆点 + 状态文字(左) / 电量(右)
-//   y  32 .. 242  宠物卡片(给宠物一块比背景略亮的底, 让轮廓更清楚)
-//   y  38 .. 236  宠物舞台 129x198 —— 与图集裁剪区的并集等大
-//   y 248 .. 310  文本气泡
+//   y   6 ..  28   状态圆点 + 状态文字(左) / 电量(右)
+//   y  38 .. 235   宠物舞台 129x198 —— 与图集裁剪区的并集等大, 不画底, 直接立在背景上
+//   y 235 .. 314   站台: 台面 + 台身, 台面上沿压在宠物脚底那一行
 //
 // 舞台尺寸直接取自图集(PET_ATLAS_STAGE_*), 不写死: 换一只宠物时自动适配。
+//
+// 站台为什么贴到 235: 57 帧素材的裁剪区并集下沿都在图集 y=203, 换算到屏幕就是
+// 脚底那一行(235)。把台面上沿放在这里, 宠物读起来就是"站在站台上", 而不是
+// "浮在方块前"。素材换一份时这个值要跟着 PET_ATLAS_STAGE_H 重新对。
 // ---------------------------------------------------------------------------
 #define SCR_W 240
 #define SCR_H 320
 
-#define COL_BG        0x0B0F14
-#define COL_CARD      0x16202A
-#define COL_CARD_EDGE 0x22323F
-#define COL_BUBBLE    0x141D26
-#define COL_INK       0xE8F1F5
-#define COL_MUTED     0x7C93A3
-#define COL_ACCENT    0x4CC2FF
-#define COL_GOOD      0x4ADE80
-#define COL_WARN      0xFBBF24
-#define COL_BAD       0xF87171
+#define COL_BG         0x0B0F14
+#define COL_CARD       0x16202A
+#define COL_CARD_EDGE  0x22323F
+#define COL_PLAT_FLOOR 0x223444  // 台面: 受光的那一段
+#define COL_PLAT_RIM   0x3E6383  // 台面顶沿高光
+#define COL_PLAT_BODY  0x131B24  // 台身: 承载文本的深色面
+#define COL_INK        0xE8F1F5
+#define COL_MUTED      0x7C93A3
+#define COL_ACCENT     0x4CC2FF
+#define COL_GOOD       0x4ADE80
+#define COL_WARN       0xFBBF24
+#define COL_BAD        0xF87171
 
 #define ROW_DOT_X   18
 #define ROW_DOT_Y   16
@@ -63,18 +68,56 @@ static const char *TAG = "pet_ui";
 #define BAT_FILL_H  7
 #define BAT_FILL_MAX_W 18
 
-#define CARD_X      49
-#define CARD_Y      32
-#define CARD_W      141
-#define CARD_H      210
-
+// 舞台: 129x198 的图集裁剪区并集, 水平居中(240 - 129 = 111 → 左边距 55)。
+// 底行 235 就是宠物脚底, 站台的台面前沿要对在这里。
 #define STAGE_X     55
 #define STAGE_Y     38
 
-#define BUBBLE_X    14
-#define BUBBLE_Y    248
-#define BUBBLE_W    212
-#define BUBBLE_PAD  8
+// 站台。数值一律写字面量(不写成宏算式): tools/preview_pet_screen.py 用正则
+// 直接读这些 #define 来出预览图, 算式会让它看不懂。等式由下面的
+// _Static_assert 兜住 —— 改错了编译期就炸, 不会悄悄错位。
+//
+// 站台左右与屏幕中心对称: (240 - 212) / 2 = 14。
+#define PLAT_X        14
+#define PLAT_W       212
+#define PLAT_RADIUS   14
+
+// 台面上沿 = 宠物脚底那一行, 见文件头的布局说明。
+#define PLAT_FLOOR_Y 235
+#define PLAT_FLOOR_H  14
+// 台面比台身矮得多, 用 PLAT_RADIUS 会鼓成胶囊, 单独给一个小圆角。
+#define PLAT_FLOOR_RADIUS 5
+#define PLAT_RIM_H     2
+#define PLAT_RIM_INSET 6
+
+// 台身到 314 为止: 屏幕底部 30 px 圆角在 x=14 处从 y≈314 开始收, 再往下会被切。
+#define PLAT_BODY_Y  249
+#define PLAT_BODY_H   65
+
+// 脚底接触阴影: 压在台面正中, 让宠物"贴"在台面上而不是飘着。
+// 别做太大 —— 台面只有 14 px 高, 阴影盖满就变成台面上一个黑洞。
+#define SHADOW_Y     236
+#define SHADOW_W      56
+#define SHADOW_H       7
+
+#define PLAT_TEXT_PAD  2
+#define PLAT_TEXT_W  184
+
+// 站台的几何约束。全部是整数常量表达式, 在编译期求值。
+// 台面上沿必须正好落在舞台底行(= 素材里宠物的脚底), 否则宠物要么浮空、
+// 要么脚被台面切掉。换宠物素材(不同 PET_ATLAS_STAGE_H)时这里会先报错。
+_Static_assert(PLAT_FLOOR_Y == STAGE_Y + PET_ATLAS_STAGE_H - 1,
+               "站台台面必须对齐宠物脚底(舞台底行)");
+_Static_assert(PLAT_BODY_Y == PLAT_FLOOR_Y + PLAT_FLOOR_H,
+               "台身必须紧接台面下沿");
+_Static_assert(PLAT_X + PLAT_W == SCR_W - PLAT_X,
+               "站台必须水平居中");
+_Static_assert(PLAT_BODY_Y + PLAT_BODY_H <= SCR_H - 6,
+               "站台底边要给屏幕底部的圆角和边框留出余量");
+_Static_assert(SHADOW_Y >= PLAT_FLOOR_Y && SHADOW_Y + SHADOW_H <= PLAT_BODY_Y,
+               "接触阴影必须整个落在台面上");
+_Static_assert(PLAT_TEXT_W == PLAT_W - 28,
+               "文本宽度 = 站台宽度减去左右各 14 px 内边距");
 
 #define SLEEP_X     98
 #define SLEEP_Y     6
@@ -108,12 +151,11 @@ static lv_obj_t *s_dot;
 static lv_obj_t *s_status;
 static lv_obj_t *s_bat_text;
 static lv_obj_t *s_bat_fill;
-static lv_obj_t *s_card;
+static lv_obj_t *s_plat_body;
+static lv_obj_t *s_plat_text;
 static lv_obj_t *s_stage;
 static lv_obj_t *s_sprite;
 static lv_obj_t *s_sleep;
-static lv_obj_t *s_bubble;
-static lv_obj_t *s_bubble_text;
 
 static lv_obj_t *s_info_scrim;
 static lv_obj_t *s_info_panel;
@@ -233,10 +275,10 @@ static void refresh_status_locked(void)
 
     // 用户没有下发文本时, 用占位文案说明当前在等什么。
     if (s_text[0] == '\0') {
-        lv_label_set_text(s_bubble_text, placeholder_text(link, codex));
+        lv_label_set_text(s_plat_text, placeholder_text(link, codex));
     }
     lv_obj_set_style_text_color(
-        s_bubble_text,
+        s_plat_text,
         lv_color_hex(s_text[0] != '\0' ? COL_INK : COL_MUTED), 0);
 
     const bool asleep = (link == PET_LINK_OFFLINE);
@@ -433,11 +475,9 @@ static void build_top_row(void)
 
 static void build_stage(void)
 {
-    s_card = make_box(s_screen, CARD_X, CARD_Y, CARD_W, CARD_H, COL_CARD, 24);
-    lv_obj_set_style_border_width(s_card, 1, 0);
-    lv_obj_set_style_border_color(s_card, lv_color_hex(COL_CARD_EDGE), 0);
-
     // 舞台不画任何东西, 只负责把宠物夹在自己的范围里, 并给帧位置一个原点。
+    // 宠物身下不留底色: 多一层浅色卡片会把轮廓框住, 动作幅度反而看不清;
+    // "地面"由站台和脚底阴影交代, 见 build_platform()。
     s_stage = lv_obj_create(s_screen);
     lv_obj_remove_style_all(s_stage);
     lv_obj_remove_flag(s_stage, LV_OBJ_FLAG_SCROLLABLE);
@@ -456,22 +496,43 @@ static void build_stage(void)
     lv_obj_set_style_text_opa(s_sleep, LV_OPA_70, 0);
 }
 
-static void build_bubble(void)
+// 站台: 台身(深) + 台面(浅) + 台面顶沿高光 + 脚底接触阴影, 四层叠出"一块板"。
+// 全部建在舞台之前 —— LVGL 按创建顺序决定叠放, 宠物必须压在台面之上,
+// 否则脚会被台面盖掉, 变成"站在台子后面"。
+static void build_platform(void)
 {
+    s_plat_body = make_box(s_screen, PLAT_X, PLAT_BODY_Y, PLAT_W, PLAT_BODY_H,
+                           COL_PLAT_BODY, PLAT_RADIUS);
+    lv_obj_set_style_border_width(s_plat_body, 1, 0);
+    lv_obj_set_style_border_color(s_plat_body, lv_color_hex(COL_CARD_EDGE), 0);
+
+    // 台面: 竖直渐变让上沿亮、下沿并入台身, 接缝不生硬。
+    lv_obj_t *floor = make_box(s_screen, PLAT_X, PLAT_FLOOR_Y, PLAT_W,
+                               PLAT_FLOOR_H, COL_PLAT_FLOOR,
+                               PLAT_FLOOR_RADIUS);
+    lv_obj_set_style_bg_grad_dir(floor, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_grad_color(floor, lv_color_hex(COL_PLAT_BODY), 0);
+
+    // 顶沿高光: 只留中间一段, 两端收进去, 避免和台面圆角打架。
+    make_box(s_screen, PLAT_X + PLAT_RIM_INSET, PLAT_FLOOR_Y,
+             PLAT_W - PLAT_RIM_INSET * 2, PLAT_RIM_H,
+             COL_PLAT_RIM, PLAT_RIM_H / 2);
+
+    // 接触阴影: 半透明黑压在台面上, 位置取自脚底正下方。跳跃动作抬起时
+    // 阴影不动 —— 它是"地面", 不是宠物的挂件。
+    lv_obj_t *shadow = make_box(s_screen, SCR_W / 2 - SHADOW_W / 2, SHADOW_Y,
+                                SHADOW_W, SHADOW_H, 0x000000, SHADOW_H / 2);
+    lv_obj_set_style_bg_opa(shadow, LV_OPA_40, 0);
+
+    // 文字落在台身上: 台身就是原来的气泡, 只是换了块"水泥"。
     const lv_font_t *font = pet_font_body();
-    const int line_height = font->line_height;
-    const int text_h = line_height * 2;
-
-    s_bubble = make_box(s_screen, BUBBLE_X, BUBBLE_Y, BUBBLE_W,
-                        text_h + BUBBLE_PAD * 2, COL_BUBBLE, 16);
-    lv_obj_set_style_border_width(s_bubble, 1, 0);
-    lv_obj_set_style_border_color(s_bubble, lv_color_hex(COL_CARD_EDGE), 0);
-
-    s_bubble_text = make_label(s_bubble, "", font, COL_MUTED);
-    lv_obj_set_size(s_bubble_text, BUBBLE_W - BUBBLE_PAD * 2 * 2, text_h);
-    lv_label_set_long_mode(s_bubble_text, LV_LABEL_LONG_MODE_DOTS);
-    lv_obj_set_style_text_align(s_bubble_text, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(s_bubble_text, BUBBLE_PAD * 2, BUBBLE_PAD);
+    const int text_h = font->line_height * 2;
+    s_plat_text = make_label(s_screen, "", font, COL_MUTED);
+    lv_obj_set_size(s_plat_text, PLAT_TEXT_W, text_h);
+    lv_label_set_long_mode(s_plat_text, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_align(s_plat_text, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_plat_text, PLAT_X + (PLAT_W - PLAT_TEXT_W) / 2,
+                   PLAT_BODY_Y + PLAT_TEXT_PAD);
 }
 
 static void build_info(void)
@@ -536,8 +597,8 @@ void pet_ui_build(void)
     lv_screen_load(s_screen);
 
     build_top_row();
+    build_platform();   // 先于舞台: 宠物要压在台面之上, 否则脚会被盖住
     build_stage();
-    build_bubble();
     build_info();
     refresh_status_locked();
     refresh_battery_locked();
@@ -546,8 +607,9 @@ void pet_ui_build(void)
     // 开机第一拍: 让定时器把第 0 帧画出来。
     s_anim_timer = lv_timer_create(anim_tick, 1, NULL);
 
-    ESP_LOGI(TAG, "界面就绪: 舞台 %dx%d @ (%d,%d), 气泡行高 %d",
-             PET_ATLAS_STAGE_W, PET_ATLAS_STAGE_H, STAGE_X, STAGE_Y,
+    ESP_LOGI(TAG, "界面就绪: 舞台 %dx%d @ (%d,%d) 脚底 y=%d, 站台 %d..%d, 行高 %d",
+             PET_ATLAS_STAGE_W, PET_ATLAS_STAGE_H, STAGE_X, STAGE_Y, PLAT_FLOOR_Y,
+             PLAT_FLOOR_Y, PLAT_BODY_Y + PLAT_BODY_H,
              pet_font_body()->line_height);
     bsp_lvgl_unlock();
 }
@@ -576,14 +638,13 @@ void pet_ui_destroy(void)
     s_screen = NULL;
     s_sprite = NULL;
     s_stage = NULL;
-    s_card = NULL;
+    s_plat_body = NULL;
+    s_plat_text = NULL;
     s_dot = NULL;
     s_status = NULL;
     s_bat_text = NULL;
     s_bat_fill = NULL;
     s_sleep = NULL;
-    s_bubble = NULL;
-    s_bubble_text = NULL;
     s_info_scrim = NULL;
     s_info_panel = NULL;
     for (int i = 0; i < INFO_ROW_COUNT; i++) s_info_value[i] = NULL;
@@ -639,7 +700,7 @@ void pet_ui_set_text(const char *utf8)
 
     if (s_screen != NULL) {
         if (s_text[0] != '\0') {
-            lv_label_set_text(s_bubble_text, s_text);
+            lv_label_set_text(s_plat_text, s_text);
         }
         refresh_status_locked();
     }

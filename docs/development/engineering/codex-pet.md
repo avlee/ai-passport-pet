@@ -10,9 +10,9 @@ This is the application delivered on the `feature/codex-pet` branch. It does not
 
 ## What it looks like
 
-- A full-screen pet stage, drawn 1:1 from the atlas pixels with no scaling.
+- A pet stage, drawn 1:1 from the atlas pixels with no scaling. The stage has no backdrop: the pet stands directly on the page background, with the platform and a contact shadow providing the ground line.
 - Top row: a status dot plus status text (offline / connecting / idle / working / waiting / ready / failed) on the left, battery on the right.
-- A text bubble at the bottom showing the text Codex pushed; when there is no text it shows a placeholder for the current state.
+- A platform at the bottom, carrying the text Codex pushed as its front face; when there is no text it shows a placeholder for the current state. Its floor edge is pinned to the pet's feet (stage bottom row), so the pet reads as standing on it.
 - Sleep (link down): the pet is dimmed to 40%, frame timing slows to 250%, backlight drops to 45%, and `Zzz` appears in the top-right of the stage.
 
 Buttons:
