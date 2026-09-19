@@ -33,6 +33,40 @@ Codex 会把每一轮对话写成 rollout JSONL: ~/.codex/sessions/YYYY/MM/DD/ro
     python3 tools/pet_bridge.py --port 8765 --bind 0.0.0.0
     python3 tools/pet_bridge.py --list-sessions  # 看看会跟哪个文件
 
+控制通道(--control)
+-------------------
+给 GUI 前端(macOS 菜单栏应用)用的本地通道: AF_UNIX + JSON 行, 双向。
+
+    python3 tools/pet_bridge.py --control "$HOME/Library/Application Support/CodexPetBridge/bridge.sock"
+
+连上来先收到一条 snapshot(全部当前状态), 之后是增量事件:
+
+    事件(服务端 -> 客户端)          字段
+    bridge   桥接自身            running, port, bind, pid
+    link     设备连接            connected, peer
+    state    Codex 状态          state, text, source
+    text     只换气泡文字        text
+    session  跟随的会话文件      name, path
+    watch    是否跟随日志        enabled
+    device   设备上报            kind(hello/poke), fw, pet
+    pong     ping 的回应
+    error    命令出错            message
+
+    命令(客户端 -> 服务端)
+    {"cmd":"state","state":"working","text":"..."}   手工推状态
+    {"cmd":"text","text":"..."}                      只换气泡文字
+    {"cmd":"raw","payload":{...}}                    直接发一行 JSON
+    {"cmd":"watch","enabled":false}                  开关日志跟随
+    {"cmd":"snapshot"}                               重发一次全量状态
+    {"cmd":"ping"}
+
+    注意: 这是一个**事件流**, 不是一问一答。命令成功不回执 —— 结果会以对应的事件
+    广播出来(state/text/watch/...); 只有出错才会多收到一条 error。客户端按事件
+    更新状态即可, 不要去配"发一条收一条"。
+
+控制通道只是**观察和驱动**上的补充, 协议的唯一定义仍然是本文件里发往设备的
+那几条 JSON —— 所以 tests/test_pet_bridge.py 的两端互校依然覆盖全部下行报文。
+
 交互命令(启动后在同一个终端里直接敲):
     working 正在重构登录模块
     text 只改文字不改状态
@@ -45,6 +79,7 @@ Codex 会把每一轮对话写成 rollout JSONL: ~/.codex/sessions/YYYY/MM/DD/ro
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import json
 import os
@@ -53,6 +88,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
 # 协议常量。必须与 main/pet_protocol.h 保持一致。
@@ -97,6 +133,12 @@ class DeviceLink:
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
         self._peer = ""
+        # 状态广播出口。默认没人接, 所以单测里直接 DeviceLink() 就行, 不必造 hub。
+        self.on_event: Callable[[dict], None] | None = None
+
+    def _publish(self, event: dict) -> None:
+        if self.on_event is not None:
+            self.on_event(event)
 
     @property
     def connected(self) -> bool:
@@ -111,6 +153,7 @@ class DeviceLink:
             self._sock = sock
             self._peer = peer
         print(f"[link] 设备已连接: {peer}", flush=True)
+        self._publish({"event": "link", "connected": True, "peer": peer})
 
     def detach(self) -> None:
         with self._lock:
@@ -122,6 +165,7 @@ class DeviceLink:
             except OSError:
                 pass
             print("[link] 设备已断开, 宠物会进入睡眠", flush=True)
+            self._publish({"event": "link", "connected": False, "peer": ""})
 
     def send(self, payload: dict) -> bool:
         line = (json.dumps(payload, ensure_ascii=False) + "\r\n").encode("utf-8")
@@ -138,7 +182,8 @@ class DeviceLink:
         self.detach()
         return False
 
-    def send_state(self, state: str, text: str | None = None) -> bool:
+    def send_state(self, state: str, text: str | None = None,
+                   source: str = "codex") -> bool:
         payload: dict = {"type": "state", "state": state}
         if text:
             payload["text"] = truncate_utf8(squash(text))
@@ -146,10 +191,21 @@ class DeviceLink:
         shown = f" / {payload.get('text')}" if payload.get("text") else ""
         print(f"[state] {state}{shown}{'' if ok else '  (设备未连接, 已丢弃)'}",
               flush=True)
+        self._publish({
+            "event": "state",
+            "state": state,
+            "text": payload.get("text", ""),
+            "source": source,
+            "delivered": ok,
+        })
         return ok
 
     def send_text(self, text: str) -> bool:
-        return self.send({"type": "text", "text": truncate_utf8(squash(text))})
+        squashed = truncate_utf8(squash(text))
+        ok = self.send({"type": "text", "text": squashed})
+        # 单独一种事件名: 只换文字不该把最近一次的 state 从 snapshot 里顶掉。
+        self._publish({"event": "text", "text": squashed, "delivered": ok})
+        return ok
 
 
 # ---------------------------------------------------------------------------
@@ -158,16 +214,36 @@ class DeviceLink:
 class CodexWatcher(threading.Thread):
     """跟随最新被改动的 rollout 文件, 把事件映射成宠物状态。"""
 
-    def __init__(self, link: DeviceLink, idle_after: float) -> None:
+    def __init__(self, link: DeviceLink, idle_after: float,
+                 on_event: Callable[[dict], None] | None = None) -> None:
         super().__init__(daemon=True, name="codex-watcher")
         self.link = link
         self.idle_after = idle_after
+        self.on_event = on_event
         self._current: str | None = None
         self._offset = 0
         self._last_event_at = time.monotonic()
         self._state = "idle"
         # 用户手工下发的状态优先于日志推断, 直到下一个 Codex 事件出现。
         self.manual_until_event = False
+        # 菜单栏可以临时停掉日志跟随(演示时只想手工切状态)。
+        self.enabled = True
+
+    def _publish(self, event: dict) -> None:
+        if self.on_event is not None:
+            self.on_event(event)
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def session_name(self) -> str:
+        return Path(self._current).name if self._current else ""
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self._publish({"event": "watch", "enabled": self.enabled})
 
     @staticmethod
     def newest_session() -> str | None:
@@ -180,7 +256,7 @@ class CodexWatcher(threading.Thread):
         self._state = state
         self._last_event_at = time.monotonic()
         self.manual_until_event = False
-        self.link.send_state(state, text)
+        self.link.send_state(state, text, source="codex")
 
     def _switch(self, path: str) -> None:
         self._current = path
@@ -191,6 +267,7 @@ class CodexWatcher(threading.Thread):
         except OSError:
             self._offset = 0
         print(f"[codex] 跟随会话: {Path(path).name}", flush=True)
+        self._publish({"event": "session", "name": Path(path).name, "path": path})
 
     def _handle(self, record: dict) -> None:
         rtype = record.get("type")
@@ -239,6 +316,9 @@ class CodexWatcher(threading.Thread):
 
     def run(self) -> None:
         while True:
+            if not self.enabled:
+                time.sleep(0.25)
+                continue
             try:
                 newest = self.newest_session()
                 if newest is None:
@@ -329,10 +409,16 @@ def read_device(link: DeviceLink, conn: socket.socket) -> None:
                     continue
                 mtype = message.get("type")
                 if mtype == "hello":
-                    print(f"[recv] hello fw={message.get('fw')} "
-                          f"pet={message.get('pet')}", flush=True)
+                    fw = message.get("fw") or ""
+                    pet = message.get("pet") or ""
+                    print(f"[recv] hello fw={fw} pet={pet}", flush=True)
+                    # 一并报给控制通道: 菜单栏要显示设备的固件版本与宠物包。
+                    # (_publish 是本模块内部的出口, read_device 与 DeviceLink 同模块。)
+                    link._publish({"event": "device", "kind": "hello",
+                                   "fw": fw, "pet": pet})
                 elif mtype == "poke":
                     print("[recv] 用户戳了宠物一下", flush=True)
+                    link._publish({"event": "device", "kind": "poke"})
                 elif mtype != "pong":
                     print(f"[recv] {message}", flush=True)
     except OSError:
@@ -350,6 +436,180 @@ def ping_loop(link: DeviceLink) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 控制通道(本地 GUI 前端用)
+# ---------------------------------------------------------------------------
+# 它只是**观察与驱动**层: 所有发往设备的报文仍然走 DeviceLink, 这里把同一份状态
+# 再广播给本地前端, 并把前端命令翻译成和终端 REPL 完全相同的调用 —— 这样终端和
+# GUI 的行为不会分叉, 两端的报文也仍然由同一份实现产生。
+CONTROL_PROTOCOL = 1
+
+
+class ControlHub:
+    """AF_UNIX + JSON 行, 双向: 状态往外推, 命令往里收。"""
+
+    def __init__(self, path: str,
+                 on_command: Callable[[dict], dict | None] | None = None) -> None:
+        self.path = path
+        self.on_command = on_command
+        self._server: socket.socket | None = None
+        self._clients: list[socket.socket] = []
+        self._lock = threading.Lock()
+        # 各类事件的最新一份。新客户端接入时用它拼出 snapshot, 所以 publish 可以
+        # 早于 start —— 应用连上来就能一次拿全当前状态, 不必等下一个事件。
+        self._latest: dict[str, dict] = {}
+
+    def publish(self, event: dict) -> None:
+        name = event.get("event")
+        if name and name not in ("pong", "error"):
+            with self._lock:
+                self._latest[name] = event
+        line = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+        with self._lock:
+            clients = list(self._clients)
+        for client in clients:
+            try:
+                client.sendall(line)
+            except OSError:
+                self._drop(client)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            latest = dict(self._latest)
+        return {"event": "snapshot", "protocol": CONTROL_PROTOCOL, "state": latest}
+
+    @property
+    def client_count(self) -> int:
+        with self._lock:
+            return len(self._clients)
+
+    def _drop(self, client: socket.socket) -> None:
+        with self._lock:
+            if client in self._clients:
+                self._clients.remove(client)
+        with contextlib.suppress(OSError):
+            client.close()
+
+    def start(self) -> None:
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # 上次没退干净会留下 socket 文件, bind 前先清掉。
+        with contextlib.suppress(OSError):
+            os.unlink(self.path)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(self.path)
+        server.listen(4)
+        self._server = server
+        threading.Thread(target=self._accept_loop, daemon=True,
+                         name="control-accept").start()
+        print(f"[ctrl] 控制通道就绪: {self.path}", flush=True)
+
+    def _accept_loop(self) -> None:
+        assert self._server is not None
+        while True:
+            try:
+                client, _ = self._server.accept()
+            except OSError:
+                return
+            with self._lock:
+                self._clients.append(client)
+            self._send(client, self.snapshot())
+            threading.Thread(target=self._read_loop, args=(client,), daemon=True,
+                             name="control-client").start()
+
+    def _read_loop(self, client: socket.socket) -> None:
+        buffer = b""
+        try:
+            while True:
+                chunk = client.recv(4096)
+                if not chunk:
+                    return
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    line = line.strip()
+                    if line:
+                        self._dispatch(client, line)
+        except OSError:
+            pass
+        finally:
+            self._drop(client)
+
+    def _dispatch(self, client: socket.socket, line: bytes) -> None:
+        try:
+            command = json.loads(line.decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            self._send(client, {"event": "error", "message": "命令不是合法 JSON"})
+            return
+        if not isinstance(command, dict):
+            self._send(client, {"event": "error", "message": "命令必须是 JSON 对象"})
+            return
+
+        name = command.get("cmd")
+        if name == "ping":
+            self._send(client, {"event": "pong"})
+            return
+        if name == "snapshot":
+            self._send(client, self.snapshot())
+            return
+        if self.on_command is None:
+            self._send(client, {"event": "error", "message": "未接入命令处理器"})
+            return
+
+        reply = self.on_command(command)
+        if reply is not None:
+            self._send(client, reply)
+
+    @staticmethod
+    def _send(client: socket.socket, event: dict) -> None:
+        with contextlib.suppress(OSError):
+            client.sendall((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+
+
+def build_command_router(link: DeviceLink, watcher: "CodexWatcher | None"):
+    """把控制通道的命令翻译成与终端 REPL 相同的调用。
+
+    成功返回 None(结果由事件广播体现), 失败返回一条 error 事件。刻意不做逐条回执:
+    回执和广播会交错到同一条流里, 客户端很容易把广播当成上一条命令的回执。
+    """
+
+    def handle(command: dict) -> dict | None:
+        name = command.get("cmd")
+
+        if name == "state":
+            state = str(command.get("state", ""))
+            if state not in VALID_STATES:
+                return {"event": "error", "message": f"未知状态: {state}"}
+            text = command.get("text")
+            apply_state(link, watcher, state, text if isinstance(text, str) else None)
+            return None
+
+        if name == "text":
+            text = command.get("text")
+            if not isinstance(text, str):
+                return {"event": "error", "message": "text 必须是字符串"}
+            link.send_text(text)
+            return None
+
+        if name == "raw":
+            payload = command.get("payload")
+            if not isinstance(payload, dict):
+                return {"event": "error", "message": "payload 必须是 JSON 对象"}
+            link.send(payload)
+            return None
+
+        if name == "watch":
+            if watcher is None:
+                return {"event": "error", "message": "启动时用了 --no-codex, 无法开启跟随"}
+            watcher.set_enabled(bool(command.get("enabled")))
+            return None
+
+        return {"event": "error", "message": f"未知命令: {name}"}
+
+    return handle
+
+
+# ---------------------------------------------------------------------------
 # 手工命令
 # ---------------------------------------------------------------------------
 HELP = """可用命令:
@@ -363,6 +623,19 @@ HELP = """可用命令:
   ready 改完了, 跑一下测试
   text 只是换一句话
 """
+
+
+def apply_state(link: DeviceLink, watcher: CodexWatcher | None,
+                state: str, text: str | None) -> None:
+    """手工推一个状态。终端 REPL 与控制通道共用, 保证两边语义一致。
+
+    手工状态优先于日志推断, 直到下一个 Codex 事件出现 —— 否则刚切过去就会被
+    日志里的旧事件覆盖回去。
+    """
+    if watcher is not None:
+        watcher.manual_until_event = True
+        watcher._state = state
+    link.send_state(state, text or None, source="manual")
 
 
 def repl(link: DeviceLink, watcher: CodexWatcher | None) -> None:
@@ -396,10 +669,7 @@ def repl(link: DeviceLink, watcher: CodexWatcher | None) -> None:
                 print(f"[err] JSON 解析失败: {exc}", flush=True)
             continue
         if head in VALID_STATES:
-            if watcher is not None:
-                watcher.manual_until_event = True
-                watcher._state = head
-            link.send_state(head, rest or None)
+            apply_state(link, watcher, head, rest or None)
             continue
 
         print(f"[err] 不认识: {head!r}; 敲 help 看用法", flush=True)
@@ -434,19 +704,45 @@ def main() -> int:
                              f"{CODEX_IDLE_AFTER_S:g}")
     parser.add_argument("--list-sessions", action="store_true",
                         help="列出会跟随的 Codex 会话文件后退出")
+    parser.add_argument("--control", metavar="SOCKET",
+                        help="额外开一个本地控制通道(AF_UNIX socket 路径), "
+                             "供菜单栏/GUI 读取状态并下发命令")
     args = parser.parse_args()
 
     if args.list_sessions:
         return list_sessions()
 
+    hub: ControlHub | None = None
+    if args.control:
+        hub = ControlHub(os.path.expanduser(args.control))
+
     link = DeviceLink()
+    if hub is not None:
+        link.on_event = hub.publish
+        # 先发布一次初始状态, 这样前端连上来拿到的 snapshot 就是完整的, 不用等事件。
+        hub.publish({"event": "bridge", "running": True, "pid": os.getpid(),
+                     "bind": args.bind, "port": args.port,
+                     "codex": not args.no_codex})
+        hub.publish({"event": "link", "connected": False, "peer": ""})
 
     watcher: CodexWatcher | None = None
     if not args.no_codex:
-        watcher = CodexWatcher(link, args.idle_after)
+        watcher = CodexWatcher(link, args.idle_after,
+                               on_event=hub.publish if hub else None)
         watcher.start()
     else:
         print("[codex] 已禁用会话跟随(--no-codex)", flush=True)
+
+    if hub is not None:
+        hub.publish({"event": "watch", "enabled": watcher is not None})
+        hub.on_command = build_command_router(link, watcher)
+        try:
+            hub.start()
+        except OSError as exc:
+            # 控制通道只是附加能力, 打不开不该拖垮主服务(设备还得照常连)。
+            print(f"[ctrl] 控制通道打开失败({exc}), 仅以终端模式运行", flush=True)
+            link.on_event = None
+            hub = None
 
     threading.Thread(target=serve, args=(link, args.bind, args.port),
                      daemon=True, name="server").start()

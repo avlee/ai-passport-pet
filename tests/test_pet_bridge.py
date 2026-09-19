@@ -224,6 +224,97 @@ def test_server_accepts_device_and_delivers_state() -> None:
         link.detach()
 
 
+def test_control_channel_drives_the_device() -> None:
+    """控制通道: 连上先拿到全量状态, 下发的命令真的走到了设备。
+
+    这是菜单栏应用唯一依赖的接口, 所以按"能被 GUI 用"的标准测: 事件流、命令、
+    以及"正常命令没有回执、只有出错才回 error"这条契约。
+    """
+    with tempfile.TemporaryDirectory(prefix="ctl-") as workdir:
+        socket_path = os.path.join(workdir, "bridge.sock")
+        assert len(socket_path.encode()) < 104, "AF_UNIX 路径过长, 换个短一点的目录"
+
+        link = pet_bridge.DeviceLink()
+        hub = pet_bridge.ControlHub(socket_path)
+        link.on_event = hub.publish
+
+        local, peer = socket.socketpair()
+        client = None
+        try:
+            # 先接上设备(attach 自己会广播一条 link 事件), 再补 bridge 事件 ——
+            # publish 可以早于 hub.start(): 新客户端接入时靠这些拼出 snapshot。
+            with contextlib.redirect_stdout(io.StringIO()):
+                link.attach(local, "192.168.0.108:58136")
+            hub.publish({"event": "bridge", "running": True, "pid": 1, "port": 8765})
+
+            watcher = pet_bridge.CodexWatcher(link, 45.0, on_event=hub.publish)
+            hub.on_command = pet_bridge.build_command_router(link, watcher)
+            hub.start()
+
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(3.0)
+            client.connect(socket_path)
+            reader = client.makefile("rb")
+
+            snapshot = json.loads(reader.readline())
+            assert snapshot["event"] == "snapshot", snapshot
+            assert snapshot["protocol"] == pet_bridge.CONTROL_PROTOCOL, snapshot
+            assert snapshot["state"]["bridge"]["running"] is True, snapshot
+            assert snapshot["state"]["link"]["peer"] == "192.168.0.108:58136", snapshot
+
+            def send(payload: dict) -> None:
+                client.sendall(json.dumps(payload).encode() + b"\n")
+
+            send({"cmd": "state", "state": "working", "text": "来自菜单栏"})
+            event = json.loads(reader.readline())
+            assert event == {"event": "state", "state": "working", "text": "来自菜单栏",
+                             "source": "manual", "delivered": True}, event
+            # 命令不只是"改了个本地状态", 报文确实发到设备那头了。
+            wire = json.loads(capture(peer).decode("utf-8").strip())
+            assert wire == {"type": "state", "state": "working", "text": "来自菜单栏"}, wire
+
+            # 只改文字用的是另一种事件, 不能把最近一次 state 从快照里顶掉。
+            send({"cmd": "text", "text": "只改文字"})
+            event = json.loads(reader.readline())
+            assert event["event"] == "text", event
+            send({"cmd": "snapshot"})
+            event = json.loads(reader.readline())
+            assert event["state"]["state"]["state"] == "working", event
+
+            send({"cmd": "watch", "enabled": False})
+            event = json.loads(reader.readline())
+            assert event == {"event": "watch", "enabled": False}, event
+            assert watcher.enabled is False
+
+            # 未完成的命令只有 error; 成功时不发回执。
+            send({"cmd": "nope"})
+            event = json.loads(reader.readline())
+            assert event["event"] == "error", event
+            send({"cmd": "state", "state": "没这个状态"})
+            event = json.loads(reader.readline())
+            assert event["event"] == "error", event
+
+            send({"cmd": "ping"})
+            assert json.loads(reader.readline())["event"] == "pong"
+
+            # 设备上报 hello 时, 控制通道必须能拿到固件与宠物包 —— 菜单栏要显示它们。
+            device_end, writer_end = socket.socketpair()
+            threading.Thread(target=pet_bridge.read_device,
+                             args=(link, device_end), daemon=True).start()
+            writer_end.sendall(b'{"type":"hello","fw":"0.1.0",'
+                               b'"pet":"sophie-portrait"}\n')
+            event = json.loads(reader.readline())
+            assert event == {"event": "device", "kind": "hello", "fw": "0.1.0",
+                             "pet": "sophie-portrait"}, event
+            writer_end.close()
+        finally:
+            if client is not None:
+                client.close()
+            local.close()
+            peer.close()
+            link.detach()
+
+
 def main() -> int:
     failures = []
     tests = [
@@ -233,6 +324,7 @@ def main() -> int:
         ("send_without_device_is_safe", test_send_without_device_is_safe),
         ("server_accepts_device_and_delivers_state",
          test_server_accepts_device_and_delivers_state),
+        ("control_channel_drives_the_device", test_control_channel_drives_the_device),
     ]
 
     with tempfile.TemporaryDirectory(prefix="pet-bridge-") as workdir:
