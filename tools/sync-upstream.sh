@@ -94,7 +94,10 @@ fi
 
 upstream_ref="${upstream_remote}/${upstream_branch}"
 
-git fetch --prune --tags "${upstream_remote}"
+if ! git fetch --prune --tags "${upstream_remote}"; then
+    echo "ERROR: 拉取 ${upstream_remote} 失败（网络问题？）。还没改动任何东西。" >&2
+    exit 1
+fi
 
 if ! git rev-parse --verify --quiet "${upstream_ref}" >/dev/null; then
     echo "ERROR: ${upstream_ref} does not exist on ${upstream_remote}." >&2
