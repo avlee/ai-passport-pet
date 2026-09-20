@@ -39,6 +39,11 @@ void pet_ui_destroy(void);
 // 界面是否已经建好。
 bool pet_ui_ready(void);
 
+// 是否逐帧渲染宠物。息屏(背光 0)时由 pet_app 关掉: 看不见的画面没必要每帧都把
+// 精灵经 SPI 推给面板。只影响重绘节奏, 不动任何状态 —— 亮屏后从当前帧接着播。
+// 屏幕开关本身不在这里管, 真值在 pet_app(见 pet_screen.h)。
+void pet_ui_set_anim_enabled(bool enabled);
+
 // 链路状态。断线时宠物进入睡眠(压暗 + 放慢), 见 pet_state.h。
 void pet_ui_set_link(pet_link_state_t link);
 

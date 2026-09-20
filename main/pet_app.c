@@ -19,6 +19,7 @@
 #include "pet_fonts.h"
 #include "pet_protocol.h"
 #include "pet_provision.h"
+#include "pet_screen.h"
 #include "pet_settings.h"
 #include "pet_slot.h"
 #include "pet_strings.h"
@@ -33,6 +34,14 @@ static pet_settings_t s_settings;
 static bool           s_settings_ok;
 static volatile bool  s_input_ready;
 static int            s_last_soc = -1;
+
+// 屏幕电源。开机先按"还没链路"处理: pet_ui 的初值也是 OFFLINE(宠物一开始就在
+// 睡觉), 两边一致, 免得开机的第一帧亮着而宠物是睡着的。
+static pet_screen_t       s_screen;
+static esp_timer_handle_t s_screen_timer;
+static bool               s_link_offline = true;
+static bool               s_anim_on = true;    // 上次同步给 pet_ui 的渲染开关
+static int                s_backlight_pct = -1;  // 上次下发的背光, -1 = 还没写过
 
 // ---------------------------------------------------------------------------
 // 中文文案覆盖自检
@@ -65,21 +74,93 @@ static void check_string_coverage(void)
 }
 
 // ---------------------------------------------------------------------------
+// 屏幕电源(空闲息屏 / 有消息亮屏)
+// ---------------------------------------------------------------------------
+// 判定本身在 pet_screen.c(纯逻辑, 主机测试逐条钉住); 这里只做两件机器相关的事:
+// 把背光写下去, 以及息屏时停掉逐帧重绘。
+//
+// 背光**只有这一个写入口**: 从前 pet_app 在链路回调里写一次、启动失败时又写一次,
+// 再叠上演示菜单自己那一摊, 排查"屏幕怎么还亮着"得同时看三处, 而且谁都可能把别人
+// 的值覆盖掉。
+static void apply_screen(void)
+{
+    const bool on = pet_screen_is_on(&s_screen);
+    const uint8_t percent = pet_screen_backlight(&s_screen, s_link_offline);
+
+    if ((int)percent != s_backlight_pct) {
+        s_backlight_pct = (int)percent;
+        bsp_display_backlight(percent);
+        if (on) {
+            ESP_LOGI(TAG, "亮屏, 背光 %u%%", (unsigned)percent);
+        } else {
+            const int64_t idle_s =
+                (esp_timer_get_time() - s_screen.last_activity_us) / 1000000;
+            ESP_LOGI(TAG, "息屏, 背光 0%% (已空闲 %lld 秒)",
+                     (long long)idle_s);
+        }
+    }
+
+    if (on != s_anim_on) {
+        s_anim_on = on;
+        // 息屏时没必要逐帧重绘: 画面看不见, 而每帧都要把精灵那 129x198x2 字节经
+        // SPI 推给面板。亮屏后从当前帧接着播, 不跳帧。
+        pet_ui_set_anim_enabled(on);
+    }
+}
+
+// 有新内容: 亮屏并重新计时。消息、按键、链路恢复都走这里。
+static void screen_touch(void)
+{
+    pet_screen_touch(&s_screen, esp_timer_get_time());
+    apply_screen();
+}
+
+// 配网页 / 宠物接收页 / 演示菜单期间不许息屏: 那几块画面用户必须看得见。
+static void screen_hold(bool hold)
+{
+    pet_screen_set_hold(&s_screen, hold, esp_timer_get_time());
+    apply_screen();
+}
+
+// 一秒一拍。息屏判定的精度远用不到更细, 而每秒一次唤醒的代价可以忽略。
+static void screen_tick(void *arg)
+{
+    (void)arg;
+    if (pet_screen_update(&s_screen, esp_timer_get_time(),
+                          (int64_t)PET_SCREEN_IDLE_MS * 1000)) {
+        apply_screen();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pet Bridge 事件(运行在 bridge 任务 / Wi-Fi 事件任务上)
 // ---------------------------------------------------------------------------
 static void on_bridge_link(pet_link_state_t link, void *user)
 {
     (void)user;
 
-    // 断线即「睡觉」: 压暗背光省电, 宠物本体也会被 pet_ui 压暗并放慢。
-    bsp_display_backlight(link == PET_LINK_OFFLINE ? PET_SLEEP_BACKLIGHT_PCT
-                                                  : PET_ACTIVE_BACKLIGHT_PCT);
+    const bool was_offline = s_link_offline;
+    s_link_offline = (link == PET_LINK_OFFLINE);
+
+    // 链路**恢复**算"有新消息", 亮屏; 掉线不算 —— 宠物这时本来就进入睡眠(压暗 +
+    // 放慢), 屏幕跟着暗下来才一致; 何况桥接重连时每一轮都会报一次 CONNECTING,
+    // 把它当消息的话, 断网期间屏幕反而一直被点亮。
+    if (was_offline && !s_link_offline) {
+        screen_touch();
+    } else {
+        apply_screen();
+    }
+
     pet_ui_set_link(link);
 }
 
 static void on_bridge_message(const pet_message_t *msg, void *user)
 {
     (void)user;
+
+    // ping 是链路保活(每 5 秒一条), 不是"新内容" —— 让它点亮屏幕的话, 息屏永远
+    // 不会发生。其余消息都意味着 Codex 那边有动静: 先亮屏, 再更新画面。
+    if (msg->type != PET_MSG_PING) screen_touch();
 
     switch (msg->type) {
     case PET_MSG_STATE:
@@ -135,6 +216,9 @@ static esp_err_t on_pet_begin(const char *pet_id, uint32_t size, uint32_t crc32,
         ESP_LOGW(TAG, "上一份宠物包还在写, 拒绝接收新的");
         return ESP_ERR_INVALID_STATE;
     }
+
+    // 进度必须看得见: 屏幕上正在走进度条, 这一刻息屏只会让人以为设备死了。
+    screen_hold(true);
 
     // 先拆界面再解除映射: 顺序反了, 界面上的图像描述符就指向一块已经归还的
     // MMU 窗口。pet_ui_begin_transfer() 会把宠物界面整块删掉并顶上一块不引用
@@ -292,6 +376,7 @@ static void on_provision_state(pet_provision_state_t state, const char *detail,
         // 配网结束(成功、超时、或被演示菜单接走蓝牙)都要收掉这一层, 否则宠物
         // 界面会一直被它盖着。留条日志, 免得"到底收没收"只能靠盯屏幕。
         ESP_LOGI(TAG, "配网界面: 收起");
+        screen_hold(false);
         pet_ui_set_provision_visible(false);
         return;
     }
@@ -449,13 +534,19 @@ static void run_demo_menu(void)
     }
 
     pet_ui_destroy();
-    bsp_display_backlight(PET_ACTIVE_BACKLIGHT_PCT);
+    // 演示菜单里有人直接改背光(亮度示例页会停在任意档位), 所以让息屏策略先让开。
+    // 亮度本身不用在这里给: hold 期间一律全亮, apply_screen() 已经写到 100 了。
+    screen_hold(true);
 
     demo_menu_run(s_input_queue);
 
     // pet_ui 的状态(链路/Codex/文案/电量)在 destroy 时被刻意保留了, 所以重建
     // 界面后立刻就是最新画面, 不会闪回旧状态。
     pet_ui_build();
+    // 演示菜单期间有人直接写过背光(亮度页会停在任意档位), 缓存里的值已经不作数:
+    // 不清掉的话, 回到宠物界面时会因为"算出来和缓存一样"而漏掉这次写。
+    s_backlight_pct = -1;
+    screen_hold(false);
     if (had_provision) {
         ESP_LOGI(TAG, "演示菜单退出, 重新打开配网窗口");
         open_provision_window();
@@ -465,6 +556,11 @@ static void run_demo_menu(void)
 
 static void handle_input(const app_input_t *in)
 {
+    // 任何按键都先亮屏并重置空闲计时: 屏幕黑着的时候, 用户手里先有的是手指, 这一下
+    // 必须立刻看到反应。按键动作本身照常执行 —— 上/下/确定都是本机的小动画或面板
+    // 开关, 顺手做掉比"先按一下唤醒、动作没了"更好解释。
+    screen_touch();
+
     if (in->event == BSP_BTN_LONG) {
         // 这几个手势在配网页打开时也要能用: 上键进演示菜单, 下键按屏幕上的提示
         // 开关配网页。
@@ -563,6 +659,20 @@ esp_err_t pet_app_start(void)
     }
     pet_ui_set_settings(s_settings_ok ? &s_settings : NULL);
 
+    // 屏幕从"亮着、开始在计时"起步。此刻还没有链路, 所以亮度按睡眠档给 —— 与
+    // pet_ui 的初值(OFFLINE, 宠物在睡觉)一致; 桥接连上会立刻把它顶到全亮。
+    pet_screen_init(&s_screen, esp_timer_get_time());
+    apply_screen();
+
+    const esp_timer_create_args_t screen_timer_args = {
+        .callback = screen_tick,
+        .name = "pet_screen",
+    };
+    if (esp_timer_create(&screen_timer_args, &s_screen_timer) != ESP_OK ||
+        esp_timer_start_periodic(s_screen_timer, 1000000) != ESP_OK) {
+        ESP_LOGW(TAG, "屏幕定时器没起来, 将不自动息屏(其余功能不受影响)");
+    }
+
     s_input_queue = xQueueCreate(APP_INPUT_QUEUE_DEPTH, sizeof(app_input_t));
     if (s_input_queue == NULL) return ESP_ERR_NO_MEM;
     s_input_ready = true;
@@ -590,9 +700,12 @@ esp_err_t pet_app_start(void)
     if (s_settings_ok && pet_settings_is_configured(&s_settings)) {
         const esp_err_t bridge_err = start_bridge();
         if (bridge_err != ESP_OK) {
+            // 亮度不用在这里给: 链路起不来, s_link_offline 保持 true,
+            // 上面 apply_screen() 已经把它压到睡眠档了。直接写这一路会绕开
+            // s_backlight_pct 这份缓存 —— 值和缓存一旦分叉, apply_screen()
+            // 会因为"值没变"而拒绝重写, 屏上亮度就再也纠正不回来。
             ESP_LOGE(TAG, "Pet Bridge 启动失败: %s; 宠物保持睡眠状态",
                      esp_err_to_name(bridge_err));
-            bsp_display_backlight(PET_SLEEP_BACKLIGHT_PCT);
         }
     } else {
         ESP_LOGI(TAG, "没有可用的 Wi-Fi 参数, 进入蓝牙配网等 Mac 下发");

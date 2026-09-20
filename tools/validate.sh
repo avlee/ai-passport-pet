@@ -127,6 +127,12 @@ run_static_checks() {
         tests/test_pet_layout.c main/pet_layout.c \
         -o "${test_dir}/test_pet_layout"
     "${test_dir}/test_pet_layout"
+    # 屏幕电源: 空闲息屏 / 有消息亮屏。判错的两个方向都不报错 —— 该黑不黑(费电)
+    # 或者人还没看就黑了 —— 所以边界和 hold 语义都在主机上钉住。
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_pet_screen.c main/pet_screen.c \
+        -o "${test_dir}/test_pet_screen"
+    "${test_dir}/test_pet_screen"
     # 预览工具把同一套版式算术在 Python 里又写了一遍(它编译不了 C), 两份实现跑偏
     # 只会让预览图骗人 —— 拿上面的 C 逐字段对照。不需要 Pillow。
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_pet_layout_mirror.py

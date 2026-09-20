@@ -59,6 +59,14 @@
 #define PET_SLEEP_BACKLIGHT_PCT 45
 #define PET_ACTIVE_BACKLIGHT_PCT 100
 
+// 空闲多久自动息屏(毫秒)。0 表示不自动息屏。
+//
+// 只统计"真的产生了新内容"的事件: Bridge 下发的状态/文本、按键、链路恢复。
+// **Bridge 每 5 秒一次的 ping 刻意不算**(节拍见 tools/pet_bridge.py 的
+// PING_INTERVAL_S) —— 算的话屏幕永远关不掉, 这个功能等于没做。
+// 配网页与宠物接收页期间不自动息屏: 那两块画面用户必须看得见, 见 pet_app.c。
+#define PET_SCREEN_IDLE_MS 60000
+
 // 电量轮询间隔。CW2017 走 I2C, 放在独立任务里读, 不要占用 LVGL 渲染任务。
 #define PET_BATTERY_POLL_MS 5000
 

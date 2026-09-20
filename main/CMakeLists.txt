@@ -9,6 +9,7 @@ idf_component_register(
          "pet_ui.c"
          "pet_layout.c"
          "pet_state.c"
+         "pet_screen.c"
          "pet_protocol.c"
          "pet_settings.c"
          "pet_pkg.c"

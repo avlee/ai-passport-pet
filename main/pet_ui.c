@@ -193,6 +193,10 @@ static lv_obj_t *s_prov_pin;
 static lv_obj_t *s_prov_status;
 
 static lv_timer_t *s_anim_timer;
+// 屏幕黑着的时候不必逐帧重绘(见 pet_ui_set_anim_enabled)。默认渲染, 由 pet_app
+// 在息屏/亮屏时改。**不放在 pet_ui_init 里复位**: 屏幕开关的真值在 pet_app, 这里
+// 跟着走就行, 两处都记一份迟早对不上。
+static bool s_anim_enabled = true;
 
 static pet_state_t       s_state;
 static pet_settings_t    s_settings;
@@ -470,8 +474,10 @@ static void anim_tick(lv_timer_t *timer)
 {
     (void)timer;
     // 配网页是不透明的, 底下的宠物没人看得见 —— 别再逐帧重绘它, 省 CPU 也省电。
-    // 槽里没有宠物时同理: 没有帧可画, 醒着也只是空转。
-    if (s_screen == NULL || s_prov_visible || !s_pet_ready) return;
+    // 息屏同理(屏幕整个黑着)。槽里没有宠物时也没有帧可画, 醒着只是空转。
+    if (s_screen == NULL || s_prov_visible || !s_pet_ready || !s_anim_enabled) {
+        return;
+    }
 
     const pet_pose_t pose = pet_state_pose(&s_state);
     const pet_anim_t want = s_override ? s_override_anim : pose.anim;
@@ -725,6 +731,22 @@ static void refresh_provision_locked(void)
     lv_obj_set_style_text_color(s_prov_status, lv_color_hex(s_prov_tone), 0);
 }
 
+// 动画定时器的周期只由这一处决定。要逐帧渲染时置 1 —— 下一拍立刻重新装载动作
+// (frame 的真实时长随后由 render_frame 按素材写回); 不需要渲染时拉长到 500, 让
+// 定时器空转的代价也接近零。
+//
+// 之所以收成一处: 周期有三个来源(配网页显隐、息屏/亮屏、重建界面), 各写各的话,
+// 最后一个写的赢, 而"谁最后写的"在运行期根本看不出来。
+static void apply_anim_period_locked(void)
+{
+    if (s_anim_timer == NULL) return;
+
+    const bool render = s_anim_enabled && !s_prov_visible && s_pet_ready
+                        && s_screen != NULL;
+    lv_timer_set_period(s_anim_timer, render ? 1 : 500);
+    lv_timer_reset(s_anim_timer);
+}
+
 static void set_provision_visible_locked(bool visible)
 {
     s_prov_visible = visible;
@@ -737,12 +759,8 @@ static void set_provision_visible_locked(bool visible)
         lv_obj_add_flag(s_prov_scrim, LV_OBJ_FLAG_HIDDEN);
     }
 
-    if (s_anim_timer != NULL) {
-        // 配网页关掉时把定时器的周期复位成 1, 下一拍立刻重新装载正确的动作;
-        // 打开时拉长周期, 底下的宠物不用再逐帧渲染。
-        lv_timer_set_period(s_anim_timer, visible ? 500 : 1);
-        lv_timer_reset(s_anim_timer);
-    }
+    // 配网页打开时底下的宠物不用再逐帧渲染, 关掉时下一拍要立刻重新装载动作。
+    apply_anim_period_locked();
 }
 
 void pet_ui_build(void)
@@ -878,6 +896,18 @@ void pet_ui_destroy(void)
 bool pet_ui_ready(void)
 {
     return s_screen != NULL;
+}
+
+void pet_ui_set_anim_enabled(bool enabled)
+{
+    if (!bsp_lvgl_lock(1000)) return;
+
+    if (s_anim_enabled != enabled) {
+        s_anim_enabled = enabled;
+        apply_anim_period_locked();
+    }
+
+    bsp_lvgl_unlock();
 }
 
 // ---------------------------------------------------------------------------
