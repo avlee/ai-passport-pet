@@ -14,6 +14,7 @@ This is the application delivered on the `feature/codex-pet` branch. It does not
 - Top row: a status dot plus status text (offline / connecting / idle / working / waiting / ready / failed) on the left, battery on the right.
 - A platform at the bottom, carrying the text Codex pushed as its front face; when there is no text it shows a placeholder for the current state. Its floor edge is pinned to the pet's feet (stage bottom row), so the pet reads as standing on it.
 - Sleep (link down): the pet is dimmed to 40%, frame timing slows to 250%, backlight drops to 45%, and `Zzz` appears in the top-right of the stage.
+- Screen power: idle for `PET_SCREEN_IDLE_MS` and the backlight goes off; a Bridge message, a key press, or the link coming back turns it on again. See [Screen power](#screen-power).
 - With an empty slot, the stage shows "no pet yet" centred and the platform says "install one from the menu bar app" — the layout is identical to the reference pet's, so "empty" reads as a state rather than as "failed to boot".
 
 Buttons:
@@ -25,6 +26,19 @@ Buttons:
 | OK click | Plays a jump and sends `poke` to the Mac; closes the info panel when it is open |
 | OK long press | Opens / closes the info panel (firmware version, pet package, link, network, bridge endpoint, battery) |
 | UP long press | Enters the BSP reference demo menu; long-press OK on its root menu returns to the pet |
+
+## Screen power
+
+Between two Codex runs nothing changes on screen, so the backlight goes off instead of burning a 520 mAh cell. The rules, and why each one is there:
+
+- **Idle off.** `PET_SCREEN_IDLE_MS` (default 60 s) without activity takes the backlight to 0. The panel keeps its frame memory, so waking is instant and needs no repaint.
+- **Wake on content.** A Bridge state/text message, any key press, or the link coming back lights the screen and restarts the clock.
+- **Keepalive pings do not count.** The Bridge pings every 5 s (`PING_INTERVAL_S` in `tools/pet_bridge.py`). Counting those as activity would mean the screen never turns off at all.
+- **Neither does losing the link.** The pet already dims and slows down when offline, and the reconnect loop reports `CONNECTING` on every round — waking on those would keep the screen lit throughout a network outage.
+- **Never while it must be seen.** The provisioning page, the pet transfer screen, and the demo menu hold the screen on at full brightness (`pet_screen_set_hold`) — the pairing code shows up while the device is still offline, so deriving the level from the link would put it on a 45% screen. Releasing the hold also counts as activity, so the line the transfer screen leaves behind (success or failure) gets its full window rather than being switched off on the spot.
+- **Off means off.** While the screen is dark, `pet_ui_set_anim_enabled(false)` stops advancing frames: each frame pushes the 129x198x2-byte sprite over SPI, and painting an invisible screen is pure waste.
+
+The decision lives in `main/pet_screen.c` — pure logic, so `tests/test_pet_screen.c` pins the deadline, the hold semantics, and the three backlight levels (0 / sleep / active) on the host. Within the pet application `pet_app.c` is the only place that writes the backlight, and `apply_screen()` is the only function in it that does so; the BSP reference demo menu keeps its own writes, having been moved in verbatim.
 
 ## Module layout
 
@@ -40,6 +54,7 @@ Hardware stays in `components/bsp`; the application lives entirely in `main/`:
 | `main/pet_pkg.c` | `.pet` package structural parsing and validation (pure logic) |
 | `main/pet_slot.c` | The `pets` partition: erase, write, mmap, validate |
 | `main/pet_layout.c` | Layout: stage centring, foot-on-platform alignment, per-frame landing (pure logic) |
+| `main/pet_screen.c` | Screen power: idle auto-off and wake-on-content decisions, backlight levels (pure logic) |
 | `main/pet_bridge.c` | Wi-Fi STA + TCP client + backoff reconnect + package intake |
 | `main/pet_settings.c` | NVS persistence for connection parameters |
 | `main/pet_atlas.c` | Atlas access layer wrapping the slot's frame tables into `lv_image_dsc_t` |
@@ -48,7 +63,7 @@ Hardware stays in `components/bsp`; the application lives entirely in `main/`:
 | `main/pet_fonts.c` | Application font entry points (16 px body / 20 px title + fallback) |
 | `main/demo_menu.c` | The original `main.c` demo menu, moved verbatim into its own file |
 
-`pet_state.c`, `pet_protocol.c`, `pet_pkg.c`, `pet_layout.c`, and `pet_strings.h` deliberately do not depend on ESP-IDF or LVGL, so they run under host unit tests.
+`pet_state.c`, `pet_protocol.c`, `pet_pkg.c`, `pet_layout.c`, `pet_screen.c`, and `pet_strings.h` deliberately do not depend on ESP-IDF or LVGL, so they run under host unit tests.
 
 ## The pet package (`.pet`) and single-slot swapping
 
@@ -169,6 +184,8 @@ python3 tools/pet_bridge.py --list-sessions
 ```
 
 It follows whichever of `~/.codex/sessions/**/rollout-*.jsonl` was modified most recently and maps events to states:
+
+How that file is found matters more than it looks: the follow loop asks again four times a second, so only the most recent dated directories are scanned (with a recursive-glob fallback when they come up empty). See `CodexWatcher.newest_session()`.
 
 | Codex event | Pet state |
 | --- | --- |
