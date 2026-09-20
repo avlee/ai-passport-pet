@@ -73,6 +73,43 @@ enum NetworkInfo {
     }
 }
 
+/// 记住配网成功过的网络(ssid + 密码), 存在支持目录下 0600 的 JSON 里。
+///
+/// 为什么不是 Keychain: 这个应用是 ad-hoc 签名, 每次重新构建 cdhash 都会变, 而
+/// Keychain 的访问控制锚在签名上 —— 换一次构建就反复弹授权甚至读不回来。Wi-Fi 密码
+/// 放进当前用户家目录里仅本人可读的文件, 是"不折腾用户"和"不裸奔"之间务实的上限。
+enum SavedWifi {
+    struct Entry: Codable, Equatable {
+        var ssid: String
+        var password: String
+    }
+
+    static var fileURL: URL {
+        BridgePaths.supportDir.appendingPathComponent("saved-wifi.json")
+    }
+
+    static func load() -> [Entry] {
+        guard let data = try? Data(contentsOf: fileURL),
+              let entries = try? JSONDecoder().decode([Entry].self, from: data)
+        else { return [] }
+        return entries
+    }
+
+    /// 最新在前; 同名网络覆盖旧密码; 上限 8 条, 超了淘汰最旧的。
+    static func remember(ssid: String, password: String) {
+        guard !ssid.isEmpty else { return }
+        BridgePaths.ensureSupportDir()
+        var entries = load().filter { $0.ssid != ssid }
+        entries.insert(Entry(ssid: ssid, password: password), at: 0)
+        if entries.count > 8 {
+            entries.removeLast(entries.count - 8)
+        }
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        FileManager.default.createFile(atPath: fileURL.path, contents: data,
+                                       attributes: [.posixPermissions: 0o600])
+    }
+}
+
 final class ProvisionWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private var client: ProvisionClient?
@@ -90,6 +127,8 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
     private let startButton = NSButton()
     private let forgetButton = NSButton()
     private let logView = NSTextView()
+    private let savedPopup = NSPopUpButton()
+    private var savedRow: NSGridRow?
 
     private var connected = false
     private var paired = false
@@ -100,6 +139,7 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
             window = buildWindow()
         }
         window?.makeKeyAndOrderFront(nil)
+        refreshSavedNetworks()
         beginScan()
     }
 
@@ -128,7 +168,6 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
         pinField.maximumNumberOfLines = 1
 
         ssidField.placeholderString = "2.4G 网络名称"
-        ssidField.stringValue = NetworkInfo.currentSSID() ?? ""
 
         passwordField.placeholderString = "Wi-Fi 密码"
 
@@ -138,17 +177,25 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
         portField.stringValue = String(settings.port)
         portField.placeholderString = "8765"
 
-        let wifiButton = NSButton(title: "用当前 Wi-Fi", target: self,
-                                  action: #selector(useCurrentSSID))
-        wifiButton.bezelStyle = .rounded
+        // 记住配网成功过的网络: SSID 是定位类敏感数据, macOS 不会把真 SSID 给没有
+        // 定位权限的进程(实测 networksetup 只会谎报"未关联"), 所以"自动读当前 Wi-Fi"
+        // 那条路在这台系统上走不通, 干脆拿掉; 已保存列表是零权限又能真正省输入的替代。
+        savedPopup.target = self
+        savedPopup.action = #selector(savedNetworkChosen)
+        let savedLabel = label("已保存")
+        savedLabel.textColor = .secondaryLabelColor
 
         let grid = NSGridView(views: [
             [label("设备"), devicePopup, scanButtonTitled()],
             [label("配对码"), pinField, NSGridCell.emptyContentView],
-            [label("网络名称"), ssidField, wifiButton],
+            [savedLabel, savedPopup, NSGridCell.emptyContentView],
+            [label("网络名称"), ssidField, NSGridCell.emptyContentView],
             [label("密码"), passwordField, NSGridCell.emptyContentView],
             [label("配对端"), hostField, portRow()],
         ])
+        // "已保存"在第 2 行: 没有记住过任何网络时整行藏掉, 界面跟原来一样。
+        savedRow = grid.row(at: 2)
+        savedRow?.isHidden = true
         grid.rowSpacing = 10
         grid.columnSpacing = 10
         grid.column(at: 0).xPlacement = .trailing
@@ -284,13 +331,27 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
         // 目前只连信号最强的那台, 下拉框只是让用户看到扫到了什么。
     }
 
-    @objc private func useCurrentSSID() {
-        if let ssid = NetworkInfo.currentSSID() {
-            ssidField.stringValue = ssid
-            append("已填入当前 Wi-Fi: \(ssid)")
-        } else {
-            append("读不到当前 Wi-Fi 名字, 请手动填写")
+    /// 窗口可能被复用(修 use-after-free 之后关掉再开是同一个窗口), 所以每次露面都
+    /// 重读一遍已保存列表。
+    private func refreshSavedNetworks() {
+        let entries = SavedWifi.load()
+        savedPopup.removeAllItems()
+        guard !entries.isEmpty else {
+            savedRow?.isHidden = true
+            return
         }
+        for entry in entries { savedPopup.addItem(withTitle: entry.ssid) }
+        savedRow?.isHidden = false
+    }
+
+    @objc private func savedNetworkChosen() {
+        let entries = SavedWifi.load()
+        let index = savedPopup.indexOfSelectedItem
+        guard index >= 0, index < entries.count else { return }
+        let entry = entries[index]
+        ssidField.stringValue = entry.ssid
+        passwordField.stringValue = entry.password
+        append("已填入记住的网络: \(entry.ssid)")
     }
 
     @objc private func startProvision() {
@@ -385,6 +446,13 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
                 startButton.isEnabled = true
                 window?.makeFirstResponder(pinField)
             case .done:
+                // 设备确认连上了才记: "曾经输入过"不算数, "真的可用"才算。
+                let ssid = ssidField.stringValue.trimmingCharacters(in: .whitespaces)
+                if !ssid.isEmpty {
+                    SavedWifi.remember(ssid: ssid, password: passwordField.stringValue)
+                    refreshSavedNetworks()
+                    append("已记住 \(ssid), 下次从这里直接选")
+                }
                 append("设备会自己连上 Wi-Fi, 随后连到这台 Mac 的桥接端口。")
             case .deviceFailed, .deviceError:
                 startButton.isEnabled = true
