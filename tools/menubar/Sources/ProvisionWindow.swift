@@ -138,6 +138,9 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
         if window == nil {
             window = buildWindow()
         }
+        // 浮在普通窗口层之上, 原因看 buildWindow 里的注释 —— 蓝牙授权弹窗收掉之后
+        // macOS 会把焦点还给之前的前台应用, 靠抢焦点修不了, 只能让窗口自己站得住。
+        window?.level = .floating
         window?.makeKeyAndOrderFront(nil)
         refreshSavedNetworks()
         beginScan()
@@ -158,6 +161,12 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
         window.title = "配置 Wi-Fi — Codex 宠物"
         window.delegate = self
         window.center()
+        // 蓝牙授权弹窗(TCC)归系统进程所有: 它弹出时抢走焦点, 用户点完"允许"之后
+        // macOS 把前台还给弹窗之前的应用(不是我们这个 .accessory 应用), 配网页就被
+        // 盖住了。修法不是抢焦点回来 —— 那会跟用户主动切走窗口的行为打架 —— 而是让
+        // 这个窗口浮在普通窗口层(show() 里设 .floating), 直到配完关掉; 顺带允许它
+        // 出现在全屏空间之上, 不然对着全屏 IDE 配网时什么都看不见。
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         devicePopup.removeAllItems()
         devicePopup.addItem(withTitle: "扫描中…")
