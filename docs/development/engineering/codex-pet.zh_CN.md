@@ -218,6 +218,8 @@ python3 tools/pet_bridge.py --list-sessions
 
 服务端每 5 s 发一条 `ping`，明显快于设备侧 12 s 的空闲判定，所以「设备静默掉线」只会在真的断网时发生。
 
+Codex 不把正文放在普通字段里：`AgentMessage` 的正文是内容块列表（`[{"type": "Text", "text": "..."}]`），报错是 `{"message": ..., "codex_error_info": ...}`。所有要变成气泡文字的 Codex 字段都走 `message_text()`：它把正文取出来，遇到不认识的结构就返回空串。它**刻意没有 `str()` 兜底** —— 把载荷序列化出去，正是那段 `[{'type': 'Text', ...}]` 顶掉进度文案、跑到宠物站台上的原因。
+
 ### 换宠物
 
 桥接启动时扫一遍 `~/.codex/pets`，把可用宠物的列表（`pets` 事件）随状态一起广播出去。

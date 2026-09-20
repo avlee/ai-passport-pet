@@ -651,6 +651,86 @@ def test_codex_records_map_to_pet_states() -> None:
         peer.close()
 
 
+def test_message_text_flattens_every_shape_to_plain_text() -> None:
+    """`message_text()` 是"Codex 字段 → 上屏文案"的唯一出口, 逐形状钉住。
+
+    它存在的理由见函数自己的注释: Codex 的正文包在内容块/结构体里, 直接 `str()`
+    上屏就是屏幕上那段"JSON 字符串"。这里断言的是"取不到就给空串", 而不是某个
+    兜底 repr。
+    """
+    assert pet_bridge.message_text(None) == ""
+    assert pet_bridge.message_text("正文") == "正文"
+    assert pet_bridge.message_text({"message": "出错"}) == "出错"
+    assert pet_bridge.message_text([{"type": "Text", "text": "第一段"},
+                                    {"type": "Text", "text": "第二段"}]) == "第一段 第二段"
+    # 将来块变成裸字符串也得认。
+    assert pet_bridge.message_text(["裸串", {"text": "块"}]) == "裸串 块"
+    # 块里没有正文(图片之类)就跳过, 不留空档。
+    assert pet_bridge.message_text([{"type": "Text", "text": "正文"},
+                                    {"type": "Image"}]) == "正文"
+
+    # 认不出的形状一律空串, **绝不 str() 兜底** —— 那正是这个缺陷本身。
+    for weird in (42, 3.5, True, {"a": 1}, {"code": 429}, [{"a": 1}], b"bytes",
+                  range(3), object()):
+        assert pet_bridge.message_text(weird) == "", repr(weird)
+
+
+def test_codex_payloads_never_reach_the_screen_as_a_struct() -> None:
+    """真实载荷形状走完整链路: 上屏的是正文, 不是那段"JSON 字符串"。
+
+    2026-09-20 在本机 598 个会话里实测: 829 条 AgentMessage 的 `content` 全是内容
+    块列表、20 条报错全是字典, 一条字符串都没有 —— 而旧实现只有 `str()` 兜底, 也
+    就是说这两个分支从来没显示过正文。这个用例就是把那两种形状钉死。
+    """
+    cases = [
+        ({"type": "event_msg", "payload": {
+            "type": "item_completed",
+            "item": {"type": "AgentMessage",
+                     "content": [{"type": "Text", "text": "改完了"}]}}},
+         "working", "改完了"),
+        ({"type": "event_msg", "payload": {
+            "type": "item_completed",
+            "item": {"type": "CommandExecution",
+                     "content": [{"type": "Text", "text": "git status"}]}}},
+         "working", "git status"),
+        ({"type": "event_msg", "payload": {
+            "type": "error",
+            "error": {"message": "用量已到上限", "codex_error_info": "usage_limit"}}},
+         "failed", "用量已到上限"),
+        # 取不到正文: 只留状态, 一个字的 repr 都不出去。
+        ({"type": "event_msg", "payload": {
+            "type": "item_completed",
+            "item": {"type": "AgentMessage", "content": {"认不出的": 1}}}},
+         "working", None),
+        ({"type": "event_msg", "payload": {"type": "error", "error": {"code": 429}}},
+         "failed", None),
+        # 条目类型本身不是字符串时, 兜底文案也不能是它的 repr。
+        ({"type": "event_msg", "payload": {
+            "type": "item_completed", "item": {}}},
+         "working", "工作中"),
+    ]
+
+    link = pet_bridge.DeviceLink()
+    local, peer = socket.socketpair()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            link.attach(local, "192.168.0.9:5000")
+        watcher = pet_bridge.CodexWatcher(link, 45.0)
+        for record, state, text in cases:
+            with contextlib.redirect_stdout(io.StringIO()):
+                watcher._handle_record(record)
+            wire = json.loads(capture(peer).decode("utf-8").strip())
+            assert wire.get("state") == state, (record, wire)
+            assert wire.get("text") == text, (record, wire)
+            shown = wire.get("text") or ""
+            # 总闸: 不管载荷形状怎么变, 上屏的文字都不许长得像序列化后的结构体。
+            assert not shown.startswith(("{", "[")), (record, shown)
+            assert "'type':" not in shown and '"type":' not in shown, (record, shown)
+    finally:
+        local.close()
+        peer.close()
+
+
 def test_codex_watcher_follows_a_session_and_drives_the_device() -> None:
     """跟随线程真的跑起来: 切会话、读新记录、把状态发到设备、活着。
 
@@ -856,6 +936,10 @@ def main() -> int:
         ("codex_watcher_takes_no_thread_internal_name",
          test_codex_watcher_takes_no_thread_internal_name),
         ("codex_records_map_to_pet_states", test_codex_records_map_to_pet_states),
+        ("message_text_flattens_every_shape",
+         test_message_text_flattens_every_shape_to_plain_text),
+        ("codex_payloads_never_reach_the_screen_as_a_struct",
+         test_codex_payloads_never_reach_the_screen_as_a_struct),
         ("codex_watcher_follows_a_session_and_drives_the_device",
          test_codex_watcher_follows_a_session_and_drives_the_device),
         ("codex_watcher_keeps_a_record_split_across_writes",

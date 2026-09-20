@@ -159,6 +159,38 @@ def squash(text: str) -> str:
     return " ".join(text.split())
 
 
+def message_text(value: object) -> str:
+    """把 Codex 的字段压成可以上屏的纯文本。
+
+    Codex 不把正文直接放在字段里, 而是包成内容块或结构体: 一条 AgentMessage 的
+    `content` 是 `[{"type": "Text", "text": "…"}]`, 报错是
+    `{"message": "…", "codex_error_info": …}`。旧代码对这两处都是 `str()` 硬转,
+    屏幕上于是出现一段"JSON 字符串" —— 那串 `[{'type': 'Text', 'text': '…'}]`
+    就是这么来的。
+
+    2026-09-20 在本机 598 个会话里实测: 829 条 AgentMessage 的 `content` 全是
+    列表, 20 条报错全是字典, **一条字符串都没有** —— 也就是说这两个分支从来没
+    显示过正文, 一直是把结构体 repr 出去。
+
+    形状对不上就返回空串, 由调用方按状态给兜底文案。**这里绝不 `str()` 兜底**:
+    把结构体 str 出去正是这个缺陷本身, 换个没见过的形状也还是同一个病。
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        # 内容块是 `{"type": …, "text": …}`, 报错体是 `{"message": …}`。
+        for key in ("text", "message"):
+            text = value.get(key)
+            if isinstance(text, str):
+                return text
+        return ""
+    if isinstance(value, (list, tuple)):
+        # 递归下去: 块本身可能是字典, 也可能(将来)是裸字符串; 多块按顺序拼一行。
+        return " ".join(part for part in (message_text(block) for block in value)
+                        if part)
+    return ""
+
+
 class DeviceLink:
     """与设备的一条 TCP 连接。写操作加锁, 多个状态来源可以安全并发调用。"""
 
@@ -742,7 +774,7 @@ class CodexWatcher(threading.Thread):
         ptype = payload.get("type")
 
         if payload.get("error"):
-            self._emit("failed", str(payload["error"]))
+            self._emit("failed", message_text(payload["error"]))
             return
 
         if rtype == "event_msg" and ptype == "task_started":
@@ -750,7 +782,7 @@ class CodexWatcher(threading.Thread):
             return
 
         if rtype == "event_msg" and ptype == "task_complete":
-            self._emit("ready", str(payload.get("last_agent_message") or ""))
+            self._emit("ready", message_text(payload.get("last_agent_message")))
             return
 
         if rtype == "event_msg" and ptype == "item_completed":
@@ -758,20 +790,25 @@ class CodexWatcher(threading.Thread):
             item = item if isinstance(item, dict) else {}
             itype = item.get("type")
             if itype == "CommandExecution":
-                content = item.get("content")
-                text = content if isinstance(content, str) else ""
+                # 命令正文同样可能是内容块; 取不到再退回一句通用文案。
+                text = message_text(item.get("content"))
                 self._emit("working", text or "正在执行命令")
             elif itype == "Reasoning":
                 self._emit("working", "正在思考…")
             elif itype == "FileChange":
                 self._emit("working", "正在修改文件")
             elif itype == "AgentMessage":
-                self._emit("working", str(item.get("content") or ""))
+                # 正文包在内容块里(`[{"type": "Text", "text": …}]`), 由 message_text 取出。
+                self._emit("working", message_text(item.get("content")))
             elif itype == "UserMessage":
                 # 新的用户消息: 下一轮通常马上开始。
                 self._emit("working", "收到新指令")
             else:
-                self._emit("working", str(itype or "工作中"))
+                # 认不出的条目类型: 只有确实是字符串才拿它当文案。这里原本是
+                # `str(itype or ...)` —— 与 message_text 同一条规矩, 结构体绝不
+                # str 上屏。
+                self._emit("working",
+                           itype if isinstance(itype, str) and itype else "工作中")
             return
 
         # 等用户确认 / 授权: 具体事件名随版本变化, 用关键词兜底匹配。

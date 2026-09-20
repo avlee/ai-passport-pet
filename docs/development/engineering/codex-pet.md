@@ -198,6 +198,8 @@ How that file is found matters more than it looks: the follow loop asks again fo
 
 The server pings every 5 s, comfortably faster than the device's 12 s idle check, so a genuinely silent device only happens when the network really drops.
 
+Codex does not put message text in a plain field. An `AgentMessage` carries its body as a list of content blocks — `[{"type": "Text", "text": "..."}]` — and an error carries `{"message": ..., "codex_error_info": ...}`. Every Codex field that becomes bubble text goes through `message_text()`, which unwraps the inner text and returns nothing for a shape it does not recognise. It deliberately has **no `str()` fallback**: serialising the payload is exactly how a `[{'type': 'Text', ...}]` blob ended up on the platform in place of the progress text.
+
 ### Swapping pets
 
 At startup the bridge scans `~/.codex/pets` and broadcasts the list of available pets (the `pets` event) alongside the rest of its state. Picking one builds the package on demand — through `tools/gen_pet_package.py`'s implementation, not a second copy, because the package format is a cross-language contract with exactly one source of truth — caches it in `~/Library/Application Support/CodexPetBridge/pets/<id>.pet`, and pushes it to the device from a **background thread**.
