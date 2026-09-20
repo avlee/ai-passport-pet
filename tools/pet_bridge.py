@@ -636,18 +636,47 @@ class CodexWatcher(threading.Thread):
         self.manual_until_event = False
         self.link.send_state(state, text, source="codex")
 
+    @staticmethod
+    def _record_boundary(path: str) -> int:
+        """文件末尾**完整记录**的边界: 从 EOF 往回退到最后一个换行。
+
+        `_offset` 的不变量是"永远落在一条记录的起点"。一个刚开的会话通常正写到
+        一半, 直接取 EOF 会把那条记录劈成两半 —— 下一轮读到的残片必然解析失败。
+        """
+        size = os.path.getsize(path)
+        if size == 0:
+            return 0
+        window = 65536
+        with open(path, "rb") as handle:
+            handle.seek(max(0, size - window))
+            tail = handle.read()
+        end = tail.rfind(b"\n")
+        if end < 0:
+            # 64 KB 里连一个换行都没有(不正常的日志): 宁可跳过, 不重放整段历史。
+            return size
+        return size - len(tail) + end + 1
+
     def _switch(self, path: str) -> None:
         self._current = path
         # 新会话从当前末尾开始跟, 不重放历史 —— 否则一连上就会看到几个月前的
-        # 旧事件在屏幕上飞快地刷一遍。
+        # 旧事件在屏幕上飞快地刷一遍。起点要对齐到记录边界, 见 _record_boundary()。
         try:
-            self._offset = os.path.getsize(path)
+            self._offset = self._record_boundary(path)
         except OSError:
             self._offset = 0
         print(f"[codex] 跟随会话: {Path(path).name}", flush=True)
         self._publish({"event": "session", "name": Path(path).name, "path": path})
 
-    def _handle(self, record: dict) -> None:
+    def _handle_record(self, record: dict) -> None:
+        """映射一条 rollout 记录。
+
+        方法名**必须**避开 `_handle`: Python 3.13 的 `threading.Thread.__init__`
+        会给每个实例挂上 `self._handle = _ThreadHandle()`。实例属性优先于类方法, 所以
+        一个叫 `_handle` 的方法在 `Thread` 子类里根本调不到 —— `self._handle(record)`
+        抛 `TypeError: '_thread._ThreadHandle' object is not callable`, 跟随线程在
+        第一条记录上就崩掉, 设备从此再也收不到 Codex 状态。真机日志见
+        `~/Library/Application Support/CodexPetBridge/bridge.log` (2026-09-20)。
+        """
         rtype = record.get("type")
         payload = record.get("payload")
         payload = payload if isinstance(payload, dict) else {}
@@ -692,6 +721,62 @@ class CodexWatcher(threading.Thread):
             self._emit("waiting", "等待你确认")
             return
 
+    def read_new_records(self) -> int:
+        """读一次被跟随文件的新尾巴, 返回消费掉的字节数。
+
+        **只消费到最后一个换行为止。** rollout 是边写边刷的, 一次读很可能正好落在
+        一条记录的中间。旧实现把那段残片也算进 `_offset`, 补全之后它再也不会被解析
+        (残片单独解 JSON 必然失败) —— 丢掉的若是 `task_complete`, 宠物就一直卡在
+        `working`, 直到 45 秒的 idle 超时才动一下。留在 `_offset` 之前, 下一轮读到
+        的就是完整的一行。
+
+        单独成方法是为了能在主机上直接测: 跟随线程真跑起来才看得见的账, 靠人会漏。
+        """
+        assert self._current is not None
+        size = os.path.getsize(self._current)
+        # 文件被截断/轮转时重新定位到开头。
+        if size < self._offset:
+            self._offset = 0
+        if size == self._offset:
+            return 0
+
+        with open(self._current, "rb") as handle:
+            handle.seek(self._offset)
+            raw = handle.read()
+        end = raw.rfind(b"\n")
+        if end < 0:
+            return 0  # 整段都还没写完, 一个字都不消费。
+
+        consumed = end + 1
+        self._offset += consumed
+        # 按 b"\n" 切, 不用 splitlines() —— 后者连 \r、\v、\x1c 一起切, 而 offset
+        # 的算术只认换行。切法必须和记账方式一致。
+        for line in raw[:consumed].split(b"\n"):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line.decode("utf-8", "replace"))
+            except json.JSONDecodeError:
+                continue
+            self._handle_record(record)
+        return consumed
+
+    def maybe_go_idle(self) -> bool:
+        """日志静了一段就切回 idle, 但**手工状态要留到下一个 Codex 事件**。
+
+        `apply_state()` 明确承诺过这条优先级, 而 idle 同样是日志推断出来的, 也得让路。
+        少了这个判断, 菜单里"推送状态"点完会被下一轮 idle 打回去: 桥接启动 45 秒后
+        全局的 idle 条件就一直满足, 于是手工状态在 0.25 秒内消失, 看起来就是"点了没
+        反应" —— 真机日志里那两条挨着的 `[state] working / ...` 与 `[state] idle`
+        就是这么来的。
+        """
+        if self.manual_until_event or self._state == "idle":
+            return False
+        if time.monotonic() - self._last_event_at <= self.idle_after:
+            return False
+        self._emit("idle", "")
+        return True
+
     def run(self) -> None:
         while True:
             if not self.enabled:
@@ -705,27 +790,8 @@ class CodexWatcher(threading.Thread):
                 if newest != self._current:
                     self._switch(newest)
 
-                assert self._current is not None
-                # 文件被截断/轮转时重新定位到开头。
-                if os.path.getsize(self._current) < self._offset:
-                    self._offset = 0
-
-                with open(self._current, "rb") as handle:
-                    handle.seek(self._offset)
-                    for raw in handle:
-                        self._offset += len(raw)
-                        line = raw.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line.decode("utf-8", "replace"))
-                        except json.JSONDecodeError:
-                            continue
-                        self._handle(record)
-
-                if (self._state != "idle"
-                        and time.monotonic() - self._last_event_at > self.idle_after):
-                    self._emit("idle", "")
+                self.read_new_records()
+                self.maybe_go_idle()
             except OSError as exc:
                 print(f"[codex] 读日志出错: {exc}", flush=True)
             time.sleep(0.25)

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import glob
 import io
 import json
 import os
@@ -541,6 +542,246 @@ def test_missing_pillow_is_explained_not_an_internal_error() -> None:
         raise AssertionError("没有 Pillow 却打包成功了?")
 
 
+# ---------------------------------------------------------------------------
+# Codex 日志跟随: 记录 -> 宠物状态 -> 发到设备的字节
+#
+# 这一层原先**一条测试都没有**: 映射函数没人调过, 跟随线程也没起过。于是当映射函数
+# 叫 `_handle`、而 Python 3.13 的 threading.Thread 正好把一个 `_handle` 实例属性挂在
+# 每个子类实例上时, 静态门禁全绿、真机上宠物却完全不再同步 Codex 状态 —— 跟随线程
+# 在第一条记录上就抛 TypeError 死掉, 日志里只有一行 traceback。
+# ---------------------------------------------------------------------------
+
+# threading.Thread 的实例属性/方法里, 我们自己不许占用的名字。
+# 前一半从当前解释器的 Thread 类里现取, 后一半**显式列出**: `_handle` 是 Python 3.13
+# 才加进去的, 而门禁跑的是 PATH 上的 python3 —— 换一台 3.12 的机器, 只靠 dir() 就漏掉
+# 这个坑, 可桥接自己用的解释器是 3.13, 真机照样崩。
+THREAD_RESERVED = ("_handle", "_stop", "_delete", "_bootstrap", "_bootstrap_inner")
+
+
+def wait_for(predicate, timeout: float = 5.0) -> bool:
+    """轮询等条件成立。跟随线程是异步的, 不能靠 sleep 猜时间。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return bool(predicate())
+
+
+def test_codex_watcher_takes_no_thread_internal_name() -> None:
+    """跟随线程自己起的名字不能跟 threading.Thread 的实例属性撞车。
+
+    实例属性优先于类方法: 撞名的后果是 `self.<名字>(...)` 去调 Thread 那个对象, 报
+    "TypeError: object is not callable", 线程静默死掉 —— 不是"状态偶尔不同步", 是
+    从此一条都不同步。这条不依赖解释器版本(见 THREAD_RESERVED 的注释), 所以换台机器
+    跑门禁也拦得住。
+    """
+    reserved = {name for name in dir(threading.Thread) if not name.startswith("__")}
+    reserved |= set(THREAD_RESERVED)
+    # run() 是子类**应该**实现的那个方法, 不是撞车。
+    reserved.discard("run")
+    clashes = sorted(name for name in vars(pet_bridge.CodexWatcher) if name in reserved)
+    assert not clashes, f"这些名字与 threading.Thread 撞车: {clashes}"
+
+
+def test_codex_records_map_to_pet_states() -> None:
+    """rollout 记录到宠物状态(以及真正发出去的字节)的映射表。"""
+    cases = [
+        ({"type": "event_msg", "payload": {"type": "task_started"}},
+         "working", "Codex 开始处理任务"),
+        ({"type": "event_msg", "payload": {"type": "item_completed",
+                                           "item": {"type": "Reasoning"}}},
+         "working", "正在思考…"),
+        ({"type": "event_msg", "payload": {"type": "item_completed",
+                                           "item": {"type": "CommandExecution",
+                                                    "content": "git status"}}},
+         "working", "git status"),
+        ({"type": "event_msg", "payload": {"type": "item_completed",
+                                           "item": {"type": "CommandExecution"}}},
+         "working", "正在执行命令"),
+        ({"type": "event_msg", "payload": {"type": "item_completed",
+                                           "item": {"type": "FileChange"}}},
+         "working", "正在修改文件"),
+        ({"type": "event_msg", "payload": {"type": "item_completed",
+                                           "item": {"type": "AgentMessage",
+                                                    "content": "改完了"}}},
+         "working", "改完了"),
+        ({"type": "event_msg", "payload": {"type": "item_completed",
+                                           "item": {"type": "UserMessage"}}},
+         "working", "收到新指令"),
+        ({"type": "event_msg", "payload": {"type": "item_completed",
+                                           "item": {"type": "McpToolCall"}}},
+         "working", "McpToolCall"),
+        ({"type": "event_msg", "payload": {"type": "error", "error": "速率受限"}},
+         "failed", "速率受限"),
+        ({"type": "event_msg", "payload": {"type": "exec_approval_request"}},
+         "waiting", "等待你确认"),
+        ({"type": "event_msg", "payload": {"type": "task_complete",
+                                           "last_agent_message": "全部通过"}},
+         "ready", "全部通过"),
+    ]
+    link = pet_bridge.DeviceLink()
+    local, peer = socket.socketpair()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            link.attach(local, "192.168.0.9:5000")
+        watcher = pet_bridge.CodexWatcher(link, 45.0)
+        for record, state, text in cases:
+            with contextlib.redirect_stdout(io.StringIO()):
+                watcher._handle_record(record)
+            assert watcher.state == state, (record, watcher.state)
+            wire = json.loads(capture(peer).decode("utf-8").strip())
+            expected = {"type": "state", "state": state}
+            if text:
+                expected["text"] = text
+            assert wire == expected, (record, wire)
+
+        # 这些记录与状态无关(用量统计/原始条目/上下文), 一条报文都不该发出去 ——
+        # 真机上一次会话里它们比事件本身还多, 漏一条就是宠物被无意义地反复刷新。
+        for record in ({"type": "token_usage_record"},
+                       {"type": "event_msg", "payload": {"type": "token_count"}},
+                       {"type": "response_item", "payload": {"type": "message"}},
+                       {"type": "turn_context"}, {"type": "world_state"}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                watcher._handle_record(record)
+        assert watcher.state == "ready", watcher.state
+        assert capture(peer) == b"", "无关记录不该产生下行报文"
+    finally:
+        local.close()
+        peer.close()
+
+
+def test_codex_watcher_follows_a_session_and_drives_the_device() -> None:
+    """跟随线程真的跑起来: 切会话、读新记录、把状态发到设备、活着。
+
+    用真的线程和真的文件, 因为要钉的正是"线程活着"这件事 —— 直接调映射函数测不出
+    线程撞名/一轮循环就崩这类问题。
+    """
+    device = pet_bridge.DeviceLink()
+    local, peer = socket.socketpair()
+    with tempfile.TemporaryDirectory(prefix="rollout-") as workdir:
+        path = os.path.join(workdir, "rollout-2099-01-01T00-00-00-test.jsonl")
+        Path(path).write_text("", encoding="utf-8")
+        original_glob = pet_bridge.CODEX_SESSIONS_GLOB
+        pet_bridge.CODEX_SESSIONS_GLOB = os.path.join(workdir, "rollout-*.jsonl")
+        events: list[dict] = []
+        watcher = pet_bridge.CodexWatcher(device, 45.0, on_event=events.append)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                device.attach(local, "192.168.0.9:5000")
+                watcher.start()
+            assert wait_for(lambda: watcher.session_name == os.path.basename(path)), \
+                f"跟随线程没有切到 {path}, 现有事件: {events}"
+
+            # 记录在线程起来**之后**才写: 真机上新会话也是边跑边写, 已有的历史不重放。
+            lines = [
+                {"type": "event_msg", "payload": {"type": "task_started"}},
+                {"type": "event_msg", "payload": {"type": "item_completed",
+                                                  "item": {"type": "CommandExecution",
+                                                           "content": "dotnet test"}}},
+                {"type": "event_msg", "payload": {"type": "task_complete",
+                                                  "last_agent_message": "绿了"}},
+            ]
+            with open(path, "a", encoding="utf-8") as handle:
+                for line in lines:
+                    handle.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+            seen = b""
+
+            def device_states() -> list[str]:
+                nonlocal seen
+                seen += capture(peer)
+                return [json.loads(line)["state"]
+                        for line in seen.decode("utf-8").splitlines() if line.strip()]
+
+            assert wait_for(lambda: device_states() == ["working", "working", "ready"]), \
+                device_states()
+            assert watcher.state == "ready", watcher.state
+            assert watcher.is_alive(), "跟随线程死了, 设备再也拿不到状态"
+        finally:
+            watcher.enabled = False
+            pet_bridge.CODEX_SESSIONS_GLOB = original_glob
+            local.close()
+            peer.close()
+
+
+def test_codex_watcher_keeps_a_record_split_across_writes() -> None:
+    """日志是边写边刷的, 读到半条记录时一个字节都不许消费。
+
+    旧实现按 `for raw in handle` 迭代, 半行也算进 `_offset`。补全之后那半行的前半段
+    已经翻过去了, 残片单独解 JSON 必然失败 —— 记录就这么静默丢了。丢掉的若是
+    `task_complete`, 宠物会一直停在 working, 直到 idle 超时才动一下。
+    """
+    link = pet_bridge.DeviceLink()
+    local, peer = socket.socketpair()
+    with tempfile.TemporaryDirectory(prefix="rollout-") as workdir:
+        path = os.path.join(workdir, "rollout-2099-01-01T00-00-00-test.jsonl")
+        Path(path).write_text("", encoding="utf-8")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                link.attach(local, "192.168.0.9:5000")
+            watcher = pet_bridge.CodexWatcher(link, 45.0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                watcher._switch(path)
+            assert watcher.read_new_records() == 0, "空文件不该消费任何字节"
+
+            record = json.dumps({"type": "event_msg",
+                                 "payload": {"type": "task_complete",
+                                             "last_agent_message": "写完一半"}},
+                                ensure_ascii=False)
+            half = len(record.encode("utf-8")) // 2
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(record[:half])
+            assert watcher.read_new_records() == 0, "半条记录不能被消费"
+            assert watcher.state == "idle", watcher.state
+            assert capture(peer) == b"", "半条记录不该产生任何下行报文"
+
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(record[half:] + "\n")
+            assert watcher.read_new_records() == len(record.encode("utf-8")) + 1
+            assert watcher.state == "ready", watcher.state
+            wire = capture(peer).decode("utf-8").splitlines()
+            assert [json.loads(line) for line in wire] == [
+                {"type": "state", "state": "ready", "text": "写完一半"}], wire
+        finally:
+            local.close()
+            peer.close()
+
+
+def test_manual_state_survives_the_idle_sweep_until_codex_speaks() -> None:
+    """手工推的状态不会被 idle 超时打回去, 但下一个 Codex 事件仍然接管。
+
+    `apply_state()` 的注释写着"手工状态优先于日志推断, 直到下一个 Codex 事件出现",
+    但那个标记原先只写不读 —— 桥接启动 45 秒后 idle 的条件一直成立, 菜单里点一下
+    "推送状态", 0.25 秒后就被打回 idle, 看着就是"点了没反应"。
+    """
+    link = pet_bridge.DeviceLink()
+    local, peer = socket.socketpair()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            link.attach(local, "192.168.0.9:5000")
+        watcher = pet_bridge.CodexWatcher(link, 0.0)   # idle 条件立刻满足
+        with contextlib.redirect_stdout(io.StringIO()):
+            pet_bridge.apply_state(link, watcher, "working", "手工推的")
+        assert watcher.state == "working", watcher.state
+
+        assert watcher.maybe_go_idle() is False, "手工状态被 idle 打回去了"
+        assert watcher.state == "working", watcher.state
+
+        # Codex 一动, 日志重新说话: 手工标记让位, idle 又照常生效。
+        with contextlib.redirect_stdout(io.StringIO()):
+            watcher._handle_record({"type": "event_msg",
+                                    "payload": {"type": "task_started"}})
+        assert watcher.manual_until_event is False
+        assert watcher.state == "working", watcher.state
+        time.sleep(0.01)
+        assert watcher.maybe_go_idle() is True, "Codex 事件之后 idle 该照常生效"
+        assert watcher.state == "idle", watcher.state
+    finally:
+        local.close()
+        peer.close()
+
+
 def main() -> int:
     failures = []
     tests = [
@@ -554,6 +795,15 @@ def main() -> int:
         ("pet_swap_end_to_end", test_pet_swap_end_to_end),
         ("missing_pillow_is_explained",
          test_missing_pillow_is_explained_not_an_internal_error),
+        ("codex_watcher_takes_no_thread_internal_name",
+         test_codex_watcher_takes_no_thread_internal_name),
+        ("codex_records_map_to_pet_states", test_codex_records_map_to_pet_states),
+        ("codex_watcher_follows_a_session_and_drives_the_device",
+         test_codex_watcher_follows_a_session_and_drives_the_device),
+        ("codex_watcher_keeps_a_record_split_across_writes",
+         test_codex_watcher_keeps_a_record_split_across_writes),
+        ("manual_state_survives_the_idle_sweep",
+         test_manual_state_survives_the_idle_sweep_until_codex_speaks),
     ]
 
     with tempfile.TemporaryDirectory(prefix="pet-bridge-") as workdir:
