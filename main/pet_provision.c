@@ -150,44 +150,11 @@ static void random_pin(char *out, size_t size)
     snprintf(out, size, "%u", (unsigned)(1000u + esp_random() % 9000u));
 }
 
-// 取配对码: 存过就沿用, 没存过才生成并落盘。
-//
-// 配对码刻意做成**长期**的。它要防的只是"旁边别的机器顺手连上设备", 不是密码学
-// 意义上的秘密 —— 屏幕上一直写着它。每连一次就换一个, 换来的是用户每次都得跑到
-// 设备跟前重抄一遍, 很不值。
-static void load_or_create_pin(void)
-{
-    char stored[PET_SETTINGS_PIN_MAX];
-    const bool reuse = pet_settings_load_pin(stored, sizeof(stored)) &&
-                       pet_prov_pin_is_valid(stored);
-
-    char pin[PET_SETTINGS_PIN_MAX];
-    if (reuse) {
-        snprintf(pin, sizeof(pin), "%s", stored);
-    } else {
-        random_pin(pin, sizeof(pin));
-    }
-
-    xSemaphoreTake(s_state_lock, portMAX_DELAY);
-    snprintf(s_pin, sizeof(s_pin), "%s", pin);
-    s_attempts_left = PET_PROVISION_MAX_ATTEMPTS;
-    xSemaphoreGive(s_state_lock);
-
-    if (reuse) {
-        ESP_LOGI(TAG, "沿用已保存的配对码 %s", pin);
-        return;
-    }
-
-    // NVS 写在锁外。存不下来只影响下次开机(会再生成一个), 本次配对照常进行。
-    const esp_err_t err = pet_settings_save_pin(pin);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "配对码 %s 已保存, 以后窗口都用它", pin);
-    } else {
-        ESP_LOGW(TAG, "配对码保存失败(%s), 本次仍然可用", esp_err_to_name(err));
-    }
-}
-
-// 只有"连续输错用尽次数"才换码: 那已经不是手滑, 而是有人在试。
+// 生成一个新码并落盘。两个调用点:
+//   1. 每次开配网页(2026-09-20 起): 配对码要防的只是"别的机器顺手连上", 而它明文
+//      打进串口日志、长期躺在 NVS 里 —— 长期码等于 once 泄漏、永远可配。用户每次
+//      配网都得看屏幕抄码, 换码不添事, 换来的是所有旧码(见过/抄过/日志里)作废。
+//   2. 配对码被连续试错耗尽: 那不是手滑, 是有人在试, 立刻换码作废对方手里的旧码。
 static void rotate_pin(void)
 {
     char pin[PET_SETTINGS_PIN_MAX];
@@ -198,8 +165,14 @@ static void rotate_pin(void)
     s_attempts_left = PET_PROVISION_MAX_ATTEMPTS;
     xSemaphoreGive(s_state_lock);
 
-    (void)pet_settings_save_pin(pin);
-    ESP_LOGW(TAG, "配对码已更换为 %s", pin);
+    // NVS 写在锁外。存不下来只影响"下一个窗口", 本次屏幕上的码照样有效。
+    const esp_err_t err = pet_settings_save_pin(pin);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "新配对码 %s 已生成并保存", pin);
+    } else {
+        ESP_LOGW(TAG, "新配对码 %s 保存失败(%s), 本次仍然可用",
+                 pin, esp_err_to_name(err));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,8 +340,8 @@ static void handle_line(const char *line)
             if (left <= 0) {
                 ESP_LOGW(TAG, "配对码连续输错 %d 次, 断开链路",
                          PET_PROVISION_MAX_ATTEMPTS);
-                // 换码必须在这里显式做: 它原来搭在"断开就换码"上, 而配对码改成长
-                // 期之后断开不再换码 —— 只靠断开的话, 这个上限就名存实亡了。
+                // 换码必须在这里显式做: 断开本身不换码(同一窗口重连应当沿用屏幕
+                // 上的码), 只靠断开的话, 这个上限就名存实亡了。
                 rotate_pin();
                 (void)ble_gap_terminate((uint16_t)atomic_load(&s_conn_handle),
                                         BLE_ERR_REM_USER_CONN_TERM);
@@ -710,8 +683,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         atomic_store(&s_conn_handle, event->connect.conn_handle);
         atomic_store(&s_connected, true);
         atomic_store(&s_paired, false);
-        // 这里既不换码也不重置尝试次数: 配对码是长期的(见 load_or_create_pin),
-        // 而"稳定的码 + 每次连接白送三次机会"等于可以把码慢慢试出来。
+        // 这里既不换码也不重置尝试次数: 码是本次开窗新生成的(见 rotate_pin), 重连
+        // 沿用屏幕上的同一个码; 但连接不白送次数 —— "稳定的码 + 每次连接白送三次"
+        // 等于可以把码慢慢试出来。
         {
             char pin[PET_SETTINGS_PIN_MAX];
             xSemaphoreTake(s_state_lock, portMAX_DELAY);
@@ -917,7 +891,7 @@ esp_err_t pet_provision_start(const pet_provision_sink_t *sink,
     s_pin[0] = '\0';
     s_rx_len = 0;
     s_running = true;
-    load_or_create_pin();   // 沿用上次存的码; 没有才新建(会落盘)
+    rotate_pin();   // 每次开配网页都换新码(见 rotate_pin 上的注释)
 
     ble_hs_cfg.reset_cb = on_reset;
     ble_hs_cfg.sync_cb = on_sync;

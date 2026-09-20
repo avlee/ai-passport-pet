@@ -76,8 +76,9 @@
 #define PET_PROVISION_WINDOW_MS 180000
 
 // 配对码连续错几次就断开这次连接, 并换一个新配对码重来。
-// 注意配对码本身是长期存 NVS 的(见 pet_settings_save_pin), 不随连接或开窗变动;
-// 只有用尽这个次数才会换 —— 所以这个上限是"稳定的码"得以安全的前提, 别调大。
+// 配对码本身每次开配网页都会重新生成并存 NVS(见 pet_provision.c 的 rotate_pin),
+// 所以一个码最多暴露一个窗口期; 这个上限是窗口期内的兜底 —— 试错耗尽会立刻换码,
+// 别调大。
 #define PET_PROVISION_MAX_ATTEMPTS 3
 
 // 收到 Wi-Fi 参数后最多等多久拿到 IP(毫秒)。超过就判定这次配网失败,

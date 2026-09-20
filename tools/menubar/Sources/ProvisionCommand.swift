@@ -129,7 +129,7 @@ enum ProvisionCommand {
     }
 
     /// --pin-file: 轮询文件直到出现 4 位数字码, 然后立刻配对。
-    /// 配对码长期存在设备 NVS 里, 设备重启也不会变, 但"读屏抄码"这件事没法用代码
+    /// 配对码每次开配网页都会重新生成(设备侧 2026-09-20 起), 但"读屏抄码"这件事没法用代码
     /// 代劳, 所以留这条路径: 由串口监听方把码写进文件, 这边以 200ms 的粒度取用。
     /// 整体超时与主等待循环共用同一个 options.timeout。
     private static func pairFromFile(_ options: Options,

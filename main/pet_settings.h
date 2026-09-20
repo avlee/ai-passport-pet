@@ -34,11 +34,8 @@ esp_err_t pet_settings_save(const pet_settings_t *in);
 // 顺手换掉会逼用户再跑到设备跟前抄一遍码。
 esp_err_t pet_settings_clear(void);
 
-// 配对码。存下来是为了让它**稳定**: 每连一次就换一个码, 用户每次都要对着设备
-// 屏幕重抄, 而配对码要防的只是"旁边别的机器顺手连上", 固定的一串四位数字就够用。
-//
-// 返回 false 表示还没存过(调用方生成一个再 save)或读失败。
-bool pet_settings_load_pin(char *out, size_t size);
+// 配对码。每次开配网页都会重新生成并覆盖存盘(换码逻辑在 pet_provision.c 的
+// rotate_pin, 这里只管存取); pet_settings_clear() 不动它, 见上。
 esp_err_t pet_settings_save_pin(const char *pin);
 
 // 这组参数是否已经"配过网"。SSID 为空、或仍等于 pet_config.h 里的占位符

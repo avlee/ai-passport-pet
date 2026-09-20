@@ -146,21 +146,6 @@ esp_err_t pet_settings_clear(void)
     return err;
 }
 
-bool pet_settings_load_pin(char *out, size_t size)
-{
-    if (out == NULL || size == 0) return false;
-    out[0] = '\0';
-
-    if (!ensure_nvs()) return false;
-
-    nvs_handle_t handle;
-    if (nvs_open(PET_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return false;
-
-    const bool ok = read_string(handle, KEY_PIN, out, size);
-    nvs_close(handle);
-    return ok && out[0] != '\0';
-}
-
 esp_err_t pet_settings_save_pin(const char *pin)
 {
     if (pin == NULL || pin[0] == '\0') return ESP_ERR_INVALID_ARG;
