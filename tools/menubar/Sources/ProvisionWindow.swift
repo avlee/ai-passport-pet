@@ -110,6 +110,11 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 540),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false)
+        // NSWindow 程序化创建时 isReleasedWhenClosed 默认是 true: 点红关闭钮 AppKit
+        // 会自己 release 一次, ARC 再 release 就是过度释放 —— 窗口死了而 `window` 属性
+        // 还悬着, 下一次点「配置 Wi-Fi」在 makeKeyAndOrderFront 上 SIGSEGV(2026-09-20
+        // 五份崩溃报告同一个栈)。设为 false 后生命周期完全交给 ARC, 关掉再开是复用。
+        window.isReleasedWhenClosed = false
         window.title = "配置 Wi-Fi — Codex 宠物"
         window.delegate = self
         window.center()
