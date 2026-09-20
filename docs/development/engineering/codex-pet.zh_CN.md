@@ -220,6 +220,8 @@ python3 tools/pet_bridge.py --list-sessions
 
 Codex 不把正文放在普通字段里：`AgentMessage` 的正文是内容块列表（`[{"type": "Text", "text": "..."}]`），报错是 `{"message": ..., "codex_error_info": ...}`。所有要变成气泡文字的 Codex 字段都走 `message_text()`：它把正文取出来，遇到不认识的结构就返回空串。它**刻意没有 `str()` 兜底** —— 把载荷序列化出去，正是那段 `[{'type': 'Text', ...}]` 顶掉进度文案、跑到宠物站台上的原因。
 
+同一条规矩也管**条目类型本身**。`item_completed` 覆盖的类型比桥接点名的多 —— `McpToolCall`、`WebSearch`、`Plan`、`ImageView`、`ContextCompaction`、`SubAgentActivity` 等，本机 62127 条 `item_completed` 里有 2423 条落在其中 —— 认不出的一律退到「工作中」。它曾经把类型名原样发出去，于是气泡在 `McpToolCall`、`ImageView` 这类 CamelCase 英文标识符之间跳：对看着中文站台的用户毫无意义，而且随 Codex 版本增删。气泡里要么是 Codex 真正产出的正文，要么是我们自己的状态文案，没有第三条路。
+
 ### 换宠物
 
 桥接启动时扫一遍 `~/.codex/pets`，把可用宠物的列表（`pets` 事件）随状态一起广播出去。
