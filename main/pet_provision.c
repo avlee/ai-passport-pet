@@ -952,8 +952,12 @@ esp_err_t pet_provision_stop(void)
         }
     }
 
-    s_sink_valid = false;
+    // 先把 OFF 发出去, 再作废 sink —— 顺序反了这条通知就永远送不到界面:
+    // set_state() 只在 sink 有效时才回调(main/pet_provision.c 的 set_state), 而
+    // pet_app 靠这条通知收起配网页、并放开"配网页期间不自动息屏"的限制。作废放在
+    // 后面照样能挡住 stop() 之后的杂散回调。
     set_state(PET_PROV_OFF, NULL);
+    s_sink_valid = false;
     return ESP_OK;
 }
 
