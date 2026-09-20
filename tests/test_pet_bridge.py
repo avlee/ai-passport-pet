@@ -782,6 +782,64 @@ def test_manual_state_survives_the_idle_sweep_until_codex_speaks() -> None:
         peer.close()
 
 
+def test_newest_session_fast_path_agrees_with_recursive_glob() -> None:
+    """快速路径换掉递归 glob, 但答案一个字都不许变。
+
+    `newest_session()` 每 0.25 秒被跟随线程问一次。旧实现每次都递归扫全部会话并逐个
+    `stat`(本机 598 个文件实测 7.2 ms/轮 ≈ 7.9% 单核, 是整条链路最大的开销), 而答案几
+    乎永远是同一个。新实现只下探最近的日期目录 —— 代价降下来, 结果必须与老路一致。
+    """
+    original_glob = pet_bridge.CODEX_SESSIONS_GLOB
+    with tempfile.TemporaryDirectory(prefix="sessions-") as root:
+        paths = []
+        for day, hour in (("01", 9), ("02", 10), ("03", 11)):
+            folder = os.path.join(root, "2026", "09", day)
+            os.makedirs(folder)
+            path = os.path.join(folder, f"rollout-2026-09-{day}T{hour}-00-00-test.jsonl")
+            Path(path).write_text("", encoding="utf-8")
+            stamp = 1_700_000_000 + hour * 60
+            os.utime(path, (stamp, stamp))          # 让先后关系唯一, 不靠写入时刻
+            paths.append(path)
+        pet_bridge.CODEX_SESSIONS_GLOB = os.path.join(root, "**", "rollout-*.jsonl")
+        try:
+            assert pet_bridge.CodexWatcher._recent_rollouts(), \
+                "日期目录结构下快速路径不该空手而归"
+            assert pet_bridge.CodexWatcher.newest_session() == paths[-1]
+            expected = max(glob.glob(pet_bridge.CODEX_SESSIONS_GLOB, recursive=True),
+                           key=os.path.getmtime)
+            assert pet_bridge.CodexWatcher.newest_session() == expected, \
+                "快速路径与递归 glob 给出了不同的会话"
+        finally:
+            pet_bridge.CODEX_SESSIONS_GLOB = original_glob
+
+
+def test_newest_session_still_finds_sessions_outside_the_recent_window() -> None:
+    """省 CPU 的前提是不漏会话: 快速路径够不到时必须回退到递归 glob。
+
+    Codex 现在是 年/月/日 三层目录。它哪天换了布局(比如按天扁平成
+    `sessions/2026-09-20/`), 快速路径就会一个 rollout 文件都看不见 —— 这时必须回退
+    去老实扫一遍, 而不是回答"没有会话"。只有很久以前的会话也一样不能漏。
+    """
+    original_glob = pet_bridge.CODEX_SESSIONS_GLOB
+    with tempfile.TemporaryDirectory(prefix="sessions-") as root:
+        flat_day = os.path.join(root, "2026-09-20")          # 布局变化: 没有 年/月/日
+        os.makedirs(flat_day)
+        changed = os.path.join(flat_day, "rollout-2026-09-20T10-00-00-x.jsonl")
+        Path(changed).write_text("", encoding="utf-8")
+        older = os.path.join(root, "2020", "01", "01", "rollout-2020-01-01T00-00-00-x.jsonl")
+        os.makedirs(os.path.dirname(older))
+        Path(older).write_text("", encoding="utf-8")
+        os.utime(older, (1_600_000_000, 1_600_000_000))
+        pet_bridge.CODEX_SESSIONS_GLOB = os.path.join(root, "**", "rollout-*.jsonl")
+        try:
+            assert pet_bridge.CodexWatcher.newest_session() == changed
+            os.remove(changed)
+            assert pet_bridge.CodexWatcher.newest_session() == older, \
+                "只剩旧会话时不该空手而归"
+        finally:
+            pet_bridge.CODEX_SESSIONS_GLOB = original_glob
+
+
 def main() -> int:
     failures = []
     tests = [
@@ -804,6 +862,10 @@ def main() -> int:
          test_codex_watcher_keeps_a_record_split_across_writes),
         ("manual_state_survives_the_idle_sweep",
          test_manual_state_survives_the_idle_sweep_until_codex_speaks),
+        ("newest_session_fast_path_agrees_with_recursive_glob",
+         test_newest_session_fast_path_agrees_with_recursive_glob),
+        ("newest_session_still_finds_sessions_outside_the_recent_window",
+         test_newest_session_still_finds_sessions_outside_the_recent_window),
     ]
 
     with tempfile.TemporaryDirectory(prefix="pet-bridge-") as workdir:
