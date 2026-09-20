@@ -804,11 +804,13 @@ class CodexWatcher(threading.Thread):
                 # 新的用户消息: 下一轮通常马上开始。
                 self._emit("working", "收到新指令")
             else:
-                # 认不出的条目类型: 只有确实是字符串才拿它当文案。这里原本是
-                # `str(itype or ...)` —— 与 message_text 同一条规矩, 结构体绝不
-                # str 上屏。
-                self._emit("working",
-                           itype if isinstance(itype, str) and itype else "工作中")
+                # 认不出的条目类型一律显示状态文案。这里曾先后是 `str(itype or …)`
+                # 与"itype 是字符串就用它" —— 后者把 `McpToolCall`、`ImageView`、
+                # `SubAgentActivity` 这些 **Codex 内部类型名**直接送到了屏上: 它们是
+                # CamelCase 英文标识符, 对着中文界面的用户没有任何意义, 而且随 Codex
+                # 版本增删。屏上要么是 Codex 真正产出的正文, 要么是我们自己的中文状态
+                # 文案, 没有第三条路。
+                self._emit("working", "工作中")
             return
 
         # 等用户确认 / 授权: 具体事件名随版本变化, 用关键词兜底匹配。

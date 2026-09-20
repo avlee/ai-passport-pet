@@ -609,9 +609,18 @@ def test_codex_records_map_to_pet_states() -> None:
         ({"type": "event_msg", "payload": {"type": "item_completed",
                                            "item": {"type": "UserMessage"}}},
          "working", "收到新指令"),
-        ({"type": "event_msg", "payload": {"type": "item_completed",
-                                           "item": {"type": "McpToolCall"}}},
-         "working", "McpToolCall"),
+        # 认不出的条目类型一律退到状态文案, 类型名绝不作为文案上屏。下面这组名字是
+        # 本机 598 个会话(62127 条 item_completed)里真实的全部落网取值, 共 2423 条;
+        # 末尾再编一个不存在的名字 —— 规矩是"认不出的类型都不显示类型名", 不是"把
+        # 已知的这几个名字特判掉"。
+        *[({"type": "event_msg", "payload": {"type": "item_completed",
+                                              "item": {"type": name}}},
+           "working", "工作中")
+          for name in ("McpToolCall", "WebSearch", "Plan", "ImageView",
+                       "ContextCompaction", "SubAgentActivity", "Extension",
+                       "CollabAgentToolCall", "DynamicToolCall",
+                       "EnteredReviewMode", "ExitedReviewMode",
+                       "SomeFutureItemType")],
         ({"type": "event_msg", "payload": {"type": "error", "error": "速率受限"}},
          "failed", "速率受限"),
         ({"type": "event_msg", "payload": {"type": "exec_approval_request"}},
