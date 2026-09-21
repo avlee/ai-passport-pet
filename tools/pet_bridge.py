@@ -50,6 +50,8 @@ Codex 会把每一轮对话写成 rollout JSONL: ~/.codex/sessions/YYYY/MM/DD/ro
     watch    是否跟随日志        enabled
     device   设备上报            kind(hello/poke), fw, pet
     battery  设备电量            soc(0..100, null 表示读不到)
+    limits   Codex 用量限额      primary(5 小时窗已用%), weekly(周窗已用%),
+                                 delivered; 没读到过快照时是 null
     pets     可选宠物列表        pets_dir, cache_dir, slot_bytes, packer, items[],
                                  busy, last
                                  packer.available 为假表示这台桥接缺 Pillow,
@@ -130,6 +132,16 @@ CODEX_SESSIONS_GLOB = os.path.expanduser("~/.codex/sessions/**/rollout-*.jsonl")
 CODEX_RECENT_MONTHS = 2
 CODEX_RECENT_DAYS = 5
 
+# Codex 用量限额(5 小时窗 / 周窗)。Codex 没有本地查询命令, 服务端随每个模型响应
+# 返回的限额快照会被写进 rollout 的 event_msg/token_count 记录 —— 那是唯一稳定的
+# 本机来源, 见 parse_rate_limits()。
+# 快照跟着"最近在用的会话"走, 所以除了从跟随流里现捞, 还要周期性回扫最近的文件。
+LIMITS_RESCAN_INTERVAL_S = 30.0
+# 每个文件最多往回看多少字节找最后一条 rate_limits。token_count 记录在几 KB 量级,
+# 256 KB 足够越过几十条普通事件; 再老的记录没有信息量, 交给更老的文件。
+LIMITS_TAIL_BYTES = 262144
+LIMITS_MAX_FILES = 6
+
 # 推送宠物包时的分片大小。只影响进度事件的密度(约 200 次一条 3 MB 的包)。
 PET_SEND_CHUNK = 16384
 
@@ -198,6 +210,10 @@ class DeviceLink:
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
         self._peer = ""
+        # 连接代数: 每次 attach 自增。消费方(限额补发)用它判断"是不是一条新连接",
+        # 而不是靠轮询时采样 connected 的跳变 —— 断开又连上若发生在两次轮询之间,
+        # 跳变会被错过, 代数不会。
+        self.generation = 0
         # 状态广播出口。默认没人接, 所以单测里直接 DeviceLink() 就行, 不必造 hub。
         self.on_event: Callable[[dict], None] | None = None
 
@@ -217,6 +233,7 @@ class DeviceLink:
         with self._lock:
             self._sock = sock
             self._peer = peer
+            self.generation += 1
         print(f"[link] 设备已连接: {peer}", flush=True)
         self._publish({"event": "link", "connected": True, "peer": peer})
 
@@ -270,6 +287,25 @@ class DeviceLink:
         ok = self.send({"type": "text", "text": squashed})
         # 单独一种事件名: 只换文字不该把最近一次的 state 从 snapshot 里顶掉。
         self._publish({"event": "text", "text": squashed, "delivered": ok})
+        return ok
+
+    def send_limits(self, primary_used: int | None,
+                    weekly_used: int | None) -> bool:
+        """把 Codex 用量限额推给设备。
+
+        两个百分比都是"已用", 设备自己换算成剩余量去画能量槽; None 表示这个窗口
+        没读到过快照, 字段整个不下发 —— 设备侧的语义是"缺哪个就藏哪个"。
+        """
+        payload: dict = {"type": "limits"}
+        if primary_used is not None:
+            payload["primary"] = primary_used
+        if weekly_used is not None:
+            payload["weekly"] = weekly_used
+        ok = self.send(payload)
+        print(f"[limits] 5h={primary_used}% 周={weekly_used}%"
+              f"{'' if ok else '  (设备未连接, 已丢弃)'}", flush=True)
+        self._publish({"event": "limits", "primary": primary_used,
+                       "weekly": weekly_used, "delivered": ok})
         return ok
 
     def send_pet(self, pet_id: str, package: bytes) -> bool:
@@ -624,6 +660,99 @@ def settle_pet_transfer(hub: ControlHub, installer: PetInstaller,
 # ---------------------------------------------------------------------------
 # Codex 会话日志跟随
 # ---------------------------------------------------------------------------
+def _window_used(window: object) -> int | None:
+    """取一个限额窗口的"已用百分比"(0..100)。形状不对返回 None。
+
+    `resets_at` 已过时按 0 报: 当前窗口已经翻页, 之后若有请求必然写出新快照,
+    还没有新快照就说明翻页后没再发过请求 —— 报旧值反而骗人。
+    """
+    if not isinstance(window, dict):
+        return None
+    value = window.get("used_percent")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    used = max(0, min(100, int(round(value))))
+    resets = window.get("resets_at")
+    if isinstance(resets, (int, float)) and resets <= time.time():
+        return 0
+    return used
+
+
+def parse_rate_limits(record: object) -> tuple[int | None, int | None] | None:
+    """从一条 rollout 记录里取 (5 小时窗已用%, 周窗已用%)。
+
+    快照长这样(event_msg/token_count 记录的一个字段):
+
+        "rate_limits": {"primary": {"used_percent": 98.0, "window_minutes": 300,
+                                    "resets_at": ...},
+                        "secondary": {"used_percent": 31.0, ...}, ...}
+
+    两个窗口都没有有效值时返回 None —— 那说明这不是一份限额快照。
+    """
+    if not isinstance(record, dict):
+        return None
+    payload = record.get("payload")
+    limits = payload.get("rate_limits") if isinstance(payload, dict) else None
+    if not isinstance(limits, dict):
+        return None
+    result = (_window_used(limits.get("primary")),
+              _window_used(limits.get("secondary")))
+    return result if result != (None, None) else None
+
+
+def _last_rate_limits_in_file(path: str,
+                              tail_bytes: int) -> tuple[int | None, int | None] | None:
+    """回看一个 rollout 文件的尾部, 取最后一条限额快照。没有返回 None。"""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            handle.seek(max(0, size - tail_bytes))
+            tail = handle.read()
+    except OSError:
+        return None
+    marker = tail.rfind(b'"rate_limits"')
+    if marker < 0:
+        return None
+    # 取出包含这条快照的完整记录(行), 残行宁可放弃也不要解析出半个 JSON。
+    start = tail.rfind(b"\n", 0, marker) + 1
+    end = tail.find(b"\n", marker)
+    if end < 0:
+        end = len(tail)
+    try:
+        record = json.loads(tail[start:end].decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return None
+    return parse_rate_limits(record)
+
+
+def codex_limits_snapshot(
+        max_files: int = LIMITS_MAX_FILES,
+        tail_bytes: int = LIMITS_TAIL_BYTES,
+) -> tuple[int | None, int | None] | None:
+    """在最近的 rollout 里从新到旧找第一份限额快照。
+
+    每个文件只回看 tail_bytes(见 LIMITS_TAIL_BYTES), 最多看 max_files 个 ——
+    限额快照天然跟着"最近在用的会话"走, 更老的文件里只有过期的旧值。
+    找不到(最近没跑过 Codex / 目录结构不符)返回 None, 调用方保留上一个快照。
+    """
+    try:
+        recent = CodexWatcher._recent_rollouts()
+    except OSError:
+        recent = []
+    candidates = [path for _, path in sorted(recent, reverse=True)]
+    if not candidates:
+        # 快速路径拿不到候选(几天没跑过 Codex): 回退到递归 glob, 与
+        # newest_session() 的取舍一致 —— 省 CPU 不能以漏掉数据为代价。
+        files = sorted(glob.glob(CODEX_SESSIONS_GLOB, recursive=True),
+                       key=os.path.getmtime, reverse=True)
+        candidates = files
+    for path in candidates[:max_files]:
+        found = _last_rate_limits_in_file(path, tail_bytes)
+        if found is not None:
+            return found
+    return None
+
+
 class CodexWatcher(threading.Thread):
     """跟随最新被改动的 rollout 文件, 把事件映射成宠物状态。"""
 
@@ -641,6 +770,14 @@ class CodexWatcher(threading.Thread):
         self.manual_until_event = False
         # 菜单栏可以临时停掉日志跟随(演示时只想手工切状态)。
         self.enabled = True
+        # Codex 用量限额: _limits 是最新已知快照, _limits_on_device 是设备已经
+        # 收到的那份。两者不等(包括断线期间发送失败)就要补发, 见 _flush_limits()。
+        self._limits: tuple[int | None, int | None] | None = None
+        self._limits_on_device: tuple[int | None, int | None] | None = None
+        self._limits_rescan_at = 0.0   # monotonic; 0 = 启动后立刻扫一次
+        # 链路代数: 上一次 _flush_limits() 看到的 DeviceLink.generation。-1 表示
+        # 还没看过任何连接。代数变了就是新连接, 设备手里的限额一律作废。
+        self._link_generation_seen = -1
 
     def _publish(self, event: dict) -> None:
         if self.on_event is not None:
@@ -777,6 +914,13 @@ class CodexWatcher(threading.Thread):
             self._emit("failed", message_text(payload["error"]))
             return
 
+        # 限额快照搭在 event_msg/token_count 记录上。它不是状态事件: 不改宠物
+        # 状态、不重置 idle 计时, 只更新限额缓存(推送由 _flush_limits 统一做)。
+        rate = parse_rate_limits(record)
+        if rate is not None:
+            self._update_limits(rate)
+            return
+
         if rtype == "event_msg" and ptype == "task_started":
             self._emit("working", "Codex 开始处理任务")
             return
@@ -875,6 +1019,53 @@ class CodexWatcher(threading.Thread):
         self._emit("idle", "")
         return True
 
+    def _update_limits(self, rate: tuple[int | None, int | None]) -> None:
+        """收到一份限额快照。值没变就不动 —— 广播和补发都以"变了"为准。"""
+        if rate == self._limits:
+            return
+        self._limits = rate
+        # 设备手里那份已经过时; 发送失败/断线时它连旧值都收不到, 统一由
+        # _flush_limits() 补齐。
+        self._limits_on_device = None
+        self._publish({"event": "limits", "primary": rate[0], "weekly": rate[1]})
+
+    def _flush_limits(self) -> None:
+        """把最新限额推给设备, 直到设备真的收到为止。
+
+        断线时 send_limits 返回 False, 下一拍(0.25 秒)会再试 —— 设备重连后第一
+        拍就能补上, 不需要专门的"重连补发"路径。没有快照时不发: 设备侧的语义是
+        "没收到过就隐藏能量槽"。
+        """
+        if self.link.generation != self._link_generation_seen:
+            # 新连接: 设备可能重启过(能量槽已清零), 也可能是断线后我们自己知道
+            # 没发出去(_limits_on_device 已是 None)。统一清位, 宁可多发一条
+            # 40 字节的小消息, 也不让重启后的设备拿着空槽假装没这功能。
+            self._link_generation_seen = self.link.generation
+            self._limits_on_device = None
+
+        if self._limits is None or self._limits == self._limits_on_device:
+            return
+        if self.link.send_limits(*self._limits):
+            self._limits_on_device = self._limits
+
+    def _rescan_limits(self) -> None:
+        """周期性回扫最近的 rollout, 找最新限额快照。
+
+        跟随流只在"当前会话有新记录"时更新限额; Codex 换了会话(旧会话 mtime 停在
+        几小时前)或者桥接启动时想先拿到一份, 都靠这条路径。
+        """
+        now = time.monotonic()
+        if now < self._limits_rescan_at:
+            return
+        self._limits_rescan_at = now + LIMITS_RESCAN_INTERVAL_S
+        try:
+            snapshot = codex_limits_snapshot()
+        except OSError as exc:
+            print(f"[limits] 回扫出错: {exc}", flush=True)
+            return
+        if snapshot is not None:
+            self._update_limits(snapshot)
+
     def run(self) -> None:
         while True:
             if not self.enabled:
@@ -890,6 +1081,8 @@ class CodexWatcher(threading.Thread):
 
                 self.read_new_records()
                 self.maybe_go_idle()
+                self._rescan_limits()
+                self._flush_limits()
             except OSError as exc:
                 print(f"[codex] 读日志出错: {exc}", flush=True)
             time.sleep(0.25)

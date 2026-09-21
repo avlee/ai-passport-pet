@@ -59,6 +59,15 @@ def device_parse(exe: str, raw: bytes) -> list[dict]:
     for line in proc.stdout.decode("utf-8").splitlines():
         if not line:
             continue
+        if line.startswith("limits "):
+            # 限额消息是纯数字字段, 挂具单独成行输出: limits <primary> <weekly>
+            _, primary, weekly = line.split(" ", 2)
+            messages.append({
+                "type": "limits",
+                "primary": int(primary),
+                "weekly": int(weekly),
+            })
+            continue
         mtype, has_state, state, has_text, text = line.split(" ", 4)
         messages.append({
             "type": mtype,
@@ -173,6 +182,30 @@ def test_ping_and_poke_roundtrip(exe: str) -> None:
     parsed = device_parse(exe, raw)
     assert [m["type"] for m in parsed] == ["ping", "text"], parsed
     assert parsed[1]["text"] == "只是换一句话", parsed
+
+
+def test_limits_roundtrip(exe: str) -> None:
+    """限额报文走完整链路: Bridge 发的字节必须被设备解析器读成同样的百分比。"""
+    local, peer = socket.socketpair()
+    try:
+        link = pet_bridge.DeviceLink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            link.attach(local, "test")
+            assert link.send_limits(98, 31)
+            # 缺哪个窗口就不发哪个字段; 两个都缺仍然是一条合法(但会被设备丢弃)的行。
+            assert link.send_limits(100, None)
+            assert link.send_limits(None, None)
+        raw = capture(peer)
+    finally:
+        local.close()
+        peer.close()
+
+    assert raw.count(b"\n") == 3, raw
+    parsed = device_parse(exe, raw)
+    # 第三行(两个窗口都没有)没有信息量, 设备侧整行丢弃。
+    assert [m["type"] for m in parsed] == ["limits", "limits"], parsed
+    assert parsed[0]["primary"] == 98 and parsed[0]["weekly"] == 31, parsed
+    assert parsed[1]["primary"] == 100 and parsed[1]["weekly"] == -1, parsed
 
 
 def test_send_without_device_is_safe() -> None:
@@ -929,6 +962,142 @@ def test_newest_session_still_finds_sessions_outside_the_recent_window() -> None
             pet_bridge.CODEX_SESSIONS_GLOB = original_glob
 
 
+def test_parse_rate_limits_shapes() -> None:
+    """rollout 记录里限额快照的形状契约, 逐个钉住。"""
+    now = time.time()
+
+    def record(primary: object, secondary: object) -> dict:
+        rate: dict = {}
+        if primary is not None:
+            rate["primary"] = primary
+        if secondary is not None:
+            rate["secondary"] = secondary
+        return {"type": "event_msg",
+                "payload": {"type": "token_count", "rate_limits": rate}}
+
+    window = {"used_percent": 98.0, "window_minutes": 300,
+              "resets_at": now + 100}
+    week = {"used_percent": 31.4, "window_minutes": 10080,
+            "resets_at": now + 1000}
+    assert pet_bridge.parse_rate_limits(record(window, week)) == (98, 31)
+    # 超上限钳到 100, 不是照单全收。
+    assert pet_bridge.parse_rate_limits(
+        record({**window, "used_percent": 150}, week)) == (100, 31)
+    # 只有一个窗口: 另一个是 None, 报文里就不带那个字段。
+    assert pet_bridge.parse_rate_limits(record(window, None)) == (98, None)
+    # 窗口已翻页(resets_at 已过): 用量按 0 报 —— 有新请求必有新快照, 没有就是没用。
+    assert pet_bridge.parse_rate_limits(
+        record({**window, "resets_at": now - 1}, week)) == (0, 31)
+    # 形状不对: used_percent 缺失/类型不对 → 该窗口 None; 全都没有 → 整条 None。
+    assert pet_bridge.parse_rate_limits(
+        record({"window_minutes": 300}, {"used_percent": True})) is None
+    assert pet_bridge.parse_rate_limits(
+        record(window, {"used_percent": True})) == (98, None)
+    assert pet_bridge.parse_rate_limits({"payload": {}}) is None
+    assert pet_bridge.parse_rate_limits({"payload": {"rate_limits": 3}}) is None
+    assert pet_bridge.parse_rate_limits(None) is None
+    assert pet_bridge.parse_rate_limits("text") is None
+
+
+def test_limits_flow_from_record_to_device() -> None:
+    """限额: 记录 → 缓存 → 设备报文, 以及断线期间压住、重连后补发。"""
+    record = {"type": "event_msg", "payload": {"type": "token_count",
+              "rate_limits": {"primary": {"used_percent": 98.0,
+                                          "window_minutes": 300,
+                                          "resets_at": time.time() + 100},
+                              "secondary": {"used_percent": 31.0,
+                                            "window_minutes": 10080,
+                                            "resets_at": time.time() + 1000}}}}
+    link = pet_bridge.DeviceLink()
+    watcher = pet_bridge.CodexWatcher(link, 45.0)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        watcher._handle_record(record)
+    assert watcher._limits == (98, 31), watcher._limits
+
+    # 设备没连上: 报文发不出去, 缓存留着 —— 重连后第一拍补上。
+    with contextlib.redirect_stdout(io.StringIO()):
+        watcher._flush_limits()
+    assert watcher._limits_on_device is None
+
+    local, peer = socket.socketpair()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            link.attach(local, "test")
+            watcher._flush_limits()
+        wire = json.loads(capture(peer).decode("utf-8").strip())
+        assert wire == {"type": "limits", "primary": 98, "weekly": 31}, wire
+        assert watcher._limits_on_device == (98, 31)
+
+        # 同样的快照再来一遍(值没变): 不打扰设备, 也不顶掉控制通道里的旧值。
+        with contextlib.redirect_stdout(io.StringIO()):
+            watcher._handle_record(record)
+            watcher._flush_limits()
+        assert capture(peer) == b"", "值没变不该重发"
+
+        # 设备重启(旧连接断掉、开一条新连接): 设备侧 UI 已清零, 就算值没变也
+        # 要补发一次。detach 会关掉旧 socketpair 的本端, 所以重启后要换新的。
+        with contextlib.redirect_stdout(io.StringIO()):
+            link.detach()
+            capture(peer)                      # 排干旧连接残余
+        local2, peer2 = socket.socketpair()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                link.attach(local2, "test-reboot")
+                watcher._flush_limits()
+            wire = json.loads(capture(peer2).decode("utf-8").strip())
+            assert wire == {"type": "limits", "primary": 98, "weekly": 31}, wire
+            assert watcher._limits_on_device == (98, 31)
+        finally:
+            local2.close()
+            peer2.close()
+    finally:
+        local.close()
+        peer.close()
+
+
+def test_codex_limits_snapshot_scans_recent_files() -> None:
+    """回扫按 mtime 从新到旧找第一份限额快照, 每个文件只回看尾部。"""
+    original_glob = pet_bridge.CODEX_SESSIONS_GLOB
+    with tempfile.TemporaryDirectory(prefix="sessions-") as root:
+        folder = os.path.join(root, "2026", "09", "21")
+        os.makedirs(folder)
+
+        def rate_line(primary: float, weekly: float, resets: int) -> str:
+            payload = {"type": "token_count", "rate_limits": {
+                "primary": {"used_percent": primary, "window_minutes": 300,
+                            "resets_at": resets},
+                "secondary": {"used_percent": weekly, "window_minutes": 10080,
+                              "resets_at": resets + 1000}}}
+            return json.dumps({"timestamp": "t", "type": "event_msg",
+                               "payload": payload}, ensure_ascii=False)
+
+        fresh = os.path.join(folder, "rollout-2026-09-21T10-00-00-a.jsonl")
+        # 新文件里**没有**快照: 只有填充事件, 回扫必须跳过它继续往前找。
+        Path(fresh).write_text(
+            json.dumps({"type": "event_msg",
+                        "payload": {"type": "task_started"}}) + "\n" * 40,
+            encoding="utf-8")
+        older = os.path.join(folder, "rollout-2026-09-21T09-00-00-b.jsonl")
+        # 旧文件里塞 1000 行噪声再放快照: 快照在文件后段, 尾部回看必须够得着。
+        noise = json.dumps({"type": "turn_context"}) + "\n"
+        Path(older).write_text(
+            noise * 1000 + rate_line(41.0, 7.0, int(time.time()) + 100) + "\n",
+            encoding="utf-8")
+        stamp_a = 1_700_000_100
+        stamp_b = 1_700_000_000
+        os.utime(fresh, (stamp_a, stamp_a))
+        os.utime(older, (stamp_b, stamp_b))
+
+        pet_bridge.CODEX_SESSIONS_GLOB = os.path.join(root, "**", "rollout-*.jsonl")
+        try:
+            assert pet_bridge.codex_limits_snapshot() == (41, 7)
+            # 尾部窗口卡死到快照之前: 找不到就该返回 None, 而不是猜。
+            assert pet_bridge.codex_limits_snapshot(tail_bytes=16) is None
+        finally:
+            pet_bridge.CODEX_SESSIONS_GLOB = original_glob
+
+
 def main() -> int:
     failures = []
     tests = [
@@ -959,6 +1128,11 @@ def main() -> int:
          test_newest_session_fast_path_agrees_with_recursive_glob),
         ("newest_session_still_finds_sessions_outside_the_recent_window",
          test_newest_session_still_finds_sessions_outside_the_recent_window),
+        ("parse_rate_limits_shapes", test_parse_rate_limits_shapes),
+        ("limits_flow_from_record_to_device",
+         test_limits_flow_from_record_to_device),
+        ("codex_limits_snapshot_scans_recent_files",
+         test_codex_limits_snapshot_scans_recent_files),
     ]
 
     with tempfile.TemporaryDirectory(prefix="pet-bridge-") as workdir:
@@ -967,6 +1141,8 @@ def main() -> int:
                       lambda: test_wire_format_and_device_roundtrip(exe)))
         tests.append(("ping_and_text_device_roundtrip",
                       lambda: test_ping_and_poke_roundtrip(exe)))
+        tests.append(("limits_device_roundtrip",
+                      lambda: test_limits_roundtrip(exe)))
 
         for name, test in tests:
             try:
