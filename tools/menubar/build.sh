@@ -113,6 +113,12 @@ bridge_dir="$app_dir/Contents/Resources/bridge"
 mkdir -p "$bridge_dir"
 cp "$repo_root/tools/pet_bridge.py" "$repo_root/tools/gen_pet_package.py" "$bridge_dir/"
 
+# 菜单栏图标: Assets/ 下 1x/2x 两档由同目录的 CodexPetBridge.png 派生(裁透明边、
+# 阈值 64 过滤隐形像素、补方形 + 6% 边距、18/36px)。源图只留档, 运行时只用这两张;
+# 换图标时用 tools 里的 Pillow 流程重新派生, 不要手动改这两张小图。
+cp "$here/Assets/menu-icon.png" "$here/Assets/menu-icon@2x.png" \
+    "$app_dir/Contents/Resources/"
+
 # 本地构建的应用没有开发者证书; ad-hoc 签名足够让它正常运行(尤其是 Apple Silicon
 # 要求可执行文件必须有签名)。
 if ! codesign --force --sign - "$app_dir" >/dev/null 2>&1; then

@@ -318,21 +318,16 @@ final class StatusMenuController: NSObject {
     }
 
     private func updateIcon(for snapshot: BridgeSnapshot) {
-        let name: String
-        if !snapshot.deviceConnected {
-            name = "pawprint"
-        } else {
-            switch snapshot.codexState {
-            case "working": name = "gearshape.2.fill"
-            case "waiting": name = "exclamationmark.bubble.fill"
-            case "ready": name = "checkmark.circle.fill"
-            case "failed": name = "xmark.octagon.fill"
-            default: name = "pawprint.fill"
-            }
-        }
-
-        if let image = NSImage(systemSymbolName: name,
-                               accessibilityDescription: "Codex 宠物") {
+        // 菜单栏图标 = 包内 Resources 的设备图(1x/2x 两档, 见 build.sh 的来源注释)。
+        // 彩色图不做 template: 深浅色菜单栏都用原色, 像素笑脸就是它的辨识度。
+        if let icon = NSImage(named: "menu-icon") {
+            icon.size = NSSize(width: 18, height: 18)
+            icon.isTemplate = false
+            statusItem.button?.image = icon
+            statusItem.button?.title = ""
+        } else if let image = NSImage(systemSymbolName: "pawprint.fill",
+                                      accessibilityDescription: "Codex 宠物") {
+            // 包内缺图才走这里, 正常构建不会到。保留原来的状态符号当兜底。
             image.isTemplate = true
             statusItem.button?.image = image
             statusItem.button?.title = ""
