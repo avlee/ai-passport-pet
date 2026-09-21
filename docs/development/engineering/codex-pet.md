@@ -149,6 +149,7 @@ Mac → device:
 {"type":"state","state":"working","text":"refactoring the login module"}
 {"type":"text","text":"update the text only, leave the state alone"}
 {"type":"ping"}
+{"type":"limits","primary":98,"weekly":31}
 {"type":"pet","id":"sophie-portrait","size":2551684,"crc32":2181165281}
 ```
 
@@ -165,6 +166,17 @@ Device → Mac:
 `battery` is sent whenever the level changes, with `soc` set to `null` when it cannot be read. After a reconnect the last known value is re-sent right after `hello`; otherwise the menu bar would show nothing until the next poll (up to 5 seconds).
 
 `pet` is the one message that is **followed by raw bytes**: the `size` bytes after the announcement line are the `.pet` package itself (not base64 — that would cost another 33%), and the device is in "binary mode" for the duration, counting bytes instead of parsing lines. The bridge therefore holds its send lock for the whole transfer: any JSON slipped in would land inside the payload and misalign the package from then on. The device answers with `petdone` — **until then the package has only been sent, not installed** — and `ok` false means the slot is empty.
+
+### Usage limits (`limits`)
+
+Codex has no local command to query subscription usage, but every server response carries a rate-limit snapshot, and Codex writes those snapshots into its session rollouts (`event_msg/token_count` records). The bridge reads them and forwards `{"type":"limits","primary":<0-100>,"weekly":<0-100>}` — the **used** percentage of the 5-hour window (`primary`, 300 minutes) and the weekly window (`secondary`, 10080 minutes). A window without a usable snapshot is omitted from the message; a line with no window at all is dropped by the parser.
+
+Staleness is handled on both sides:
+
+- The bridge re-scans the most recent rollouts every 30 seconds and treats an expired `resets_at` as 0% used — the window has rolled over, and any request after that would have produced a newer snapshot.
+- The device hides a window that has no value and hides both gauges while the link is offline (a stale gauge would be a lie). Values are cached, so a rebuild (demo menu, pet swap) restores them, and the bridge re-sends after a device reconnect.
+
+On screen the two windows are vertical gauges hugging the left (`5h`) and right (`7d`) screen edges, filled bottom-up by **remaining** percentage and color-graded green/yellow/red as remaining drops below 50%/20%. `tools/preview_pet_screen.py --limits 98/31` renders them without a device.
 
 Parsing is **bounded and forgiving**: a per-line limit of `PET_PROTOCOL_LINE_MAX` (512 bytes) and a text-field limit of `PET_PROTOCOL_TEXT_MAX` (192 bytes), overlong lines are dropped and resynchronised at the next newline, unknown fields are ignored, and UTF-8 is only truncated on character boundaries. The device is the TCP client and the Mac is the server, so the device never needs to accept inbound connections and does not depend on mDNS discovery.
 
