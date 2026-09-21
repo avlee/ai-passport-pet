@@ -135,6 +135,65 @@ static void test_touch_and_hold_keep_the_clock_monotonic(void)
     assert(pet_screen_update(&screen, 50 + IDLE_US, IDLE_US));
 }
 
+static void test_user_lock_darkens_and_ignores_activity(void)
+{
+    // 双击确定息屏: 锁定立刻黑, 之后消息/链路恢复(touch)再吵也不亮。
+    pet_screen_t screen;
+    pet_screen_init(&screen, 0);
+    assert(pet_screen_is_locked(&screen) == false);
+
+    pet_screen_set_user_lock(&screen, true, 1);
+    assert(pet_screen_is_locked(&screen));
+    assert(!pet_screen_is_on(&screen));
+    assert(pet_screen_backlight(&screen, false) == 0);
+
+    pet_screen_touch(&screen, 2);
+    assert(!pet_screen_is_on(&screen));
+
+    // 锁定期间的空闲超时也不会"再变一次"(本来就黑着), 背光不会出错。
+    assert(!pet_screen_update(&screen, IDLE_US * 10, IDLE_US));
+    assert(pet_screen_backlight(&screen, true) == 0);
+}
+
+static void test_user_lock_mutes_hold_but_uninterrupted_keys_unlock(void)
+{
+    // 锁定后 hold 只记账不亮屏(防御: 正常流程按键先解锁); 解锁亮屏并重置
+    // 空闲计时 —— 否则锁了很久之后一解锁就被 update() 当场判成超时。
+    pet_screen_t screen;
+    pet_screen_init(&screen, 0);
+    pet_screen_set_user_lock(&screen, true, 1);
+
+    pet_screen_set_hold(&screen, true, 2);
+    assert(!pet_screen_is_on(&screen));
+
+    const int64_t unlock_at = IDLE_US * 100;
+    pet_screen_set_user_lock(&screen, false, unlock_at);
+    assert(!pet_screen_is_locked(&screen));
+    assert(pet_screen_is_on(&screen));
+
+    // 解锁把空闲计时从这一刻重算; 释放 hold 也一样 —— 计时基准不许再回到
+    // 锁定期/hold 期的旧时刻, 否则一解锁就"看一眼就黑"。
+    pet_screen_set_hold(&screen, false, unlock_at + 1);
+    assert(pet_screen_is_on(&screen));
+    assert(!pet_screen_update(&screen, unlock_at + 1 + IDLE_US - 1, IDLE_US));
+    assert(pet_screen_update(&screen, unlock_at + 1 + IDLE_US, IDLE_US));
+}
+
+static void test_relocking_and_unlocking_is_idempotent(void)
+{
+    // 重复设同一个状态不该有任何副作用(比如把空闲计时抹掉)。
+    pet_screen_t screen;
+    pet_screen_init(&screen, 0);
+    pet_screen_set_user_lock(&screen, true, 1);
+    pet_screen_set_user_lock(&screen, true, 2);
+    assert(!pet_screen_is_on(&screen));
+
+    pet_screen_set_user_lock(&screen, false, 10);
+    pet_screen_set_user_lock(&screen, false, 20);
+    assert(pet_screen_is_on(&screen));
+    assert(screen.last_activity_us == 10);
+}
+
 int main(void)
 {
     test_boot_is_lit_and_goes_dark_at_the_deadline();
@@ -147,5 +206,8 @@ int main(void)
     test_backlight_follows_link_state();
     test_zero_timeout_disables_the_auto_off();
     test_touch_and_hold_keep_the_clock_monotonic();
+    test_user_lock_darkens_and_ignores_activity();
+    test_user_lock_mutes_hold_but_uninterrupted_keys_unlock();
+    test_relocking_and_unlocking_is_idempotent();
     return 0;
 }

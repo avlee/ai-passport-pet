@@ -45,6 +45,7 @@
 #define PET_STR_INFO_UNKNOWN       "未知"
 #define PET_STR_INFO_HINT_CLOSE    "长按确定键关闭"
 #define PET_STR_INFO_HINT_DEMO     "长按上键进入演示菜单"
+#define PET_STR_INFO_HINT_DIM      "双击确定息屏"
 
 // 睡眠标记, 使用拉丁字母, 走 fallback 字体。
 #define PET_STR_SLEEP_MARK         "Zzz"
@@ -117,6 +118,7 @@
     X(info_unknown,      PET_STR_INFO_UNKNOWN,      16)        \
     X(info_hint_close,   PET_STR_INFO_HINT_CLOSE,   16)        \
     X(info_hint_demo,    PET_STR_INFO_HINT_DEMO,    16)        \
+    X(info_hint_dim,     PET_STR_INFO_HINT_DIM,     16)        \
     X(sleep_mark,        PET_STR_SLEEP_MARK,        16)        \
     X(limit_primary,     PET_STR_LIMIT_PRIMARY,     16)        \
     X(limit_weekly,      PET_STR_LIMIT_WEEKLY,      16)        \

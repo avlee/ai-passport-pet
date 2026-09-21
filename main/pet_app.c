@@ -135,6 +135,13 @@ static void screen_hold(bool hold)
     apply_screen();
 }
 
+// 用户锁定(双击确定息屏)。锁定后消息再吵也不亮屏, 任意键解锁。
+static void screen_set_user_lock(bool lock)
+{
+    pet_screen_set_user_lock(&s_screen, lock, esp_timer_get_time());
+    apply_screen();
+}
+
 // 一秒一拍。息屏判定的精度远用不到更细, 而每秒一次唤醒的代价可以忽略。
 static void screen_tick(void *arg)
 {
@@ -576,6 +583,13 @@ static void run_demo_menu(void)
 
 static void handle_input(const app_input_t *in)
 {
+    // 锁定期(双击确定息屏)任何按键先解锁亮屏。动作照常执行 —— 和下面"任何按键
+    // 都先亮屏"是同一条约定: 手里先有的是手指, 这一下必须立刻看到反应。
+    if (pet_screen_is_locked(&s_screen)) {
+        ESP_LOGI(TAG, "按键解锁");
+        screen_set_user_lock(false);
+    }
+
     // 任何按键都先亮屏并重置空闲计时: 屏幕黑着的时候, 用户手里先有的是手指, 这一下
     // 必须立刻看到反应。按键动作本身照常执行 —— 上/下/确定都是本机的小动画或面板
     // 开关, 顺手做掉比"先按一下唤醒、动作没了"更好解释。
@@ -609,7 +623,20 @@ static void handle_input(const app_input_t *in)
 
     // 配网页是不透明的, 盖住了整个画面: 此刻其余按键都看不到效果, 直接忽略。
     // 否则会留下"关掉配网页之后信息面板莫名其妙开着"这类状态。
+    // 配网页也不能被锁定(配对码必须看得见), 走到这里就顺带拦掉了。
     if (pet_provision_active()) return;
+
+    // 双击确定 = 手动锁定息屏。锁定的价值恰恰是"再来消息也不亮": 挂机、半夜
+    // 推送都压得住, 按任意键才回来。bsp 的双击在两次 CLICK 之后到达, 前两下
+    // 戳出的互动动画已经播了, 无伤大雅。
+    if (in->event == BSP_BTN_DOUBLE) {
+        if (in->btn == BSP_BTN_OK) {
+            ESP_LOGI(TAG, "双击确定: 手动锁定息屏");
+            pet_ui_set_info_visible(false);
+            screen_set_user_lock(true);
+        }
+        return;
+    }
 
     if (in->event != BSP_BTN_CLICK) return;
 
@@ -732,7 +759,7 @@ esp_err_t pet_app_start(void)
         open_provision_window();
     }
 
-    ESP_LOGI(TAG, "就绪。上/下=互动, 确定=戳一下, 长按确定=信息, "
+    ESP_LOGI(TAG, "就绪。上/下=互动, 确定=戳一下, 长按确定=信息, 双击确定=息屏锁定, "
                   "长按上=演示菜单, 长按下=蓝牙配网");
     return ESP_OK;
 }

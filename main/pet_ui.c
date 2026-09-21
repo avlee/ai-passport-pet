@@ -771,6 +771,13 @@ static void build_info(void)
         lv_obj_set_pos(s_info_value[i], INFO_W - 14 - 120, 48 + i * 24);
     }
 
+    // 三条 hint(-44/-26/-8, 间距 18)。16px 字库的字形只占行框 [top+7, top+16],
+    // 逐条算: 数据区末行字形底 = 48+5*24+16 = 184; hint_dim 字形 [191,200];
+    // hint_close [209,218]; hint_demo [227,236] —— 相邻都不碰。改动前先重算。
+    lv_obj_t *hint_dim = make_label(s_info_panel, PET_STR_INFO_HINT_DIM,
+                                    pet_font_body(), COL_MUTED);
+    lv_obj_align(hint_dim, LV_ALIGN_BOTTOM_MID, 0, -44);
+
     lv_obj_t *hint_close = make_label(s_info_panel, PET_STR_INFO_HINT_CLOSE,
                                       pet_font_body(), COL_MUTED);
     lv_obj_align(hint_close, LV_ALIGN_BOTTOM_MID, 0, -26);

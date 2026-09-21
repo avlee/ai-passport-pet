@@ -25,18 +25,27 @@ typedef struct {
     pet_screen_state_t state;
     int64_t            last_activity_us;  // 最后一次"有新内容"的时刻
     bool               hold;              // true = 有必须看得见的画面, 不自动息屏
+    bool               user_lock;         // true = 用户手动锁定, 亮屏只听按键的
 } pet_screen_t;
 
 // 开机: 亮屏, 从现在起算空闲。
 void pet_screen_init(pet_screen_t *screen, int64_t now_us);
 
 // 有新内容了(收到 Bridge 消息 / 按下按键 / 链路恢复): 亮屏并重新计时。
+// 用户锁定期间是空操作 —— 锁定的本意就是"有消息也不亮屏"。
 void pet_screen_touch(pet_screen_t *screen, int64_t now_us);
 
 // 持有/释放"必须看得见"的窗口(蓝牙配网页、宠物接收页、演示菜单)。
 // 开始持有会立刻亮屏。开始与结束**都**算一次活动: 结束那一刻屏幕上刚换成新画面,
-// 不能拿旧的空闲时刻把它当场关掉。
+// 不能拿旧的空闲时刻把它当场关掉。锁定期间不亮屏(hold 照常记录)。
 void pet_screen_set_hold(pet_screen_t *screen, bool hold, int64_t now_us);
+
+// 用户锁定/解锁(双击确定息屏, 任意键解锁)。锁定立刻息屏; 之后 touch()/set_hold()
+// 都不再亮屏, 只有解锁会亮 —— 解锁本身就是一次 touch(重置空闲计时)。
+// 调用侧负责保证锁定不发生在 hold 窗口(配网页的配对码必须看得见)。
+void pet_screen_set_user_lock(pet_screen_t *screen, bool lock, int64_t now_us);
+
+bool pet_screen_is_locked(const pet_screen_t *screen);
 
 // 到点查一次。idle_timeout_us <= 0 表示不自动息屏。
 // 返回 true 表示状态**刚刚**变成息屏 —— 亮起来是 touch()/set_hold() 当场做的,

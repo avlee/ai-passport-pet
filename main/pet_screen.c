@@ -8,10 +8,13 @@ void pet_screen_init(pet_screen_t *screen, int64_t now_us)
     screen->state = PET_SCREEN_ON;
     screen->last_activity_us = now_us;
     screen->hold = false;
+    screen->user_lock = false;
 }
 
 void pet_screen_touch(pet_screen_t *screen, int64_t now_us)
 {
+    // 锁定期 touch 是空操作: 消息、链路恢复都不许把屏点亮, 这是锁定的本意。
+    if (screen->user_lock) return;
     screen->last_activity_us = now_us;
     screen->state = PET_SCREEN_ON;
 }
@@ -20,13 +23,35 @@ void pet_screen_set_hold(pet_screen_t *screen, bool hold, int64_t now_us)
 {
     screen->hold = hold;
     screen->last_activity_us = now_us;
-    if (hold) screen->state = PET_SCREEN_ON;
+    // 锁定期 hold 只记账不亮屏。调用侧的正常流程不会在锁定时进 hold 窗口
+    // (进窗口靠按键, 按键先解锁), 这里是防御。
+    if (hold && !screen->user_lock) screen->state = PET_SCREEN_ON;
+}
+
+void pet_screen_set_user_lock(pet_screen_t *screen, bool lock, int64_t now_us)
+{
+    if (screen->user_lock == lock) return;
+    screen->user_lock = lock;
+    if (lock) {
+        screen->state = PET_SCREEN_OFF;
+    } else {
+        // 解锁即 touch: 亮屏, 并把空闲计时从这一刻重算 —— 否则锁了很久之后
+        // 一解锁就被 update() 当场判成"超时", 看一眼就黑。
+        screen->last_activity_us = now_us;
+        screen->state = PET_SCREEN_ON;
+    }
+}
+
+bool pet_screen_is_locked(const pet_screen_t *screen)
+{
+    return screen->user_lock;
 }
 
 bool pet_screen_update(pet_screen_t *screen, int64_t now_us,
                        int64_t idle_timeout_us)
 {
     if (screen->state != PET_SCREEN_ON) return false;
+    if (screen->user_lock) return false;
     if (screen->hold) return false;
     if (idle_timeout_us <= 0) return false;
     if (now_us - screen->last_activity_us < idle_timeout_us) return false;
