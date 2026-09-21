@@ -616,7 +616,10 @@ static void handle_input(const app_input_t *in)
             return;
         }
         if (in->btn == BSP_BTN_OK && !pet_provision_active()) {
-            pet_ui_set_info_visible(true);
+            // 开关, 不是"只开不关": 屏幕上的提示写着"长按确定键关闭", 这里若
+            // 无条件 set true, 面板开着时长按就是无操作 —— 提示成了假话。和
+            // "长按下键开关配网页"保持同一个模式。
+            pet_ui_set_info_visible(!pet_ui_info_visible());
         }
         return;
     }
