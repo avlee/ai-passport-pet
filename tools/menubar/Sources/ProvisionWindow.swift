@@ -12,41 +12,66 @@ import AppKit
 
 /// 本机网络信息。都通过系统工具/内核查询, 不引入第三方库。
 enum NetworkInfo {
-    /// 本机的局域网地址。用一个不会真的发出去的 UDP connect 问内核要出口地址 ——
-    /// 与 tools/pet_bridge.py 里的做法一致, 不需要遍历网卡。
+    /// 本机的局域网地址。
+    ///
+    /// 早期实现是「UDP connect 到 192.168.1.1 问内核要出口地址」(与 pet_bridge.py
+    /// 一致): 简单, 但有两个坑 —— 装 VPN 时 192.168.1.1 从虚拟网卡走, 拿回来的是
+    /// 设备根本连不通的 VPN 地址; 没有 IPv4 默认路由时 connect 直接失败。改成枚举
+    /// 网卡: 只在 UP 且 RUNNING 的实体网卡里选, 优先 en0(Wi-Fi/网线), 跳过
+    /// utun/awdl 等虚拟接口和 169.254 链路本地地址 —— 设备要连的是 Mac 所在的
+    /// 局域网, 只有从实体网卡上取才是对的。
     static func localIPv4() -> String? {
-        let socketFD = socket(AF_INET, SOCK_DGRAM, 0)
-        guard socketFD >= 0 else { return nil }
-        defer { close(socketFD) }
+        var candidates: [(name: String, ip: String)] = []
 
-        var address = sockaddr_in()
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = in_port_t(1).bigEndian
-        address.sin_addr.s_addr = inet_addr("192.168.1.1")
+        var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddrPtr) == 0, let first = ifaddrPtr else { return nil }
+        defer { freeifaddrs(first) }
 
-        let result = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(socketFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = cursor {
+            cursor = entry.pointee.ifa_next
+
+            guard let addr = entry.pointee.ifa_addr,
+                  addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+
+            let flags = Int32(entry.pointee.ifa_flags)
+            guard flags & IFF_UP != 0, flags & IFF_RUNNING != 0,
+                  flags & IFF_LOOPBACK == 0 else { continue }
+
+            let name = String(cString: entry.pointee.ifa_name)
+            // 这些都是虚拟/辅助接口: VPN(utun/tap/tun/gif/stf)、AirDrop 与侧信道
+            // (awdl/llw)、热点共享(ap/bridge)、虚拟机(docker/VMware 的 bridge 与
+            // vmnet 系列)、Apple 网络处理器(anpi)。设备永远不需要连这些地址。
+            let virtual = ["utun", "awdl", "llw", "bridge", "ipsec", "stf",
+                           "gif", "tap", "tun", "vlan", "vmnet", "vmenet",
+                           "anpi", "ap"]
+            if virtual.contains(where: name.hasPrefix) { continue }
+
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            // NI_NUMERICHOST: 只做数字转换, 不发起任何 DNS 查询。
+            guard getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host,
+                              socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0
+            else { continue }
+
+            let ip = String(cString: host)
+            // 169.254.x.x 是没拿到 DHCP 时的自分配地址, 拿它配网必然失败。
+            if ip.isEmpty || ip.hasPrefix("169.254.") { continue }
+            candidates.append((name, ip))
         }
-        guard result == 0 else { return nil }
 
-        var local = sockaddr_in()
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let ok = withUnsafeMutablePointer(to: &local) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                getsockname(socketFD, $0, &length)
-            }
-        }
-        guard ok == 0 else { return nil }
+        guard !candidates.isEmpty else { return nil }
 
-        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-        var raw = local.sin_addr
-        guard inet_ntop(AF_INET, &raw, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {
-            return nil
+        func rank(_ name: String) -> Int {
+            if name == "en0" { return 0 }
+            if name.hasPrefix("en") { return 1 }
+            return 2
         }
-        let text = String(cString: buffer)
-        return text == "0.0.0.0" ? nil : text
+        // 排序保证结果确定: 同为 en 按名字排(en0 在 en1 前), 不依赖枚举顺序。
+        let best = candidates.min { a, b in
+            let (ra, rb) = (rank(a.name), rank(b.name))
+            return ra != rb ? ra < rb : a.name < b.name
+        }
+        return best?.ip
     }
 
     /// 当前连着的 Wi-Fi 名字。走 networksetup, 走的不是 Wi-Fi 或者没权限时会失败,
@@ -142,8 +167,23 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
         // macOS 会把焦点还给之前的前台应用, 靠抢焦点修不了, 只能让窗口自己站得住。
         window?.level = .floating
         window?.makeKeyAndOrderFront(nil)
+        // 窗口是复用的, buildWindow 里那次预填只在第一次生效: 之后换了网络或
+        // DHCP 换了地址, 旧 IP 会一直留在框里发给设备, 设备自然连不上。所以
+        // 每次露面都重新取一次(见 refreshHostField 的注释)。
+        refreshHostField()
         refreshSavedNetworks()
         beginScan()
+    }
+
+    /// 重新探测本机地址并填进「配对端」。取得到就覆盖 —— 手动改这一栏的场景只
+    /// 应该发生在自动探测失败时, 覆盖是安全的; 取不到就保留现有内容, 让用户
+    /// 自己填, 并在日志里说清楚为什么框是空的。
+    private func refreshHostField() {
+        if let ip = NetworkInfo.localIPv4() {
+            hostField.stringValue = ip
+        } else if hostField.stringValue.isEmpty {
+            append("⚠︎ 没能自动取到本机局域网地址, 请手动填写「配对端」一栏")
+        }
     }
 
     // MARK: - 窗口
@@ -371,6 +411,12 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
         }
         guard !ssidField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty else {
             append("⚠︎ 网络名称不能为空")
+            return
+        }
+        // 配对成功后会自动把「配对端」一起下发, 与其让设备拿着空地址白等几秒
+        // 再报 connect failed, 不如在这里就拦下来把话说清楚。
+        guard !hostField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty else {
+            append("⚠︎ 配对端地址不能为空(应为这台 Mac 的局域网 IP)")
             return
         }
         guard let port = Int(portField.stringValue), port > 0, port < 65536 else {
