@@ -401,17 +401,25 @@ final class StatusMenuController: NSObject {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "发送气泡文字"
-        alert.informativeText = "只改设备上的一句话, 不改变当前状态。"
+        alert.informativeText = "只改设备上的文字, 不改变当前状态。Return 换行, 点「发送」下发(设备文字区显示两行)。"
         alert.addButton(withTitle: "发送")
         alert.addButton(withTitle: "取消")
 
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        field.placeholderString = "例如：正在重构登录模块"
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
+        // 多行输入: 单行 NSTextField 换成 NSTextView 套滚动视图, Return 换行、
+        // 发送靠按钮。Cmd+V 等快捷键由 AppDelegate 装的编辑菜单兜底。
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 280, height: 64))
+        textView.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        textView.isRichText = false
+        textView.usesFindBar = true
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 280, height: 64))
+        scroll.borderType = .bezelBorder
+        scroll.hasVerticalScroller = true
+        scroll.documentView = textView
+        alert.accessoryView = scroll
+        alert.window.initialFirstResponder = textView
 
         if alert.runModal() == .alertFirstButtonReturn {
-            let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
             if !text.isEmpty { supervisor.sendText(text) }
         }
     }
