@@ -42,6 +42,7 @@ static esp_timer_handle_t s_screen_timer;
 static bool               s_link_offline = true;
 static bool               s_anim_on = true;    // 上次同步给 pet_ui 的渲染开关
 static int                s_backlight_pct = -1;  // 上次下发的背光, -1 = 还没写过
+static bool               s_screen_was_on = true;  // 上次 apply_screen 时的亮灭
 
 // ---------------------------------------------------------------------------
 // 中文文案覆盖自检
@@ -85,6 +86,18 @@ static void check_string_coverage(void)
 static void apply_screen(void)
 {
     const bool on = pet_screen_is_on(&s_screen);
+
+    // 联动 bridge 的重连节奏(见 pet_bridge.h 的 set_doze/wake)。doze 是纯条件
+    // (息屏 && 链路不通), 每次都同步。**必须用 pet_bridge_is_online() 而不是
+    // s_link_offline**: 重试期间 bridge 任务每轮都报 CONNECTING, on_bridge_link
+    // 会把 s_link_offline 置回 false —— 而息屏恰恰发生在重试等待期间, 用它判定
+    // 的话 doze 永远设不上(真机踩过: 退避封顶卡死在 15s, 日志静默)。
+    // wake 才需要翻转沿: 只在从灭到亮且链路不通时踢一次。
+    const bool link_down = !pet_bridge_is_online();
+    pet_bridge_set_doze(!on && link_down);
+    if (on && !s_screen_was_on && link_down) pet_bridge_wake();
+    s_screen_was_on = on;
+
     const uint8_t percent = pet_screen_backlight(&s_screen, s_link_offline);
 
     if ((int)percent != s_backlight_pct) {
