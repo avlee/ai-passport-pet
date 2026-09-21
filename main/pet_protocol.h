@@ -7,6 +7,9 @@
 //     {"type":"state","state":"working","text":"正在重构登录模块"}
 //     {"type":"text","text":"只更新文本, 不改状态"}
 //     {"type":"ping"}
+//     {"type":"limits","primary":98,"weekly":31}
+//       Codex 用量限额: primary = 5 小时窗、weekly = 周窗的**已用**百分比(0..100)。
+//       某个窗口没有可用快照时对应的字段整个不下发 —— 设备把缺的窗口藏起来。
 //     {"type":"pet","id":"sophie-portrait","size":1234567,"crc32":3735928559}
 //       宣告"接下来 size 个字节就是这只宠物包"。这一行之后**不再是文本**,
 //       而是紧跟 size 个裸字节; 收满之后链路自动回到行模式。
@@ -40,6 +43,7 @@ typedef enum {
     PET_MSG_STATE,   // 更新 Codex 状态, 可能同时带文本
     PET_MSG_TEXT,    // 只更新文本
     PET_MSG_PING,    // 心跳
+    PET_MSG_LIMITS,  // Codex 用量限额快照(5 小时窗 / 周窗)
     // 宠物包传输的宣告。本行之后是**二进制载荷**, 不是文本 —— 解析器只负责把这一行
     // 解出来, 切分载荷是 pet_bridge.c 的事(它知道要按字节数收多久)。
     PET_MSG_PET,
@@ -51,6 +55,9 @@ typedef struct {
     pet_codex_state_t state;
     bool              has_text;
     char              text[PET_PROTOCOL_TEXT_MAX];
+    // 仅 PET_MSG_LIMITS: 各窗口的已用百分比, 0..100; -1 = 该窗口未提供。
+    int8_t            limits_primary_used;
+    int8_t            limits_weekly_used;
     // 仅 PET_MSG_PET: 包的字节数与整包 CRC32, 以及 id(放在 text 里, 最长 31 字节)。
     uint32_t          pet_size;
     uint32_t          pet_crc32;

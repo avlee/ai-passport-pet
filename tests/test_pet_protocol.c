@@ -124,6 +124,53 @@ static void test_pet_announce_rejects_incomplete(void)
     assert(capture.count == 0);
 }
 
+// 用量限额。两个百分比都是"已用", 0..100; 缺哪个字段哪个就是 -1, 两个都缺则
+// 整行丢弃 —— 没有信息量的行不该惊动应用层。
+static void test_limits_message(void)
+{
+    pet_protocol_t protocol;
+    pet_protocol_init(&protocol);
+    capture_t capture = {0};
+
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"limits\",\"primary\":98,\"weekly\":31}\n") == 1);
+    assert(capture.count == 1);
+    assert(capture.messages[0].type == PET_MSG_LIMITS);
+    assert(capture.messages[0].limits_primary_used == 98);
+    assert(capture.messages[0].limits_weekly_used == 31);
+
+    // 只有一个窗口: 缺的那个是 -1。
+    assert(feed(&capture, &protocol, "{\"type\":\"limits\",\"primary\":100}\n") == 1);
+    assert(capture.messages[0].limits_primary_used == 100);
+    assert(capture.messages[0].limits_weekly_used == -1);
+
+    assert(feed(&capture, &protocol, "{\"type\":\"limits\",\"weekly\":0}\n") == 1);
+    assert(capture.messages[0].limits_primary_used == -1);
+    assert(capture.messages[0].limits_weekly_used == 0);
+
+    // 两个都缺 / 值非法(小数、负数、超上限): 一律丢弃, 不回调。
+    assert(feed(&capture, &protocol, "{\"type\":\"limits\"}\n") == 0);
+    // 单个窗口非法但另一个合法: 非法的按"未提供"处理(-1), 整行仍接受 —— 与
+    // "缺哪个藏哪个"是同一条语义, 只是触发原因从"没发"变成了"发得不对"。
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"limits\",\"primary\":98.5,\"weekly\":31}\n") == 1);
+    assert(capture.messages[0].limits_primary_used == -1);
+    assert(capture.messages[0].limits_weekly_used == 31);
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"limits\",\"primary\":-5,\"weekly\":31}\n") == 1);
+    assert(capture.messages[0].limits_primary_used == -1);
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"limits\",\"primary\":150,\"weekly\":31}\n") == 1);
+    assert(capture.messages[0].limits_primary_used == -1);
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"limits\",\"primary\":1e2,\"weekly\":31}\n") == 1);
+    assert(capture.messages[0].limits_primary_used == -1);
+    // 两个窗口都非法: 等于什么都没说, 丢弃。
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"limits\",\"primary\":1e2,\"weekly\":x}\n") == 0);
+    assert(capture.count == 0);
+}
+
 static void test_text_only_message(void)
 {
     pet_protocol_t protocol;
@@ -288,6 +335,7 @@ int main(void)
     test_unknown_state_value_keeps_message();
     test_pet_announce_message();
     test_pet_announce_rejects_incomplete();
+    test_limits_message();
     test_text_only_message();
     test_escapes_and_unicode();
     test_raw_utf8_passthrough();

@@ -12,6 +12,13 @@
 static void report(const pet_message_t *msg, void *user)
 {
     (void)user;
+    if (msg->type == PET_MSG_LIMITS) {
+        // 限额是纯数字字段, 单独一行打出来, 供桥接侧测试逐字段比对。
+        printf("limits %d %d\n", (int)msg->limits_primary_used,
+               (int)msg->limits_weekly_used);
+        fflush(stdout);
+        return;
+    }
     const char *type = "none";
     switch (msg->type) {
     case PET_MSG_STATE: type = "state"; break;

@@ -237,6 +237,29 @@ static bool json_get_u32(const char *line, const char *key, uint32_t *out)
     return true;
 }
 
+// 读取 line 中 key 对应的百分比整数(0..100)。找不到 key 返回 false; 找到了但
+// 不是纯十进制整数、或超出 0..100 也返回 false —— 百分比只有这一种合法写法,
+// "98.5"、"-5"、"1e2" 都说明对面不是我们的 Bridge, 宁可丢弃也不要猜。
+static bool json_get_pct(const char *line, const char *key, int8_t *out)
+{
+    const char *p = find_key(line, key);
+    if (p == NULL) return false;
+    while (is_space(*p)) p++;
+    if (*p < '0' || *p > '9') return false;
+
+    int value = 0;
+    while (*p >= '0' && *p <= '9') {
+        value = value * 10 + (*p - '0');
+        if (value > 100) return false;  // 已超上限还继续读只会是垃圾
+        p++;
+    }
+    // 数字后面必须紧跟合法的 JSON 值终止符: 否则 "98.5" 会被截成 98、"1e2" 被
+    // 截成 1 —— 截断出来的数看着合法, 其实谁也不是它。
+    if (*p != '\0' && *p != ',' && *p != '}' && !is_space(*p)) return false;
+    *out = (int8_t)value;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // 行解析
 // ---------------------------------------------------------------------------
@@ -257,6 +280,19 @@ static bool parse_line(const char *line, pet_msg_cb_t cb, void *user)
         msg.type = PET_MSG_TEXT;
     } else if (strcmp(type, "ping") == 0) {
         msg.type = PET_MSG_PING;
+    } else if (strcmp(type, "limits") == 0) {
+        // 用量限额。两个窗口都缺的行没有任何信息量, 直接丢弃; 只缺一个也接受 ——
+        // 桥接的语义就是"缺哪个藏哪个"。
+        const bool has_primary = json_get_pct(line, "primary",
+                                              &msg.limits_primary_used);
+        const bool has_weekly = json_get_pct(line, "weekly",
+                                             &msg.limits_weekly_used);
+        if (!has_primary && !has_weekly) return false;
+        if (!has_primary) msg.limits_primary_used = -1;
+        if (!has_weekly) msg.limits_weekly_used = -1;
+        msg.type = PET_MSG_LIMITS;
+        cb(&msg, user);
+        return true;
     } else if (strcmp(type, "pet") == 0) {
         // 宠物包宣告。id/size/crc32 缺一不可 —— 少一个就没法判断该收多久、收对了没,
         // 所以不完整的宣告直接丢弃(不回调), 后面的字节会继续被当成文本解析, 结果是
