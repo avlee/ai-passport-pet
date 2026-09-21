@@ -8,6 +8,10 @@
     <string>Codex Pet Bridge</string>
     <key>CFBundleExecutable</key>
     <string>CodexPetBridge</string>
+    <!-- 应用图标: Resources/AppIcon.icns, 由 make_icons.py 从源图派生。
+         LSUIElement 不进 Dock, 但 Finder 和"关于"面板都用它。 -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>local.codex-pet.bridge</string>
     <key>CFBundlePackageType</key>

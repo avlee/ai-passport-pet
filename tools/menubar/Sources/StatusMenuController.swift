@@ -496,6 +496,10 @@ final class StatusMenuController: NSObject {
 
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
+        // 用包内透明图, 不用 applicationIconImage: macOS 26 会给应用图标合成
+        // squircle 底板, About 里跟着一块灰底很难看; NSAlert 直接画 NSImage,
+        // 透明的 about-icon.png 才是真的透明。加载失败退回系统图标。
+        alert.icon = NSImage(named: "about-icon") ?? NSApp.applicationIconImage
         alert.messageText = "Codex Pet Bridge \(BuildConfig.version)"
         alert.informativeText = lines.joined(separator: "\n")
         alert.runModal()

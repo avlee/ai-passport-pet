@@ -113,10 +113,12 @@ bridge_dir="$app_dir/Contents/Resources/bridge"
 mkdir -p "$bridge_dir"
 cp "$repo_root/tools/pet_bridge.py" "$repo_root/tools/gen_pet_package.py" "$bridge_dir/"
 
-# 菜单栏图标: Assets/ 下 1x/2x 两档由同目录的 CodexPetBridge.png 派生(裁透明边、
-# 阈值 64 过滤隐形像素、补方形 + 6% 边距、18/36px)。源图只留档, 运行时只用这两张;
-# 换图标时用 tools 里的 Pillow 流程重新派生, 不要手动改这两张小图。
+# 菜单栏与应用图标: Assets/ 下四件由同目录的 CodexPetBridge.png 经 make_icons.py
+# 派生(裁透明边、补方形 + 6% 边距; 菜单 18/36px、About 透明 256px、应用 icns
+# 多尺寸 —— Tahoe 会给透明 icns 垫灰板, 系统行为, 不另做底色)。源图只留档,
+# 换图标时跑 make_icons.py 重新派生, 不要手动改派生产物。
 cp "$here/Assets/menu-icon.png" "$here/Assets/menu-icon@2x.png" \
+    "$here/Assets/AppIcon.icns" "$here/Assets/about-icon.png" \
     "$app_dir/Contents/Resources/"
 
 # 本地构建的应用没有开发者证书; ad-hoc 签名足够让它正常运行(尤其是 Apple Silicon
