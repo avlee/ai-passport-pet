@@ -44,6 +44,11 @@ static const char *TAG = "pet_ui";
 #define COL_WARN       0xFBBF24
 #define COL_BAD        0xF87171
 
+// 多行文本的行距(LVGL text_line_space, 加在行与行之间, 首行位置不变)。默认按
+// 字体行高走, 在 240px 宽的小屏上换行文字显得松; 收紧一档。单行 label 不受影响。
+// tools/preview_pet_screen.py 从本文件解析同一个值, 改这里预览跟着变。
+#define TEXT_LINE_SPACE -1
+
 // 顶栏: 左 = 状态圆点 + 状态文字, 右 = 电量(数字 + 电池图形)。
 #define ROW_DOT_X   18
 #define ROW_DOT_Y   16
@@ -266,6 +271,8 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *text,
     lv_label_set_text(label, text);
     lv_obj_set_style_text_font(label, font, 0);
     lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+    // 行距收紧(见 TEXT_LINE_SPACE): 只有换行/多行文本看得出差别。
+    lv_obj_set_style_text_line_space(label, TEXT_LINE_SPACE, 0);
     return label;
 }
 

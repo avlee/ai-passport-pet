@@ -164,8 +164,6 @@
    12334,
    12335,
    12336,
-   12337,
-   12338,
    12339,
    12340,
    12341,
@@ -7037,7 +7035,7 @@
    65373,
    65374
   ],
-  "source": "NotoSansSC-Regular.otf"
+  "source": "NotoSansCJKsc-Regular.otf"
  },
  "pet_font_20": {
   "size": 20,
@@ -7203,8 +7201,6 @@
    12334,
    12335,
    12336,
-   12337,
-   12338,
    12339,
    12340,
    12341,
@@ -11068,6 +11064,6 @@
    65373,
    65374
   ],
-  "source": "NotoSansSC-Regular.otf"
+  "source": "NotoSansCJKsc-Regular.otf"
  }
 }

@@ -31,6 +31,16 @@ ASCII_RANGE = range(0x20, 0x7F)
 
 # CJK punctuation, fullwidth forms and the few typographic marks that appear in
 # Chinese prose or in text relayed from a Codex session.
+#
+# U+3031/U+3032 are deliberately excluded: they are Japanese vertical-writing
+# repeat marks that no UI or bridged text ever uses, but Noto Sans CJK draws
+# them with an unusually tall bounding box (31 px in the 16 px font).  lv_font_conv
+# derives line_height from the tallest glyph, so keeping them inflated the whole
+# font's line_height to 31 (38 in the 20 px font) and every multi-line label on
+# the device got a bogus two-fold line pitch -- the two-line platform text
+# collided with the gauge labels ("5h"/"7d").  Keep any future additions here
+# clear of oversized-decorative glyphs; check the generated .line_height after
+# regenerating.
 EXTRA_CODEPOINTS = [
     0x00B0,  # degree sign
     0x00B7,  # middle dot
@@ -40,7 +50,8 @@ EXTRA_CODEPOINTS = [
     0x2026,  # horizontal ellipsis
     0x2190, 0x2192,  # left/right arrow
     0x2500,  # box drawing
-] + list(range(0x3000, 0x3040)) + list(range(0xFF01, 0xFF5F))
+] + [cp for cp in range(0x3000, 0x3040) if cp not in (0x3031, 0x3032)] \
+  + list(range(0xFF01, 0xFF5F))
 
 
 def gb2312_hanzi(level: int) -> list[int]:

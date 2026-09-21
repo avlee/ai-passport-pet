@@ -261,17 +261,20 @@ def draw_line(draw: ImageDraw.ImageDraw, text: str, font, metrics: tuple[int, in
 
 def draw_block(draw: ImageDraw.ImageDraw, text: str, font,
                metrics: tuple[int, int], box_x: float, box_w: float,
-               top_y: float, color, align: str = "center") -> int:
+               top_y: float, color, align: str = "center",
+               line_space: int = 0) -> int:
     """在固定宽度的框里画一段(可能折行的)文字, 返回行数。
 
-    LVGL 的定宽标签把第一行贴在内容区顶边, 所以第 k 行的行框顶 =
-    top_y + k * line_height。
+    LVGL 的定宽标签把第一行贴在内容区顶边, 行与行之间加 line_space(可为负,
+    与设备侧 pet_ui.c 的 TEXT_LINE_SPACE 同源), 所以第 k 行的行框顶 =
+    top_y + k * (line_height + line_space)。首行不受行距影响。
     """
     line_height = metrics[0]
+    step = line_height + line_space
     lines = wrap_text(draw, text, font, box_w)
     for index, line in enumerate(lines):
         draw_line(draw, line, font, metrics, box_x,
-                  top_y + index * line_height, color, align, box_w)
+                  top_y + index * step, color, align, box_w)
     return len(lines)
 
 
@@ -483,6 +486,15 @@ class Renderer:
         board = Image.new("RGB", size, self.colors["COL_BG"])
         return board, ImageDraw.Draw(board)
 
+    def block(self, draw: ImageDraw.ImageDraw, text: str, font,
+              metrics: tuple[int, int], box_x: float, box_w: float,
+              top_y: float, color, align: str = "center") -> int:
+        """draw_block 的 Renderer 入口: 行距与设备侧 make_label 同源
+        (pet_ui.c 的 TEXT_LINE_SPACE, parse_defines 读的, 缺了直接 KeyError,
+        两边跑偏立刻炸)。"""
+        return draw_block(draw, text, font, metrics, box_x, box_w, top_y,
+                          color, align, self.c["TEXT_LINE_SPACE"])
+
     # ---- 宠物界面 -----------------------------------------------------
     def pet_screen(self, scene: tuple, package: dict, frame_index: int | None,
                    battery_text: str,
@@ -541,7 +553,7 @@ class Renderer:
         一律用 COL_MUTED —— 设备上只有 Bridge 真的下发过文本才转成 COL_INK, 而预览
         画的都是"还没有文本"的占位状态(placeholder_text 那几条)。
         """
-        draw_block(draw, text, self.fonts[16], self.metrics[16],
+        self.block(draw, text, self.fonts[16], self.metrics[16],
                    layout["plat_text_x"], layout["plat_text_w"],
                    layout["plat_text_y"], self.colors["COL_MUTED"])
 
@@ -554,7 +566,7 @@ class Renderer:
                                   self.c["PET_LAYOUT_STAGE_H_REF"], self.c)
         paste_platform(board, layout, self.colors)
 
-        draw_block(draw, self.s["PET_STR_NO_PET"], self.fonts[16], self.metrics[16],
+        self.block(draw, self.s["PET_STR_NO_PET"], self.fonts[16], self.metrics[16],
                    layout["stage_x"], layout["stage_w"],
                    layout["stage_y"]
                    + (layout["stage_h"] - self.metrics[16][0]) // 2,
@@ -572,10 +584,10 @@ class Renderer:
         board, draw = self.new_board()
         scr_w = self.c["PET_LAYOUT_SCR_W"]
 
-        draw_block(draw, self.s["PET_STR_TRANSFER_TITLE"], self.fonts[20],
+        self.block(draw, self.s["PET_STR_TRANSFER_TITLE"], self.fonts[20],
                    self.metrics[20], 0, scr_w, self.c["TRANS_TITLE_Y"],
                    self.colors["COL_INK"])
-        draw_block(draw, pet_id, self.fonts[16], self.metrics[16],
+        self.block(draw, pet_id, self.fonts[16], self.metrics[16],
                    self.c["TRANS_MSG_X"], scr_w - 2 * self.c["TRANS_MSG_X"],
                    self.c["TRANS_NAME_Y"], self.colors["COL_ACCENT"])
 
@@ -591,7 +603,7 @@ class Renderer:
                                    radius=(bar_h - 2) // 2,
                                    fill=self.colors["COL_ACCENT"])
 
-        draw_block(draw, message, self.fonts[16], self.metrics[16],
+        self.block(draw, message, self.fonts[16], self.metrics[16],
                    self.c["TRANS_MSG_X"], self.c["TRANS_MSG_W"],
                    self.c["TRANS_MSG_Y"], self.colors[tone])
         return finish(board, "transfer")
@@ -601,10 +613,10 @@ class Renderer:
         board, draw = self.new_board()
         scr_w = self.c["PET_LAYOUT_SCR_W"]
 
-        draw_block(draw, self.s["PET_STR_PROV_TITLE"], self.fonts[20],
+        self.block(draw, self.s["PET_STR_PROV_TITLE"], self.fonts[20],
                    self.metrics[20], 0, scr_w, self.c["PROV_TITLE_Y"],
                    self.colors["COL_INK"])
-        draw_block(draw, device, self.fonts[16], self.metrics[16], 0, scr_w,
+        self.block(draw, device, self.fonts[16], self.metrics[16], 0, scr_w,
                    self.c["PROV_NAME_Y"], self.colors["COL_MUTED"])
 
         card_x, card_w = self.c["PROV_CARD_X"], self.c["PROV_CARD_W"]
@@ -616,16 +628,16 @@ class Renderer:
 
         # 20 px 的字体下 "1234" 四个数字挤在一起念不清, 设备上拉开成一格一个。
         spaced = " ".join(pin) if len(pin) == 4 else "- - - -"
-        draw_block(draw, self.s["PET_STR_PROV_PIN_LABEL"], self.fonts[16],
+        self.block(draw, self.s["PET_STR_PROV_PIN_LABEL"], self.fonts[16],
                    self.metrics[16], card_x, card_w,
                    card_y + self.c["PROV_PIN_LABEL_Y"], self.colors["COL_MUTED"])
-        draw_block(draw, spaced, self.fonts[20], self.metrics[20], card_x, card_w,
+        self.block(draw, spaced, self.fonts[20], self.metrics[20], card_x, card_w,
                    card_y + self.c["PROV_PIN_Y"], self.colors["COL_ACCENT"])
 
-        draw_block(draw, status, self.fonts[16], self.metrics[16],
+        self.block(draw, status, self.fonts[16], self.metrics[16],
                    self.c["PROV_STATUS_X"], self.c["PROV_STATUS_W"],
                    self.c["PROV_STATUS_Y"], self.colors[tone])
-        draw_block(draw, self.s["PET_STR_PROV_HINT"], self.fonts[16],
+        self.block(draw, self.s["PET_STR_PROV_HINT"], self.fonts[16],
                    self.metrics[16], 0, scr_w, self.c["PROV_HINT_Y"],
                    self.colors["COL_MUTED"])
         return finish(board, "prov")
