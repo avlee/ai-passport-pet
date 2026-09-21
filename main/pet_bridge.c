@@ -28,6 +28,7 @@ static const char *TAG = "pet_bridge";
 
 #define BIT_GOT_IP  BIT0
 #define BIT_STOPPED BIT1
+#define BIT_WAKE    BIT2  // pet_bridge_wake(): 打断退避等待, 立即重试
 
 #define PET_BRIDGE_TASK_STACK 5120
 #define PET_BRIDGE_TASK_PRIORITY 5
@@ -47,6 +48,7 @@ static esp_netif_t *s_netif;
 static int s_socket = -1;
 static atomic_bool s_stop;
 static atomic_bool s_online;
+static atomic_bool s_doze;  // 息屏且离线: 重连节奏放慢(见 pet_config.h)
 static bool s_ready;
 static uint32_t s_generation;  // 每次 start/stop 递增, 用于让旧任务自行退出
 
@@ -147,14 +149,51 @@ static void emit_message(const pet_message_t *msg, void *user)
 // Wi-Fi 事件
 // ---------------------------------------------------------------------------
 
+// Wi-Fi 重连退避。断开后前 PET_WIFI_RETRY_FAST_COUNT 次立即重试, 之后指数退避
+// 到 PET_WIFI_RETRY_MAX_MS。以前是"断开就立即重连"的无限热循环: 路由器关机时
+// 每次重试都是一轮全信道扫描, 射频全程不歇, 息屏后白烧电。
+static esp_timer_handle_t s_wifi_retry_timer;
+static uint32_t s_wifi_fail_count;  // 自上次拿到 IP 起的连续失败次数
+
+static void wifi_retry_now(void *arg)
+{
+    (void)arg;
+    (void)esp_wifi_connect();
+}
+
+// 记一次失败并安排下一次重连。连续失败越多, 重试间隔越长。
+static void schedule_wifi_retry(void)
+{
+    const uint32_t fails = s_wifi_fail_count++;
+
+    if (fails < PET_WIFI_RETRY_FAST_COUNT) {
+        wifi_retry_now(NULL);   // 前几次立即重试: 瞬时抖动大概率马上自愈
+        return;
+    }
+
+    uint32_t backoff_ms = PET_BRIDGE_RETRY_MIN_MS;
+    for (uint32_t i = PET_WIFI_RETRY_FAST_COUNT; i < fails; i++) {
+        backoff_ms = backoff_ms * 2 > PET_WIFI_RETRY_MAX_MS
+                         ? PET_WIFI_RETRY_MAX_MS
+                         : backoff_ms * 2;
+    }
+
+    if (s_wifi_retry_timer == NULL) {   // 定时器没建出来就退回立即重试
+        wifi_retry_now(NULL);
+        return;
+    }
+    esp_timer_stop(s_wifi_retry_timer);  // 未在计时则返回错误, 忽略即可
+    (void)esp_timer_start_once(s_wifi_retry_timer,
+                               (uint64_t)backoff_ms * 1000);
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id,
                                void *data)
 {
     (void)arg;
-    (void)data;
 
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        // 凭据错误会在这里反复失败, 由 bridge 任务按退避节奏重试。
+        // 凭据错误会在这里反复失败, 由上面的退避节奏控制重试频率。
         (void)esp_wifi_connect();
         return;
     }
@@ -165,14 +204,17 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id,
             ESP_LOGW(TAG, "Wi-Fi 断开, 宠物进入睡眠");
             emit_link(PET_LINK_OFFLINE);
         }
-        // 退避重连由任务负责节奏控制, 这里只做一次立即重试。
-        if (!atomic_load(&s_stop)) (void)esp_wifi_connect();
+        // 重连按退避节奏走。任务已停(配网重建参数时)就不再自动重连, 免得
+        // 打扰配网流程对 Wi-Fi 的独占。
+        if (!atomic_load(&s_stop)) schedule_wifi_retry();
         return;
     }
 
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "获取 IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_wifi_fail_count = 0;   // 连上了: 退避从头开始
+        if (s_wifi_retry_timer != NULL) esp_timer_stop(s_wifi_retry_timer);
         if (s_events) xEventGroupSetBits(s_events, BIT_GOT_IP);
     }
 }
@@ -473,6 +515,26 @@ static void set_online(bool online)
     }
 }
 
+// 退避等待。息屏(且离线)时封顶放宽到 DOZE 档 —— 每分钟一次尝试的射频代价
+// 可忽略, 却保住了"Mac 恢复后宠物自动上线"; 亮屏时回到正常档。
+static uint32_t backoff_grow(uint32_t cur_ms)
+{
+    const uint32_t cap = atomic_load(&s_doze) ? PET_BRIDGE_RETRY_DOZE_MAX_MS
+                                              : PET_BRIDGE_RETRY_MAX_MS;
+    return cur_ms * 2 > cap ? cap : cur_ms * 2;
+}
+
+// 按退避节奏等待, 但可被 pet_bridge_wake()(用户亮屏)打断, 立刻进入下一轮重试。
+static void wait_backoff(uint32_t ms)
+{
+    if (s_events == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(ms));
+        return;
+    }
+    xEventGroupWaitBits(s_events, BIT_WAKE, pdTRUE, pdTRUE,
+                        pdMS_TO_TICKS(ms));
+}
+
 static void bridge_task(void *arg)
 {
     const uint32_t generation = (uint32_t)(uintptr_t)arg;
@@ -488,11 +550,17 @@ static void bridge_task(void *arg)
     while (!atomic_load(&s_stop) && generation == s_generation) {
         emit_link(PET_LINK_CONNECTING);
 
-        // 等 IP。没有 IP 时不该尝试连接, 也不该反复打印解析失败。
+        // 等 IP。没有 IP 时不该尝试连接, 也不该反复打印解析失败。Wi-Fi 层在
+        // 按自己的退避节奏重连, 任务这里跟着退避节奏空转等就行 —— 亮屏会通过
+        // BIT_WAKE 把它叫醒。
         xEventGroupWaitBits(s_events, BIT_GOT_IP, pdFALSE, pdTRUE,
                             pdMS_TO_TICKS(2000));
         if (atomic_load(&s_stop) || generation != s_generation) break;
-        if ((xEventGroupGetBits(s_events) & BIT_GOT_IP) == 0) continue;
+        if ((xEventGroupGetBits(s_events) & BIT_GOT_IP) == 0) {
+            wait_backoff(backoff_ms);
+            backoff_ms = backoff_grow(backoff_ms);
+            continue;
+        }
 
         if (!open_socket()) {
             if (backoff_ms != logged_backoff) {
@@ -500,10 +568,8 @@ static void bridge_task(void *arg)
                          (unsigned)s_settings.port, (unsigned)backoff_ms);
                 logged_backoff = backoff_ms;
             }
-            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
-            backoff_ms = backoff_ms * 2 > PET_BRIDGE_RETRY_MAX_MS
-                             ? PET_BRIDGE_RETRY_MAX_MS
-                             : backoff_ms * 2;
+            wait_backoff(backoff_ms);
+            backoff_ms = backoff_grow(backoff_ms);
             continue;
         }
 
@@ -537,10 +603,8 @@ static void bridge_task(void *arg)
 
         if (!atomic_load(&s_stop) && generation == s_generation) {
             ESP_LOGI(TAG, "链路中断, %u ms 后重连", (unsigned)backoff_ms);
-            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
-            backoff_ms = backoff_ms * 2 > PET_BRIDGE_RETRY_MAX_MS
-                             ? PET_BRIDGE_RETRY_MAX_MS
-                             : backoff_ms * 2;
+            wait_backoff(backoff_ms);
+            backoff_ms = backoff_grow(backoff_ms);
         }
     }
 
@@ -610,6 +674,17 @@ esp_err_t pet_bridge_prepare(const pet_settings_t *settings)
     err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                               wifi_event_handler, NULL, NULL);
     if (err != ESP_OK) return err;
+
+    const esp_timer_create_args_t wifi_retry_args = {
+        .callback = wifi_retry_now,
+        .name = "wifi_retry",
+    };
+    err = esp_timer_create(&wifi_retry_args, &s_wifi_retry_timer);
+    if (err != ESP_OK) {
+        // 建不出来只是退回立即重试, 不阻断启动。
+        ESP_LOGW(TAG, "Wi-Fi 重连定时器创建失败: %s", esp_err_to_name(err));
+        s_wifi_retry_timer = NULL;
+    }
 
     wifi_config_t config;
     memset(&config, 0, sizeof(config));
@@ -683,6 +758,27 @@ esp_err_t pet_bridge_stop(void)
 bool pet_bridge_is_online(void)
 {
     return atomic_load(&s_online);
+}
+
+void pet_bridge_set_doze(bool doze)
+{
+    atomic_store(&s_doze, doze);
+}
+
+void pet_bridge_wake(void)
+{
+    atomic_store(&s_doze, false);
+    // 打断 bridge 任务正在进行的退避等待(下一轮重试立即开始)。
+    if (s_events != NULL) xEventGroupSetBits(s_events, BIT_WAKE);
+    s_wifi_fail_count = 0;
+    if (s_wifi_retry_timer != NULL) esp_timer_stop(s_wifi_retry_timer);
+    // 只有 Wi-Fi 没关联(还没拿到 IP)时才踢 Wi-Fi 层。TCP 不通但 Wi-Fi 还连着
+    // 是常态(桥接进程没起), 这时 esp_wifi_connect() 会把关联拆掉重连一次,
+    // 白白断网几秒 —— 任务被 BIT_WAKE 打断后自己就会立刻重试 TCP。
+    if (s_ready && !atomic_load(&s_stop) && s_events != NULL &&
+        (xEventGroupGetBits(s_events) & BIT_GOT_IP) == 0) {
+        (void)esp_wifi_connect();
+    }
 }
 
 bool pet_bridge_local_ip(char *out, size_t size)

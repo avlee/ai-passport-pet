@@ -52,6 +52,18 @@
 #define PET_BRIDGE_RETRY_MIN_MS 1000
 #define PET_BRIDGE_RETRY_MAX_MS 15000
 
+// 息屏且链路离线时的 TCP 重连退避封顶。息屏期间每分钟一次连接尝试的射频代价
+// 可以忽略, 但保住了"Mac 恢复后宠物最多一分钟自动上线"的行为 —— 这是彻底停止
+// 重连做不到的。亮屏时封顶回到 PET_BRIDGE_RETRY_MAX_MS 并立即重试一次。
+#define PET_BRIDGE_RETRY_DOZE_MAX_MS 60000
+
+// Wi-Fi 断开后的重连节奏: 前 PET_WIFI_RETRY_FAST_COUNT 次立即重试(瞬时抖动
+// 大概率马上自愈), 之后按指数退避, 上限 PET_WIFI_RETRY_MAX_MS。以前这里是
+// "断开就立即重连"的无限热循环: 路由器关机/密码错误时每次重试都是一轮全信道
+// 扫描, 射频全程不歇 —— 息屏后最大的额外功耗来源就是它。
+#define PET_WIFI_RETRY_FAST_COUNT 3
+#define PET_WIFI_RETRY_MAX_MS 30000
+
 // 超过该时间没有收到任何消息(含 ping)就认为链路已经掉线。
 #define PET_BRIDGE_IDLE_TIMEOUT_MS 12000
 

@@ -51,6 +51,16 @@ esp_err_t pet_bridge_start(const pet_bridge_sink_t *sink);
 // 停止任务并断开连接。用于应用退出。可重复调用。
 esp_err_t pet_bridge_stop(void);
 
+// 屏幕电源与重连节奏联动:
+//   set_doze(true)  = 息屏且离线: TCP 重连退避封顶放宽到
+//                     PET_BRIDGE_RETRY_DOZE_MAX_MS(慢节奏省电)。
+//   set_doze(false) = 恢复正常节奏。
+//   wake()          = 用户亮屏: 清掉放慢标志、打断正在进行的退避等待、
+//                     踢一下 Wi-Fi 层重连 —— 按下按键就该看到"正在回线",
+//                     而不是干等旧退避计时器走完。在线时调用是空操作。
+void pet_bridge_set_doze(bool doze);
+void pet_bridge_wake(void);
+
 // 向 Mac 发送一条消息(type 为协议类型名, text 可为 NULL)。
 // 未连接时返回 ESP_ERR_INVALID_STATE。
 esp_err_t pet_bridge_notify(const char *type, const char *text);
