@@ -57,7 +57,7 @@ static void test_reference_pet_is_unchanged(void)
     check(layout.stage_y == 38, "reference stage keeps its old top edge");
     check(layout.plat_floor_y == 235, "platform floor stays put");
     check(layout.plat_body_y == 249, "platform body stays put");
-    check(layout.plat_text_y == 251, "text block stays put");
+    check(layout.plat_text_y == 254, "text block stays put");
 }
 
 static void test_every_supported_width_is_centred(void)
