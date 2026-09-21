@@ -119,6 +119,11 @@ final class ProvisionClient: NSObject {
     private var scanTimer: DispatchSourceTimer?
     /// 扫描到多少秒之后按信号强度选一台连上去。
     private let scanWindow: TimeInterval
+    /// 扫空之后最多重试几轮。nil = 一直扫到找到或客户端被停掉 —— GUI 用这个,
+    /// 因为"先开窗、后进配网页"的顺序完全合法, 设备广播晚于第一轮扫描是天经地义;
+    /// CLI 保持 1 轮, 扫空即报错退出, 退出码语义不变。
+    private let maxScanRounds: Int?
+    private var scanRounds = 0
 
     /// 写入必须串行: CoreBluetooth 不会替你排队, 并发发多条 withResponse 写会丢。
     private var writeQueue: [(CBCharacteristic, Data)] = []
@@ -127,9 +132,11 @@ final class ProvisionClient: NSObject {
     private var statusBuffer = Data()
     private var finished = false
 
-    init(scanWindow: TimeInterval = 4.0, emitQueue: DispatchQueue = .main,
+    init(scanWindow: TimeInterval = 4.0, maxScanRounds: Int? = 1,
+         emitQueue: DispatchQueue = .main,
          onEvent: @escaping (ProvisionEvent) -> Void) {
         self.scanWindow = scanWindow
+        self.maxScanRounds = maxScanRounds
         self.emitQueue = emitQueue
         self.onEvent = onEvent
         super.init()
@@ -147,10 +154,26 @@ final class ProvisionClient: NSObject {
                                    options: [CBCentralManagerOptionShowPowerAlertKey: true])
     }
 
+    /// 起一轮扫描: 过滤服务 UUID 开始收广播, scanWindow 秒后收兵交给
+    /// connectStrongest()。每轮重新调 scanForPeripherals, 上一轮的 RSSI 不会串轮。
+    private func startScanRound() {
+        guard !finished, let central = central else { return }
+        central.scanForPeripherals(withServices: [ProvisionUUID.service],
+                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + scanWindow)
+        timer.setEventHandler { [weak self] in self?.connectStrongest() }
+        timer.resume()
+        scanTimer = timer
+    }
+
     /// 连接信号最强的那台。等满 scanWindow 再动手, 免得连到远处那台。
+    /// 扫空时不收摊: 只要没到轮数上限就再来一轮 —— 设备的广播和窗口谁先谁后
+    /// 都是合法时序, 报错收手只会把"先开窗后按键"的用户逼进死胡同。
     private func connectStrongest() {
         scanTimer?.cancel()
         scanTimer = nil
+        guard !finished, central != nil else { return }
 
         let found = discovered.values
             .map { DiscoveredDevice(id: $0.peripheral.identifier, name: $0.name, rssi: $0.rssi) }
@@ -159,7 +182,14 @@ final class ProvisionClient: NSObject {
 
         guard let best = found.first,
               let entry = discovered[best.id] else {
-            emit(.failed("没有扫描到配网中的设备。确认设备停在配对码界面(长按下键可以打开)。"))
+            scanRounds += 1
+            if let limit = maxScanRounds, scanRounds >= limit {
+                emit(.failed("没有扫描到配网中的设备。确认设备停在配对码界面(长按下键可以打开)。"))
+                return
+            }
+            emit(.log("第 \(scanRounds) 轮没扫到 —— 设备还没进配网页? 继续扫, 扫到即连(关窗停止)"))
+            discovered.removeAll()
+            startScanRound()
             return
         }
 
@@ -171,6 +201,7 @@ final class ProvisionClient: NSObject {
     }
 
     func stop() {
+        finished = true
         scanTimer?.cancel()
         scanTimer = nil
         central?.stopScan()
@@ -299,13 +330,7 @@ extension ProvisionClient: CBCentralManagerDelegate {
         case .poweredOn:
             emit(.log("开始扫描配网中的设备…"))
             emit(.scanning)
-            central.scanForPeripherals(withServices: [ProvisionUUID.service],
-                                       options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
-            let timer = DispatchSource.makeTimerSource(queue: queue)
-            timer.schedule(deadline: .now() + scanWindow)
-            timer.setEventHandler { [weak self] in self?.connectStrongest() }
-            timer.resume()
-            scanTimer = timer
+            startScanRound()
         case .poweredOff:
             emit(.failed("蓝牙没打开。打开蓝牙后重试。"))
         case .unauthorized:

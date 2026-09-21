@@ -369,7 +369,9 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
         devicePopup.addItem(withTitle: "扫描中…")
         append("开始扫描…")
 
-        let client = ProvisionClient { [weak self] event in
+        // maxScanRounds nil = 扫不到就一直扫: 设备进配网页可以发生在开窗之后,
+        // 一次扫空就报错对"先开窗、后长按下键"的顺序是误伤。
+        let client = ProvisionClient(maxScanRounds: nil) { [weak self] event in
             self?.handle(event)
         }
         self.client = client
@@ -458,7 +460,8 @@ final class ProvisionWindowController: NSObject, NSWindowDelegate {
             devicePopup.removeAllItems()
             if devices.isEmpty {
                 devicePopup.addItem(withTitle: "没有扫到设备")
-                append("没有扫到配网中的设备。确认宠物屏幕停在配对码界面。")
+                // 不再 append 一行: 扫空在持续扫描模式下每几秒来一次, 刷屏;
+                // 进度由客户端的 .log("第 N 轮没扫到…")负责交代。
             } else {
                 for device in devices {
                     devicePopup.addItem(withTitle: "\(device.name)  \(device.rssi) dBm")
