@@ -27,9 +27,10 @@
 #define PLAT_W       212
 #define PLAT_RADIUS   14
 
-// 台面上沿 = 宠物脚底那一行。
-#define PLAT_FLOOR_Y 235
-#define PLAT_FLOOR_H  14
+// 台面上沿 = 宠物脚底那一行。真值定义在 pet_layout.h(PET_LAYOUT_PLAT_FLOOR_Y /
+// PET_LAYOUT_PLAT_FLOOR_H), pet_ui.c 的灯条断言也引用它们, 不在这里重复写数字。
+#define PLAT_FLOOR_Y PET_LAYOUT_PLAT_FLOOR_Y
+#define PLAT_FLOOR_H PET_LAYOUT_PLAT_FLOOR_H
 // 台面比台身矮得多, 用 PLAT_RADIUS 会鼓成胶囊, 单独给一个小圆角。
 #define PLAT_FLOOR_RADIUS 5
 #define PLAT_RIM_H     2

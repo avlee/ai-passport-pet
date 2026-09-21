@@ -57,6 +57,9 @@ UI_C = REPO_ROOT / "main" / "pet_ui.c"
 STRINGS_H = REPO_ROOT / "main" / "pet_strings.h"
 FONT_C = {16: REPO_ROOT / "assets" / "fonts" / "pet_font_16.c",
           20: REPO_ROOT / "assets" / "fonts" / "pet_font_20.c"}
+# LVGL 内置 montserrat_14 的 (行高, 基线) —— sdkconfig 启用 LV_FONT_MONTSERRAT_14,
+# 设备侧能量槽小标签用它; 没有对应的生成字体文件, 度量取 LVGL 源码常量。
+M14_METRICS = (16, 11)
 
 # 布局常量分散在三个文件里: 屏幕尺寸与舞台上下限在 pet_layout.h, 站台坐标在
 # pet_layout.c(那边有主机测试), 顶栏/配网页/传输页与宠物无关, 在 pet_ui.c。
@@ -157,7 +160,7 @@ def layout_for_stage(stage_w: int, stage_h: int,
         raise SystemExit(f"舞台高 {stage_h} 小于下限 {consts['PET_LAYOUT_STAGE_H_MIN']}")
 
     stage_x = (consts["PET_LAYOUT_SCR_W"] - stage_w) // 2
-    stage_y = consts["PLAT_FLOOR_Y"] + 1 - stage_h
+    stage_y = consts["PET_LAYOUT_PLAT_FLOOR_Y"] + 1 - stage_h
     if stage_y < consts["PET_LAYOUT_STAGE_TOP_MIN"]:
         raise SystemExit(f"舞台 {stage_w}x{stage_h} 顶边会压到顶部状态行"
                          f"(y {stage_y} < {consts['PET_LAYOUT_STAGE_TOP_MIN']})")
@@ -168,8 +171,8 @@ def layout_for_stage(stage_w: int, stage_h: int,
 
         "plat_x": consts["PLAT_X"], "plat_w": consts["PLAT_W"],
         "plat_radius": consts["PLAT_RADIUS"],
-        "plat_floor_y": consts["PLAT_FLOOR_Y"],
-        "plat_floor_h": consts["PLAT_FLOOR_H"],
+        "plat_floor_y": consts["PET_LAYOUT_PLAT_FLOOR_Y"],
+        "plat_floor_h": consts["PET_LAYOUT_PLAT_FLOOR_H"],
         "plat_floor_radius": consts["PLAT_FLOOR_RADIUS"],
         "plat_rim_h": consts["PLAT_RIM_H"],
         "plat_rim_inset": consts["PLAT_RIM_INSET"],
@@ -361,6 +364,14 @@ def parse_battery(text: str) -> int | None:
     return max(0, min(100, int(value))) if value.isdigit() else None
 
 
+def parse_limits(text: str) -> tuple[int | None, int | None]:
+    """--limits 的取值: "<5h窗已用>/<周窗已用>", 如 98/31; 每格用 -- 表示未读到。"""
+    parts = text.split("/")
+    if len(parts) != 2:
+        raise SystemExit(f"--limits 的格式是 <5h已用>/<周已用>, 收到 {text!r}")
+    return parse_battery(parts[0]), parse_battery(parts[1])
+
+
 def draw_top_row(board: Image.Image, draw: ImageDraw.ImageDraw, c: dict[str, int],
                  colors: dict[str, tuple[int, int, int]],
                  status: str, dot: str, battery_text: str,
@@ -409,6 +420,49 @@ def finish(board: Image.Image, key: str) -> Image.Image:
     return out
 
 
+def draw_gauges(draw: ImageDraw.ImageDraw, layout: dict[str, int],
+                c: dict[str, int], colors: dict[str, tuple[int, int, int]],
+                strings: dict[str, str], fonts: dict[int, object],
+                metrics: dict[int, tuple[int, int]],
+                limits: tuple[int | None, int | None]) -> None:
+    """站台台身(文字框)内左右两条竖形能量槽。语义与 pet_ui.c 的
+    refresh_gauges_locked() 一致: 坐标锚定镜像 layout 的台身几何, 轨道标出
+    "满格"高度, 填充按**剩余**百分比从槽底往上生长, 颜色固定(左 = 5 小时窗红,
+    右 = 周窗蓝), 槽底一行小标签("5h"/"7d"), 没有快照整组不画。"""
+    track_h = (layout["plat_body_h"] - c["GAUGE_VPAD"]
+               - c["GAUGE_LABEL_H"] - c["GAUGE_LABEL_GAP"]
+               - c["GAUGE_BOTTOM_CLEAR"])
+    track_top = layout["plat_body_y"] + c["GAUGE_VPAD"]
+    track_x = (layout["plat_x"] + c["GAUGE_INSET"],
+               layout["plat_x"] + layout["plat_w"] - c["GAUGE_INSET"] - c["GAUGE_W"])
+    labels = (strings.get("PET_STR_LIMIT_PRIMARY", "5h"),
+              strings.get("PET_STR_LIMIT_WEEKLY", "7d"))
+    bar_colors = ("COL_BAD", "COL_ACCENT")
+
+    for i, used in enumerate(limits):
+        if used is None or track_h < c["GAUGE_MIN_H"]:
+            continue
+        draw.rounded_rectangle(
+            (track_x[i], track_top,
+             track_x[i] + c["GAUGE_W"] - 1, track_top + track_h - 1),
+            radius=2, fill=colors["COL_CARD"])
+
+        remain = 100 - used
+        height = max(remain * track_h // 100, c["GAUGE_MIN_H"])
+        draw.rounded_rectangle(
+            (track_x[i], track_top + track_h - height,
+             track_x[i] + c["GAUGE_W"] - 1, track_top + track_h - 1),
+            radius=2, fill=colors[bar_colors[i]])
+
+        # 小标签钉在槽底正下方: 左标签左对齐、右标签右对齐于各自的槽。
+        # 用的 montserrat_14, 度量取内置常量(见文件头 M14_METRICS)。
+        label_x = (track_x[0] if i == 0
+                   else track_x[1] + c["GAUGE_W"] - c["GAUGE_LABEL_W"])
+        draw_line(draw, labels[i], fonts[14], M14_METRICS, label_x,
+                  track_top + track_h + c["GAUGE_LABEL_GAP"],
+                  colors["COL_MUTED"])
+
+
 # ---------------------------------------------------------------------------
 # 三块屏
 # ---------------------------------------------------------------------------
@@ -422,7 +476,7 @@ class Renderer:
         self.metrics = metrics
         self.colors = {name: rgb(value) for name, value in consts.items()
                        if name.startswith("COL_")}
-        self.fonts = {size: load_font(size) for size in (16, 20)}
+        self.fonts = {size: load_font(size) for size in (14, 16, 20)}
 
     def new_board(self) -> tuple[Image.Image, ImageDraw.ImageDraw]:
         size = (self.c["PET_LAYOUT_SCR_W"], self.c["PET_LAYOUT_SCR_H"])
@@ -431,7 +485,8 @@ class Renderer:
 
     # ---- 宠物界面 -----------------------------------------------------
     def pet_screen(self, scene: tuple, package: dict, frame_index: int | None,
-                   battery_text: str) -> Image.Image:
+                   battery_text: str,
+                   limits: tuple[int | None, int | None] = (None, None)) -> Image.Image:
         key, status_key, dot, plate_key, anim, asleep = scene
         board, draw = self.new_board()
         layout = layout_for_stage(package["stage"][2], package["stage"][3], self.c)
@@ -474,6 +529,8 @@ class Renderer:
 
         draw_top_row(board, draw, self.c, self.colors, self.s[status_key], dot,
                      battery_text, self.fonts, self.metrics)
+        draw_gauges(draw, layout, self.c, self.colors, self.s, self.fonts,
+                    self.metrics, limits)
         self.draw_plat_text(draw, self.s[plate_key], layout)
         return finish(board, key)
 
@@ -489,7 +546,9 @@ class Renderer:
                    layout["plat_text_y"], self.colors["COL_MUTED"])
 
     def no_pet_screen(self, battery_text: str) -> Image.Image:
-        """空槽: 舞台区一句占位(lv_obj_center), 站台上告诉用户去哪儿装。"""
+        """空槽: 舞台区一句占位(lv_obj_center), 站台上告诉用户去哪儿装。
+
+        恒为离线状态 —— 不画能量槽, 与设备侧"掉线整组隐藏"的语义一致。"""
         board, draw = self.new_board()
         layout = layout_for_stage(self.c["PET_LAYOUT_STAGE_W_REF"],
                                   self.c["PET_LAYOUT_STAGE_H_REF"], self.c)
@@ -630,6 +689,9 @@ def main() -> int:
     parser.add_argument("--frame", type=int, default=None, help="指定帧序号")
     parser.add_argument("--battery", default="82%",
                         help="顶栏电量, 如 95%% 或 -- (表示未读到)")
+    parser.add_argument("--limits", default="98/31",
+                        help="能量槽, 格式 <5h窗已用>/<周窗已用>, 如 98/31; "
+                             "某格用 -- 表示未读到")
     parser.add_argument("--pin", default="1234", help="配网页上的配对码")
     parser.add_argument("--device", default="CodexPet-75B4",
                         help="配网页上的设备名(CodexPet-MAC 后两字节)")
@@ -683,12 +745,13 @@ def main() -> int:
     print(f"输出目录 {out_dir}")
 
     images: list[tuple[str, Image.Image]] = []
+    limits = parse_limits(args.limits)
     if want_pet and package is not None:
         for scene in SCENES:
             if args.anim and scene[4] != args.anim:
                 continue
             images.append((scene[0], renderer.pet_screen(
-                scene, package, args.frame, args.battery)))
+                scene, package, args.frame, args.battery, limits)))
 
     if "nopet" in want_static:
         images.append(("nopet", renderer.no_pet_screen(args.battery)))

@@ -49,6 +49,11 @@
 // 睡眠标记, 使用拉丁字母, 走 fallback 字体。
 #define PET_STR_SLEEP_MARK         "Zzz"
 
+// 能量槽小标签(16 px)。左 = 5 小时窗, 右 = 周窗。ASCII 是刻意的: 字库本来就
+// 覆盖, 不为两条小字重开字模; 窗口定义见 docs/development/engineering/codex-pet.md。
+#define PET_STR_LIMIT_PRIMARY      "5h"
+#define PET_STR_LIMIT_WEEKLY       "7d"
+
 // ---------------------------------------------------------------------------
 // 宠物槽(没有宠物 / 正在换宠物)
 // ---------------------------------------------------------------------------
@@ -113,6 +118,8 @@
     X(info_hint_close,   PET_STR_INFO_HINT_CLOSE,   16)        \
     X(info_hint_demo,    PET_STR_INFO_HINT_DEMO,    16)        \
     X(sleep_mark,        PET_STR_SLEEP_MARK,        16)        \
+    X(limit_primary,     PET_STR_LIMIT_PRIMARY,     16)        \
+    X(limit_weekly,      PET_STR_LIMIT_WEEKLY,      16)        \
     X(prov_title,        PET_STR_PROV_TITLE,        20)        \
     X(prov_pin_label,    PET_STR_PROV_PIN_LABEL,    16)        \
     X(prov_waiting,      PET_STR_PROV_WAITING,      16)        \

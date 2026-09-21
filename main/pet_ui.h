@@ -56,6 +56,10 @@ void pet_ui_set_text(const char *utf8);
 // 电量百分比, 0..100;-1 表示读不到。
 void pet_ui_set_battery(int soc_percent);
 
+// Codex 用量限额(屏幕两侧的竖形能量槽)。两个参数都是**已用**百分比, 0..100;
+// 小于 0 表示该窗口没有快照, 对应的槽隐藏。左侧 = 5 小时窗, 右侧 = 周窗。
+void pet_ui_set_limits(int primary_used, int weekly_used);
+
 // 信息面板要展示的连接参数。
 void pet_ui_set_settings(const pet_settings_t *settings);
 

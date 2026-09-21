@@ -31,6 +31,11 @@
 #define PET_LAYOUT_STAGE_W_REF 129
 #define PET_LAYOUT_STAGE_H_REF 198
 
+// 站台台面上沿, 也就是宠物脚底那一行(y 235)。台面以上的竖向区域属于舞台。
+#define PET_LAYOUT_PLAT_FLOOR_Y 235
+// 台面高度(y 235..249)。上下边框各被一条用量灯条占用, 灯条总高不得超过它。
+#define PET_LAYOUT_PLAT_FLOOR_H 14
+
 typedef struct {
     // 舞台(运行时按宠物包里的裁剪区并集算出来)
     int stage_x;

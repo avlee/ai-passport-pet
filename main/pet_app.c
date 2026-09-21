@@ -173,6 +173,13 @@ static void on_bridge_message(const pet_message_t *msg, void *user)
         if (msg->has_text) pet_ui_set_text(msg->text);
         break;
 
+    case PET_MSG_LIMITS:
+        // 限额变化意味着 Codex 那边真的发了请求(或窗口翻页), 让它算"新内容":
+        // 屏幕在息屏时被点亮一次, 用户能看到能量槽跳一下。窗口没提供的传 -1,
+        // 由界面隐藏对应的槽。
+        pet_ui_set_limits(msg->limits_primary_used, msg->limits_weekly_used);
+        break;
+
     case PET_MSG_PING:
         (void)pet_bridge_notify("pong", NULL);
         break;

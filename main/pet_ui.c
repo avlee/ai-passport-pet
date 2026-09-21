@@ -81,6 +81,23 @@ _Static_assert(BAT_CAP_X == BAT_BODY_X + BAT_BODY_W,
 _Static_assert(BAT_FILL_X > BAT_BODY_X && BAT_FILL_X + BAT_FILL_MAX_W < BAT_CAP_X,
                "电量填充必须落在电池体内");
 
+// Codex 用量能量槽: 站台台身(文字框)内左右两条竖槽 —— 左 = 5 小时窗(红),
+// 右 = 周窗(蓝)。颜色 + 位置 + 小标签三重编码, 新观众也能对上号。
+// 填充按**剩余**百分比从槽底往上生长。槽的坐标完全锚定运行时的站台几何
+// (s_layout), 预览工具用镜像的同一批值, 所以这里只写字面量尺寸。
+// 标签放槽底而不是槽顶: 台身顶部到中部是居中的状态文字, 标签放上面会跟它
+// 抢空间; 底部内缩区与文字完全错开。
+#define GAUGE_W            4   // 槽宽(轨道与填充同宽)
+#define GAUGE_INSET        4   // 距台身左右边框的水平内缩
+#define GAUGE_VPAD         8   // 距台身顶的竖直内缩, 避开 14px 圆角弧
+#define GAUGE_MIN_H        3   // 有剩余时的最小可见高度, 否则 1% 看起来像空的
+#define GAUGE_LABEL_H     16   // 槽底小标签("5h"/"7d")的行高, 从槽底高度里扣
+#define GAUGE_LABEL_GAP    1   // 标签与槽底贴近, 把竖直空间尽量留给槽体
+#define GAUGE_LABEL_W     26   // 标签行框宽(左标签左对齐/右标签右对齐于槽)
+#define GAUGE_BOTTOM_CLEAR 4   // 标签底与台身底边的净空。压线但不出弧: 标签最底
+                               // 行(y≈310)处 14px 圆角弧内收约 4.2px, 标签自身
+                               // 内缩 4px, 视觉上贴着弧线走
+
 // 蓝牙配网页。同样只写字面量: tools/preview_pet_screen.py 会读这些值出预览图,
 // 编辑器里看不到屏幕, 预览就是唯一能"眼见为实"的途径。
 #define PROV_TITLE_Y     26
@@ -158,6 +175,9 @@ static lv_obj_t *s_dot;
 static lv_obj_t *s_status;
 static lv_obj_t *s_bat_text;
 static lv_obj_t *s_bat_fill;
+static lv_obj_t *s_gauge_track[2];  // [0]=左槽(5 小时窗) [1]=右槽(周窗)
+static lv_obj_t *s_gauge_fill[2];
+static lv_obj_t *s_gauge_label[2];
 static lv_obj_t *s_plat_body;
 static lv_obj_t *s_plat_text;
 static lv_obj_t *s_stage;
@@ -202,6 +222,11 @@ static pet_state_t       s_state;
 static pet_settings_t    s_settings;
 static bool              s_settings_ok;
 static int               s_battery;
+
+// Codex 用量限额。存的是**已用**百分比; <0 表示还没有快照, 对应的槽要藏着。
+// 与电量一样: build/destroy 只管对象, 数值留在模块里, 重建界面后立刻恢复。
+static int s_limit_primary = -1;
+static int s_limit_weekly  = -1;
 
 static char     s_prov_device[24];
 static char     s_prov_pin_text[8];
@@ -360,6 +385,63 @@ static void refresh_battery_locked(void)
     int width = (s_battery * BAT_FILL_MAX_W) / 100;
     if (width < 1) width = 1;
     lv_obj_set_size(s_bat_fill, width, BAT_FILL_H);
+}
+
+// 能量槽: 按剩余百分比把填充从槽底顶上来。掉线时不显示 —— 那时的快照是旧的,
+// 画上去就是骗人; 没有快照的窗口整组隐藏(轨道一起藏, 台身上不留两条没有意义
+// 的空槽)。跑在持有 LVGL 锁的路径里。
+static void refresh_gauges_locked(void)
+{
+    const bool online = s_state.link == PET_LINK_ONLINE;
+    const int used[2] = { s_limit_primary, s_limit_weekly };
+    const uint32_t color[2] = { COL_BAD, COL_ACCENT };
+    // 槽的竖直范围: 台身顶留 VPAD; 底部依次让出标签行、一线间隔、圆角净空。
+    // 台身几何是运行时值。
+    const int track_top = s_layout.plat_body_y + GAUGE_VPAD;
+    const int track_h = s_layout.plat_body_h - GAUGE_VPAD
+                        - GAUGE_LABEL_H - GAUGE_LABEL_GAP - GAUGE_BOTTOM_CLEAR;
+    const int track_x[2] = {
+        s_layout.plat_x + GAUGE_INSET,
+        s_layout.plat_x + s_layout.plat_w - GAUGE_INSET - GAUGE_W,
+    };
+
+    for (int i = 0; i < 2; i++) {
+        if (s_gauge_track[i] == NULL || s_gauge_fill[i] == NULL) continue;
+
+        if (!online || used[i] < 0 || used[i] > 100 || track_h < GAUGE_MIN_H) {
+            lv_obj_add_flag(s_gauge_track[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_gauge_fill[i], LV_OBJ_FLAG_HIDDEN);
+            if (s_gauge_label[i] != NULL) {
+                lv_obj_add_flag(s_gauge_label[i], LV_OBJ_FLAG_HIDDEN);
+            }
+            continue;
+        }
+
+        lv_obj_set_size(s_gauge_track[i], GAUGE_W, track_h);
+        lv_obj_set_pos(s_gauge_track[i], track_x[i], track_top);
+        lv_obj_remove_flag(s_gauge_track[i], LV_OBJ_FLAG_HIDDEN);
+
+        // 标签钉在槽底正下方: 左标签左对齐、右标签右对齐于各自的槽。
+        if (s_gauge_label[i] != NULL) {
+            lv_obj_set_size(s_gauge_label[i], GAUGE_LABEL_W, GAUGE_LABEL_H);
+            lv_obj_set_pos(s_gauge_label[i],
+                           i == 0 ? track_x[0]
+                                  : track_x[1] + GAUGE_W - GAUGE_LABEL_W,
+                           track_top + track_h + GAUGE_LABEL_GAP);
+            lv_obj_remove_flag(s_gauge_label[i], LV_OBJ_FLAG_HIDDEN);
+        }
+
+        const int remain = 100 - used[i];
+        int height = (remain * track_h) / 100;
+        if (height < GAUGE_MIN_H) height = GAUGE_MIN_H;
+
+        // 底对齐: 填充永远从槽底往上生长, "能量还剩多少"一眼可比。
+        lv_obj_set_size(s_gauge_fill[i], GAUGE_W, height);
+        lv_obj_set_pos(s_gauge_fill[i], track_x[i], track_top + track_h - height);
+        lv_obj_set_style_bg_color(s_gauge_fill[i], lv_color_hex(color[i]), 0);
+        lv_obj_set_style_bg_opa(s_gauge_fill[i], LV_OPA_COVER, 0);
+        lv_obj_remove_flag(s_gauge_fill[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 // 信息面板里的动态行: 链路 / 电量。
@@ -545,6 +627,40 @@ static void build_top_row(void)
     s_bat_fill = make_box(s_screen, BAT_FILL_X, BAT_FILL_Y, 1, BAT_FILL_H,
                           COL_GOOD, 1);
     lv_obj_set_style_bg_opa(s_bat_fill, LV_OPA_TRANSP, 0);
+}
+
+static void build_gauges(void)
+{
+    // 台身(文字框)内左右两条竖形能量槽, 显示 Codex 用量的**剩余**量。
+    // 轨道 = 深色暗条, 标出"满格"的高度; 填充对象单独记下来, 高度/颜色由
+    // refresh_gauges_locked() 按 s_layout 与收到的快照算 —— 这里不摆坐标。
+    // 没数据之前整组隐藏, 别让台身上挂两条没有意义的空槽。
+    static const uint32_t color[2] = { COL_BAD, COL_ACCENT };
+    static const char *const labels[2] = {
+        PET_STR_LIMIT_PRIMARY, PET_STR_LIMIT_WEEKLY,
+    };
+
+    for (int i = 0; i < 2; i++) {
+        s_gauge_track[i] = make_box(s_screen, 0, 0, 1, 1, COL_CARD, 2);
+        lv_obj_set_style_bg_opa(s_gauge_track[i], LV_OPA_60, 0);
+        lv_obj_add_flag(s_gauge_track[i], LV_OBJ_FLAG_HIDDEN);
+
+        s_gauge_fill[i] = make_box(s_screen, 0, 0, 1, 1, color[i], 2);
+        lv_obj_set_style_bg_opa(s_gauge_fill[i], LV_OPA_TRANSP, 0);
+        lv_obj_add_flag(s_gauge_fill[i], LV_OBJ_FLAG_HIDDEN);
+
+        // 行框宽是固定的, 对齐方式决定文字贴槽的哪一侧。
+        // 行框只钉宽不钉高: 高度钉死会把字库真实行高(>16)裁出"下半截缺失"。
+        // montserrat_14 是 LVGL 内置字体(sdkconfig 已启用), 行高恰好 16,
+        // 与 GAUGE_LABEL_H 的几何预留吻合; ASCII 覆盖足够两条小标签。
+        s_gauge_label[i] = make_label(s_screen, labels[i], &lv_font_montserrat_14,
+                                      COL_MUTED);
+        lv_obj_set_width(s_gauge_label[i], GAUGE_LABEL_W);
+        lv_obj_set_style_text_align(s_gauge_label[i],
+                                    i == 0 ? LV_TEXT_ALIGN_LEFT
+                                           : LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_add_flag(s_gauge_label[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void build_stage(void)
@@ -816,10 +932,14 @@ void pet_ui_build(void)
     build_top_row();
     build_platform();   // 先于舞台: 宠物要压在台面之上, 否则脚会被盖住
     build_stage();
+    // 能量槽最后建(信息面板之前): 它画在台身正面, 必须压在站台之上 —— LVGL
+    // 后建的兄弟对象盖先建的, 摆在 build_platform() 之前会被台身整个盖住。
+    build_gauges();
     build_info();
     build_provision();   // 最后建: 配网页要盖在信息面板之上
     refresh_status_locked();
     refresh_battery_locked();
+    refresh_gauges_locked();
     refresh_provision_locked();
     set_info_visible_locked(s_info_visible);  // 重建时恢复面板显隐
 
@@ -878,6 +998,11 @@ void pet_ui_destroy(void)
     s_status = NULL;
     s_bat_text = NULL;
     s_bat_fill = NULL;
+    for (int i = 0; i < 2; i++) {
+        s_gauge_fill[i] = NULL;
+        s_gauge_track[i] = NULL;
+        s_gauge_label[i] = NULL;
+    }
     s_sleep = NULL;
     s_info_scrim = NULL;
     s_info_panel = NULL;
@@ -921,6 +1046,8 @@ void pet_ui_set_link(pet_link_state_t link)
                  pet_anim_name(s_state.anim));
         refresh_status_locked();
         refresh_info_locked();
+        // 掉线时能量槽要藏起来(快照不再可信), 恢复时再按缓存的值放回去。
+        refresh_gauges_locked();
     }
     bsp_lvgl_unlock();
 }
@@ -963,6 +1090,19 @@ void pet_ui_set_battery(int soc_percent)
     s_battery = soc_percent;
     refresh_battery_locked();
     refresh_info_locked();
+    bsp_lvgl_unlock();
+}
+
+void pet_ui_set_limits(int primary_used, int weekly_used)
+{
+    // 越界值按"没有快照"处理: 协议层拦过一道, 这里只兜内部不一致。
+    if (primary_used < 0 || primary_used > 100) primary_used = -1;
+    if (weekly_used < 0 || weekly_used > 100) weekly_used = -1;
+
+    if (!bsp_lvgl_lock(1000)) return;
+    s_limit_primary = primary_used;
+    s_limit_weekly = weekly_used;
+    refresh_gauges_locked();
     bsp_lvgl_unlock();
 }
 
@@ -1135,6 +1275,11 @@ void pet_ui_begin_transfer(const char *pet_id, uint32_t total_bytes)
     s_status = NULL;
     s_bat_text = NULL;
     s_bat_fill = NULL;
+    for (int i = 0; i < 2; i++) {
+        s_gauge_fill[i] = NULL;
+        s_gauge_track[i] = NULL;
+        s_gauge_label[i] = NULL;
+    }
     s_sleep = NULL;
     s_info_scrim = NULL;
     s_info_panel = NULL;
