@@ -16,6 +16,7 @@ idf_component_register(
          "pet_slot.c"
          "pet_atlas.c"
          "pet_fonts.c"
+         "pet_sound.c"
          "pet_strings.c"
          "pet_bridge.c"
          "pet_provision.c"
@@ -47,4 +48,6 @@ idf_component_register(
 target_sources(${COMPONENT_LIB} PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../assets/fonts/pet_font_16.c"
     "${CMAKE_CURRENT_LIST_DIR}/../assets/fonts/pet_font_20.c"
+    # 提示音 PCM(约 50 KB rodata), 由 tools/gen_pet_sounds.py 从 .wav 生成。
+    "${CMAKE_CURRENT_LIST_DIR}/../assets/music/pet_sound_clips.c"
 )

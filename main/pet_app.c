@@ -22,6 +22,7 @@
 #include "pet_screen.h"
 #include "pet_settings.h"
 #include "pet_slot.h"
+#include "pet_sound.h"
 #include "pet_strings.h"
 #include "pet_ui.h"
 
@@ -203,6 +204,13 @@ static void on_bridge_message(const pet_message_t *msg, void *user)
 
     case PET_MSG_PING:
         (void)pet_bridge_notify("pong", NULL);
+        break;
+
+    case PET_MSG_SOUND:
+        // 本轮 Codex 任务完成: 放一段庆祝提示音。播放不占这里(bridge 任务),
+        // pet_sound_play 只发一个任务通知。屏幕已经由上面的 screen_touch()
+        // 亮过了(与 state 消息同时到达), 不在这里重复点亮。
+        pet_sound_play(msg->sound_clip);
         break;
 
     case PET_MSG_NONE:
@@ -565,8 +573,13 @@ static void run_demo_menu(void)
     // 演示菜单里有人直接改背光(亮度示例页会停在任意档位), 所以让息屏策略先让开。
     // 亮度本身不用在这里给: hold 期间一律全亮, apply_screen() 已经写到 100 了。
     screen_hold(true);
+    // 演示菜单的 demo_audio 也在操作 ES8311, 提示音若在此期间从链路上进来,
+    // 两条流混写只会出杂音 —— 整段菜单期间静音, 退出后恢复。
+    pet_sound_set_enabled(false);
 
     demo_menu_run(s_input_queue);
+
+    pet_sound_set_enabled(true);
 
     // pet_ui 的状态(链路/Codex/文案/电量)在 destroy 时被刻意保留了, 所以重建
     // 界面后立刻就是最新画面, 不会闪回旧状态。
@@ -743,6 +756,11 @@ esp_err_t pet_app_start(void)
     if (xTaskCreate(battery_task, "pet_battery", 4096, NULL, 3,
                     &s_battery_task) != pdPASS) {
         ESP_LOGW(TAG, "电量任务创建失败, 电量将一直显示 --");
+    }
+
+    // 提示音播放任务。失败只是"任务完成时不响", 不值得因此不让宠物上线。
+    if (pet_sound_start() != ESP_OK) {
+        ESP_LOGW(TAG, "提示音任务创建失败, 任务完成时将没有声音");
     }
 
     // 有可用凭据就照旧直连; 只有实际生效的 SSID 仍是编译期占位符(说明这台设备
