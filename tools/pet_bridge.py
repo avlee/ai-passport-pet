@@ -51,7 +51,9 @@ Codex 会把每一轮对话写成 rollout JSONL: ~/.codex/sessions/YYYY/MM/DD/ro
     device   设备上报            kind(hello/poke), fw, pet
     battery  设备电量            soc(0..100, null 表示读不到)
     limits   Codex 用量限额      primary(5 小时窗已用%), weekly(周窗已用%),
+                                 plan(订阅类型 plus/pro/…, 拿不到是 null),
                                  delivered; 没读到过快照时是 null
+                                 plan 只走这条通道, **不下发设备**
     pets     可选宠物列表        pets_dir, cache_dir, slot_bytes, packer, items[],
                                  busy, last
                                  packer.available 为假表示这台桥接缺 Pillow,
@@ -113,7 +115,7 @@ import threading
 import time
 import zlib
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 # ---------------------------------------------------------------------------
 # 协议常量。必须与 main/pet_protocol.h 保持一致。
@@ -141,6 +143,9 @@ LIMITS_RESCAN_INTERVAL_S = 30.0
 # 256 KB 足够越过几十条普通事件; 再老的记录没有信息量, 交给更老的文件。
 LIMITS_TAIL_BYTES = 262144
 LIMITS_MAX_FILES = 6
+# plan_type(plus/pro/…)是**外来字符串**, 会原样进控制通道、再显示到菜单栏标题里。
+# 限长 + 白名单字符: 免得一个畸形或超长的值把菜单行撑变形。
+LIMITS_PLAN_MAX_LEN = 24
 
 # 推送宠物包时的分片大小。只影响进度事件的密度(约 200 次一条 3 MB 的包)。
 PET_SEND_CHUNK = 16384
@@ -289,23 +294,28 @@ class DeviceLink:
         self._publish({"event": "text", "text": squashed, "delivered": ok})
         return ok
 
-    def send_limits(self, primary_used: int | None,
-                    weekly_used: int | None) -> bool:
+    def send_limits(self, limits: LimitSnapshot) -> bool:
         """把 Codex 用量限额推给设备。
 
         两个百分比都是"已用", 设备自己换算成剩余量去画能量槽; None 表示这个窗口
         没读到过快照, 字段整个不下发 —— 设备侧的语义是"缺哪个就藏哪个"。
+
+        收整份快照而不是两个裸数字: 这条路径同时要往控制通道发一条 limits, 而它与
+        `_update_limits()` 发的那条**共用 ControlHub 里同一个槽位** —— 字段必须逐字
+        一致, 少一个就会把对方顶掉(菜单栏的订阅徽章会因此变空)。
         """
         payload: dict = {"type": "limits"}
-        if primary_used is not None:
-            payload["primary"] = primary_used
-        if weekly_used is not None:
-            payload["weekly"] = weekly_used
+        if limits.primary is not None:
+            payload["primary"] = limits.primary
+        if limits.weekly is not None:
+            payload["weekly"] = limits.weekly
         ok = self.send(payload)
-        print(f"[limits] 5h={primary_used}% 周={weekly_used}%"
+        print(f"[limits] 5h={limits.primary}% 周={limits.weekly}%"
+              f" plan={limits.plan}"
               f"{'' if ok else '  (设备未连接, 已丢弃)'}", flush=True)
-        self._publish({"event": "limits", "primary": primary_used,
-                       "weekly": weekly_used, "delivered": ok})
+        self._publish({"event": "limits", "primary": limits.primary,
+                       "weekly": limits.weekly, "plan": limits.plan,
+                       "delivered": ok})
         return ok
 
     def send_pet(self, pet_id: str, package: bytes) -> bool:
@@ -678,16 +688,49 @@ def _window_used(window: object) -> int | None:
     return used
 
 
-def parse_rate_limits(record: object) -> tuple[int | None, int | None] | None:
-    """从一条 rollout 记录里取 (5 小时窗已用%, 周窗已用%)。
+class LimitSnapshot(NamedTuple):
+    """一份限额快照。
+
+    三个字段同源 —— 都出自同一条 event_msg/token_count 记录里的 rate_limits, 所以
+    合成一个值传递: 分开传的话, "变了才推"的比较逻辑要在好几处各写一遍。
+
+    用 NamedTuple 而不是 dataclass, 是因为它仍然是 tuple: `_limits` 的比较、解包
+    写法都能原样沿用, 不必为了多一个字段把整条链路的取值方式改掉。
+    """
+
+    primary: int | None      # 5 小时窗已用%
+    weekly: int | None       # 周窗已用%
+    plan: str | None         # 订阅类型(plus/pro/…); 拿不到是 None
+
+
+def _plan_label(limits: dict) -> str | None:
+    """取订阅类型(rate_limits.plan_type)。形状不对返回 None。
+
+    值**原样透传, 不做中文映射**: plan 是专有名词, 而且档位随时会增加, 映射表只会
+    腐烂。首字母大写这类展示格式化归菜单栏那一侧。
+    """
+    value = limits.get("plan_type")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > LIMITS_PLAN_MAX_LEN:
+        return None
+    if not all(ch.isalnum() or ch in "_-+ " for ch in value):
+        return None
+    return value
+
+
+def parse_rate_limits(record: object) -> LimitSnapshot | None:
+    """从一条 rollout 记录里取一份限额快照(5 小时窗已用%, 周窗已用%, 订阅类型)。
 
     快照长这样(event_msg/token_count 记录的一个字段):
 
         "rate_limits": {"primary": {"used_percent": 98.0, "window_minutes": 300,
                                     "resets_at": ...},
-                        "secondary": {"used_percent": 31.0, ...}, ...}
+                        "secondary": {"used_percent": 31.0, ...},
+                        "plan_type": "plus", ...}
 
-    两个窗口都没有有效值时返回 None —— 那说明这不是一份限额快照。
+    三个字段全部取不到时返回 None —— 那说明这不是一份限额快照。
     """
     if not isinstance(record, dict):
         return None
@@ -695,13 +738,16 @@ def parse_rate_limits(record: object) -> tuple[int | None, int | None] | None:
     limits = payload.get("rate_limits") if isinstance(payload, dict) else None
     if not isinstance(limits, dict):
         return None
-    result = (_window_used(limits.get("primary")),
-              _window_used(limits.get("secondary")))
-    return result if result != (None, None) else None
+    result = LimitSnapshot(_window_used(limits.get("primary")),
+                           _window_used(limits.get("secondary")),
+                           _plan_label(limits))
+    # plan 单独有值也算一份快照: 换档(plus -> pro)而两个窗口恰好都没读到值的时候,
+    # 菜单栏那一行仍然该跟着变。
+    return None if all(value is None for value in result) else result
 
 
 def _last_rate_limits_in_file(path: str,
-                              tail_bytes: int) -> tuple[int | None, int | None] | None:
+                              tail_bytes: int) -> LimitSnapshot | None:
     """回看一个 rollout 文件的尾部, 取最后一条限额快照。没有返回 None。"""
     try:
         size = os.path.getsize(path)
@@ -728,7 +774,7 @@ def _last_rate_limits_in_file(path: str,
 def codex_limits_snapshot(
         max_files: int = LIMITS_MAX_FILES,
         tail_bytes: int = LIMITS_TAIL_BYTES,
-) -> tuple[int | None, int | None] | None:
+) -> LimitSnapshot | None:
     """在最近的 rollout 里从新到旧找第一份限额快照。
 
     每个文件只回看 tail_bytes(见 LIMITS_TAIL_BYTES), 最多看 max_files 个 ——
@@ -772,8 +818,8 @@ class CodexWatcher(threading.Thread):
         self.enabled = True
         # Codex 用量限额: _limits 是最新已知快照, _limits_on_device 是设备已经
         # 收到的那份。两者不等(包括断线期间发送失败)就要补发, 见 _flush_limits()。
-        self._limits: tuple[int | None, int | None] | None = None
-        self._limits_on_device: tuple[int | None, int | None] | None = None
+        self._limits: LimitSnapshot | None = None
+        self._limits_on_device: LimitSnapshot | None = None
         self._limits_rescan_at = 0.0   # monotonic; 0 = 启动后立刻扫一次
         # 链路代数: 上一次 _flush_limits() 看到的 DeviceLink.generation。-1 表示
         # 还没看过任何连接。代数变了就是新连接, 设备手里的限额一律作废。
@@ -1019,7 +1065,7 @@ class CodexWatcher(threading.Thread):
         self._emit("idle", "")
         return True
 
-    def _update_limits(self, rate: tuple[int | None, int | None]) -> None:
+    def _update_limits(self, rate: LimitSnapshot) -> None:
         """收到一份限额快照。值没变就不动 —— 广播和补发都以"变了"为准。"""
         if rate == self._limits:
             return
@@ -1027,7 +1073,8 @@ class CodexWatcher(threading.Thread):
         # 设备手里那份已经过时; 发送失败/断线时它连旧值都收不到, 统一由
         # _flush_limits() 补齐。
         self._limits_on_device = None
-        self._publish({"event": "limits", "primary": rate[0], "weekly": rate[1]})
+        self._publish({"event": "limits", "primary": rate.primary,
+                       "weekly": rate.weekly, "plan": rate.plan})
 
     def _flush_limits(self) -> None:
         """把最新限额推给设备, 直到设备真的收到为止。
@@ -1045,7 +1092,11 @@ class CodexWatcher(threading.Thread):
 
         if self._limits is None or self._limits == self._limits_on_device:
             return
-        if self.link.send_limits(*self._limits):
+        # send_limits 只往设备报文里放两个窗口 —— 那两块能量槽的语义就是"两个窗口
+        # 的剩余量", 订阅类型是菜单栏那一侧的信息, 固件协议因此完全不变。
+        # 副作用: 只有 plan 变化时也会重发一条内容相同的限额给设备(40 字节, 无害)。
+        # 改成"只比两个窗口"会让 _limits_on_device 的语义分叉, 不值当。
+        if self.link.send_limits(self._limits):
             self._limits_on_device = self._limits
 
     def _rescan_limits(self) -> None:

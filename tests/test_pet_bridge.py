@@ -191,10 +191,11 @@ def test_limits_roundtrip(exe: str) -> None:
         link = pet_bridge.DeviceLink()
         with contextlib.redirect_stdout(io.StringIO()):
             link.attach(local, "test")
-            assert link.send_limits(98, 31)
+            snap = pet_bridge.LimitSnapshot
+            assert link.send_limits(snap(98, 31, "plus"))
             # 缺哪个窗口就不发哪个字段; 两个都缺仍然是一条合法(但会被设备丢弃)的行。
-            assert link.send_limits(100, None)
-            assert link.send_limits(None, None)
+            assert link.send_limits(snap(100, None, "plus"))
+            assert link.send_limits(snap(None, None, None))
         raw = capture(peer)
     finally:
         local.close()
@@ -206,6 +207,8 @@ def test_limits_roundtrip(exe: str) -> None:
     assert [m["type"] for m in parsed] == ["limits", "limits"], parsed
     assert parsed[0]["primary"] == 98 and parsed[0]["weekly"] == 31, parsed
     assert parsed[1]["primary"] == 100 and parsed[1]["weekly"] == -1, parsed
+    # 订阅类型**不下发设备**(固件协议没动), 报文里不该出现它。
+    assert "plan" not in parsed[0] and "plan" not in parsed[1], parsed
 
 
 def test_send_without_device_is_safe() -> None:
@@ -966,12 +969,15 @@ def test_parse_rate_limits_shapes() -> None:
     """rollout 记录里限额快照的形状契约, 逐个钉住。"""
     now = time.time()
 
-    def record(primary: object, secondary: object) -> dict:
+    def record(primary: object, secondary: object,
+               plan: object = None) -> dict:
         rate: dict = {}
         if primary is not None:
             rate["primary"] = primary
         if secondary is not None:
             rate["secondary"] = secondary
+        if plan is not None:
+            rate["plan_type"] = plan
         return {"type": "event_msg",
                 "payload": {"type": "token_count", "rate_limits": rate}}
 
@@ -979,24 +985,45 @@ def test_parse_rate_limits_shapes() -> None:
               "resets_at": now + 100}
     week = {"used_percent": 31.4, "window_minutes": 10080,
             "resets_at": now + 1000}
-    assert pet_bridge.parse_rate_limits(record(window, week)) == (98, 31)
+    snap = pet_bridge.LimitSnapshot
+    assert pet_bridge.parse_rate_limits(
+        record(window, week)) == snap(98, 31, None)
     # 超上限钳到 100, 不是照单全收。
     assert pet_bridge.parse_rate_limits(
-        record({**window, "used_percent": 150}, week)) == (100, 31)
+        record({**window, "used_percent": 150}, week)) == snap(100, 31, None)
     # 只有一个窗口: 另一个是 None, 报文里就不带那个字段。
-    assert pet_bridge.parse_rate_limits(record(window, None)) == (98, None)
+    assert pet_bridge.parse_rate_limits(
+        record(window, None)) == snap(98, None, None)
     # 窗口已翻页(resets_at 已过): 用量按 0 报 —— 有新请求必有新快照, 没有就是没用。
     assert pet_bridge.parse_rate_limits(
-        record({**window, "resets_at": now - 1}, week)) == (0, 31)
+        record({**window, "resets_at": now - 1}, week)) == snap(0, 31, None)
     # 形状不对: used_percent 缺失/类型不对 → 该窗口 None; 全都没有 → 整条 None。
     assert pet_bridge.parse_rate_limits(
         record({"window_minutes": 300}, {"used_percent": True})) is None
     assert pet_bridge.parse_rate_limits(
-        record(window, {"used_percent": True})) == (98, None)
+        record(window, {"used_percent": True})) == snap(98, None, None)
     assert pet_bridge.parse_rate_limits({"payload": {}}) is None
     assert pet_bridge.parse_rate_limits({"payload": {"rate_limits": 3}}) is None
     assert pet_bridge.parse_rate_limits(None) is None
     assert pet_bridge.parse_rate_limits("text") is None
+
+    # 订阅类型(plan_type): 只做形状校验, **不**翻译成中文 —— 档位随时会增加。
+    assert pet_bridge.parse_rate_limits(
+        record(window, week, "plus")) == snap(98, 31, "plus")
+    # 首尾空白去掉; 值本身原样保留(大小写不改, 怎么显示是菜单栏的事)。
+    assert pet_bridge.parse_rate_limits(
+        record(window, week, "  Pro  ")) == snap(98, 31, "Pro")
+    # 类型不对 / 超长 / 含换行 → 只丢 plan, 两个窗口照旧。
+    assert pet_bridge.parse_rate_limits(
+        record(window, week, 42)) == snap(98, 31, None)
+    assert pet_bridge.parse_rate_limits(
+        record(window, week, "x" * 30)) == snap(98, 31, None)
+    assert pet_bridge.parse_rate_limits(
+        record(window, week, "pro\ninject")) == snap(98, 31, None)
+    # 只有 plan 有值也算一份快照(换档时两个窗口可能恰好都没读到值)。
+    assert pet_bridge.parse_rate_limits(
+        record(None, None, "pro")) == snap(None, None, "pro")
+    assert pet_bridge.parse_rate_limits(record(None, None)) is None
 
 
 def test_limits_flow_from_record_to_device() -> None:
@@ -1007,13 +1034,20 @@ def test_limits_flow_from_record_to_device() -> None:
                                           "resets_at": time.time() + 100},
                               "secondary": {"used_percent": 31.0,
                                             "window_minutes": 10080,
-                                            "resets_at": time.time() + 1000}}}}
+                                            "resets_at": time.time() + 1000},
+                              "plan_type": "plus"}}}
     link = pet_bridge.DeviceLink()
-    watcher = pet_bridge.CodexWatcher(link, 45.0)
+    events: list[dict] = []
+    watcher = pet_bridge.CodexWatcher(link, 45.0, on_event=events.append)
 
     with contextlib.redirect_stdout(io.StringIO()):
         watcher._handle_record(record)
-    assert watcher._limits == (98, 31), watcher._limits
+    assert watcher._limits == pet_bridge.LimitSnapshot(98, 31, "plus"), \
+        watcher._limits
+    # 订阅类型只走控制通道(菜单栏那一行), 不下发设备 —— 所以下面设备报文里
+    # 不该出现 plan 字段。
+    assert {"event": "limits", "primary": 98, "weekly": 31,
+            "plan": "plus"} in events, events
 
     # 设备没连上: 报文发不出去, 缓存留着 —— 重连后第一拍补上。
     with contextlib.redirect_stdout(io.StringIO()):
@@ -1027,7 +1061,9 @@ def test_limits_flow_from_record_to_device() -> None:
             watcher._flush_limits()
         wire = json.loads(capture(peer).decode("utf-8").strip())
         assert wire == {"type": "limits", "primary": 98, "weekly": 31}, wire
-        assert watcher._limits_on_device == (98, 31)
+        # 设备侧只认两个窗口; plan 不在报文里(固件协议没动)。
+        assert watcher._limits_on_device == pet_bridge.LimitSnapshot(
+            98, 31, "plus")
 
         # 同样的快照再来一遍(值没变): 不打扰设备, 也不顶掉控制通道里的旧值。
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1047,7 +1083,8 @@ def test_limits_flow_from_record_to_device() -> None:
                 watcher._flush_limits()
             wire = json.loads(capture(peer2).decode("utf-8").strip())
             assert wire == {"type": "limits", "primary": 98, "weekly": 31}, wire
-            assert watcher._limits_on_device == (98, 31)
+            assert watcher._limits_on_device == pet_bridge.LimitSnapshot(
+                98, 31, "plus")
         finally:
             local2.close()
             peer2.close()
@@ -1063,12 +1100,14 @@ def test_codex_limits_snapshot_scans_recent_files() -> None:
         folder = os.path.join(root, "2026", "09", "21")
         os.makedirs(folder)
 
-        def rate_line(primary: float, weekly: float, resets: int) -> str:
+        def rate_line(primary: float, weekly: float, resets: int,
+                      plan: str = "pro") -> str:
             payload = {"type": "token_count", "rate_limits": {
                 "primary": {"used_percent": primary, "window_minutes": 300,
                             "resets_at": resets},
                 "secondary": {"used_percent": weekly, "window_minutes": 10080,
-                              "resets_at": resets + 1000}}}
+                              "resets_at": resets + 1000},
+                "plan_type": plan}}
             return json.dumps({"timestamp": "t", "type": "event_msg",
                                "payload": payload}, ensure_ascii=False)
 
@@ -1091,7 +1130,10 @@ def test_codex_limits_snapshot_scans_recent_files() -> None:
 
         pet_bridge.CODEX_SESSIONS_GLOB = os.path.join(root, "**", "rollout-*.jsonl")
         try:
-            assert pet_bridge.codex_limits_snapshot() == (41, 7)
+            # 回扫这条路(桥接刚启动 / Codex 换了会话)同样要带出订阅类型 ——
+            # 菜单栏第一次连上来就该显示, 不必等跟随流的下一轮。
+            assert pet_bridge.codex_limits_snapshot() == \
+                pet_bridge.LimitSnapshot(41, 7, "pro")
             # 尾部窗口卡死到快照之前: 找不到就该返回 None, 而不是猜。
             assert pet_bridge.codex_limits_snapshot(tail_bytes=16) is None
         finally:
