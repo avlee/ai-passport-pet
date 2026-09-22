@@ -19,7 +19,7 @@ Codex 会把每一轮对话写成 rollout JSONL: ~/.codex/sessions/YYYY/MM/DD/ro
 
     event_msg/task_started          -> working   开始干活
     event_msg/item_completed        -> working   进度(命令/思考/改文件…)
-    event_msg/task_complete         -> ready     本轮完成
+    event_msg/task_complete         -> ready     本轮完成(顺带让设备播提示音)
     error 字段非空 / error 事件      -> failed    出错
     一段时间没有任何事件             -> idle      空闲
     审批/确认类事件                  -> waiting   等你确认
@@ -292,6 +292,13 @@ class DeviceLink:
         ok = self.send({"type": "text", "text": squashed})
         # 单独一种事件名: 只换文字不该把最近一次的 state 从 snapshot 里顶掉。
         self._publish({"event": "text", "text": squashed, "delivered": ok})
+        return ok
+
+    def send_sound(self, clip: str) -> bool:
+        ok = self.send({"type": "sound", "clip": clip})
+        # 同 send_text 的理由: 提示音不进 snapshot, 不顶掉任何已有事件。
+        # 设备不认识片段名时会静默忽略(协议向前兼容), 断线时 send() 自己丢弃。
+        self._publish({"event": "sound", "clip": clip, "delivered": ok})
         return ok
 
     def send_limits(self, limits: LimitSnapshot) -> bool:
@@ -976,6 +983,9 @@ class CodexWatcher(threading.Thread):
 
         if rtype == "event_msg" and ptype == "task_complete":
             self._emit("ready", message_text(payload.get("last_agent_message")))
+            # 本轮完成: 顺手让设备响一段庆祝提示音。不发 text/state 之外的
+            # 任何东西 —— 播放是"完成"的附属反馈, 状态本身已经由 _emit 发过。
+            self.link.send_sound("taskdone")
             return
 
         if rtype == "event_msg" and ptype == "item_completed":

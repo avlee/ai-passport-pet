@@ -670,9 +670,11 @@ def test_codex_records_map_to_pet_states() -> None:
          "failed", "速率受限"),
         ({"type": "event_msg", "payload": {"type": "exec_approval_request"}},
          "waiting", "等待你确认"),
+        # task_complete 除了状态行, 还会带一条提示音下行 —— 验证紧随其后。
         ({"type": "event_msg", "payload": {"type": "task_complete",
                                            "last_agent_message": "全部通过"}},
-         "ready", "全部通过"),
+         "ready", "全部通过",
+         [{"type": "sound", "clip": "taskdone"}]),
     ]
     link = pet_bridge.DeviceLink()
     local, peer = socket.socketpair()
@@ -680,14 +682,21 @@ def test_codex_records_map_to_pet_states() -> None:
         with contextlib.redirect_stdout(io.StringIO()):
             link.attach(local, "192.168.0.9:5000")
         watcher = pet_bridge.CodexWatcher(link, 45.0)
-        for record, state, text in cases:
+        # 三元组是"只有 state 一条下行"; 第四个元素列出 state 之外**按序**跟随的
+        # 附加下行(目前只有 task_complete 的提示音)。两条下行可能一次性到达,
+        # 所以整批读出来按序比较, 而不是按"一次一条"读。
+        for case in cases:
+            record, state, text = case[:3]
+            sound_lines = case[3] if len(case) > 3 else []
             with contextlib.redirect_stdout(io.StringIO()):
                 watcher._handle_record(record)
             assert watcher.state == state, (record, watcher.state)
-            wire = json.loads(capture(peer).decode("utf-8").strip())
-            expected = {"type": "state", "state": state}
+            expected = [{"type": "state", "state": state}]
             if text:
-                expected["text"] = text
+                expected[0]["text"] = text
+            expected += sound_lines
+            wire = [json.loads(line) for line in
+                    capture(peer).decode("utf-8").splitlines() if line.strip()]
             assert wire == expected, (record, wire)
 
         # 这些记录与状态无关(用量统计/原始条目/上下文), 一条报文都不该发出去 ——
@@ -825,8 +834,15 @@ def test_codex_watcher_follows_a_session_and_drives_the_device() -> None:
             def device_states() -> list[str]:
                 nonlocal seen
                 seen += capture(peer)
-                return [json.loads(line)["state"]
-                        for line in seen.decode("utf-8").splitlines() if line.strip()]
+                # task_complete 会多带一条提示音下行, 这里只收集 state 行。
+                states = []
+                for line in seen.decode("utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    if record.get("type") == "state":
+                        states.append(record["state"])
+                return states
 
             assert wait_for(lambda: device_states() == ["working", "working", "ready"]), \
                 device_states()
@@ -876,7 +892,10 @@ def test_codex_watcher_keeps_a_record_split_across_writes() -> None:
             assert watcher.state == "ready", watcher.state
             wire = capture(peer).decode("utf-8").splitlines()
             assert [json.loads(line) for line in wire] == [
-                {"type": "state", "state": "ready", "text": "写完一半"}], wire
+                {"type": "state", "state": "ready", "text": "写完一半"},
+                # 状态行之后紧跟着提示音 —— 顺序也钉住, 设备靠它先亮屏再响。
+                {"type": "sound", "clip": "taskdone"},
+            ], wire
         finally:
             local.close()
             peer.close()
