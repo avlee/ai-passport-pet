@@ -299,6 +299,18 @@ static bool parse_line(const char *line, pet_msg_cb_t cb, void *user)
         msg.type = PET_MSG_LIMITS;
         cb(&msg, user);
         return true;
+    } else if (strcmp(type, "sound") == 0) {
+        // 提示音请求。clip 缺失、为空或被截断都播放不出任何有意义的东西 ——
+        // 宁可不响, 也不要把半截片段名交给播放器去猜。这里不查白名单: 片段名
+        // 是否认识是应用层(pet_sound.c)的事, 协议层保持对主机侧向前兼容。
+        if (!json_get_string(line, "clip", msg.sound_clip,
+                             sizeof(msg.sound_clip), &truncated) ||
+            msg.sound_clip[0] == '\0' || truncated) {
+            return false;
+        }
+        msg.type = PET_MSG_SOUND;
+        cb(&msg, user);
+        return true;
     } else if (strcmp(type, "pet") == 0) {
         // 宠物包宣告。id/size/crc32 缺一不可 —— 少一个就没法判断该收多久、收对了没,
         // 所以不完整的宣告直接丢弃(不回调), 后面的字节会继续被当成文本解析, 结果是

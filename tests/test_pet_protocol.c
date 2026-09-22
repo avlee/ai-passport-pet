@@ -398,6 +398,39 @@ static void test_plan_label_display_name(void)
     assert(!pet_plan_label("plus", out, 0));
 }
 
+// 提示音请求。解析器只负责把 clip 原样解出来, 不查白名单 —— 认不认得这个
+// 片段名是播放器(pet_sound.c)的事, 协议层对主机侧向前兼容。
+static void test_sound_message(void)
+{
+    pet_protocol_t protocol;
+    pet_protocol_init(&protocol);
+    capture_t capture = {0};
+
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"sound\",\"clip\":\"taskdone\"}\n") == 1);
+    assert(capture.count == 1);
+    assert(capture.messages[0].type == PET_MSG_SOUND);
+    assert(strcmp(capture.messages[0].sound_clip, "taskdone") == 0);
+
+    // 未来的片段名照收: 主机比固件新是常态, 设备侧静默忽略即可。
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"sound\",\"clip\":\"some-future-clip\"}\n") == 1);
+    assert(strcmp(capture.messages[0].sound_clip, "some-future-clip") == 0);
+
+    // 恰好放得下的名字(23 字节, 缓冲是 PET_PROTOCOL_CLIP_MAX - 1 + NUL)合法。
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"sound\",\"clip\":\"aaaaa12345678901234567a\"}\n")
+           == 1);
+
+    // 缺 clip / 空 clip / 超长截断: 都播放不出有意义的东西, 一律不回调。
+    assert(feed(&capture, &protocol, "{\"type\":\"sound\"}\n") == 0);
+    assert(feed(&capture, &protocol, "{\"type\":\"sound\",\"clip\":\"\"}\n") == 0);
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"sound\",\"clip\":\"aaaaa123456789012345678a\"}\n")
+           == 0);
+    assert(capture.count == 0);  // feed() 每次清零, 这里只统计最后一批(全拒)
+}
+
 int main(void)
 {
     test_state_message();
@@ -407,6 +440,7 @@ int main(void)
     test_pet_announce_message();
     test_pet_announce_rejects_incomplete();
     test_limits_message();
+    test_sound_message();
     test_text_only_message();
     test_escapes_and_unicode();
     test_raw_utf8_passthrough();
