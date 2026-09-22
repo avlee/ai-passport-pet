@@ -113,10 +113,11 @@ bridge_dir="$app_dir/Contents/Resources/bridge"
 mkdir -p "$bridge_dir"
 cp "$repo_root/tools/pet_bridge.py" "$repo_root/tools/gen_pet_package.py" "$bridge_dir/"
 
-# 菜单栏与应用图标: Assets/ 下四件由同目录的 CodexPetBridge.png 经 make_icons.py
-# 派生(裁透明边、补方形 + 6% 边距; 菜单 18/36px、About 透明 256px、应用 icns
-# 多尺寸 —— Tahoe 会给透明 icns 垫灰板, 系统行为, 不另做底色)。源图只留档,
-# 换图标时跑 make_icons.py 重新派生, 不要手动改派生产物。
+# 菜单栏与应用图标: Assets/ 下四件派生自两个来源 —— menu-icon/about-icon 由
+# 同目录 CodexPetBridge.png 经 make_icons.py 派生(裁透明边、补方形 + 6% 边距,
+# 菜单 18/36px、About 透明 256px); AppIcon.icns 派生自 AppIcon.icon(Icon Composer
+# 工程, ictool 渲 Liquid Glass, 本机没装时退回平面派生 —— 见 make_icons.py)。
+# 源图/图标工程只留档, 换图标时跑 make_icons.py 重新派生, 不要手动改派生产物。
 cp "$here/Assets/menu-icon.png" "$here/Assets/menu-icon@2x.png" \
     "$here/Assets/AppIcon.icns" "$here/Assets/about-icon.png" \
     "$app_dir/Contents/Resources/"
