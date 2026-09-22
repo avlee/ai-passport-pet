@@ -20,7 +20,7 @@
 
 For configuration, converter commands, CMake integration, safe fallback code, and glyph-check examples, follow the [detailed LVGL Chinese text guide](lvgl-chinese-fonts.md).
 
-The baseline enables Montserrat 14 and 20 in [`sdkconfig.defaults`](../../../sdkconfig.defaults); neither contains Chinese glyphs. A correct UTF-8 string can therefore appear as boxes or blank text. Serial-console output, an installed computer font, and a successful firmware build do not prove that LVGL can render that text.
+The baseline enables Montserrat 12, 14 and 20 in [`sdkconfig.defaults`](../../../sdkconfig.defaults); none of them contains Chinese glyphs. A correct UTF-8 string can therefore appear as boxes or blank text. Serial-console output, an installed computer font, and a successful firmware build do not prove that LVGL can render that text.
 
 ### Before implementing or changing Chinese UI
 

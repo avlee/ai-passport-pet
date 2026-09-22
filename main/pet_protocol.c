@@ -281,13 +281,19 @@ static bool parse_line(const char *line, pet_msg_cb_t cb, void *user)
     } else if (strcmp(type, "ping") == 0) {
         msg.type = PET_MSG_PING;
     } else if (strcmp(type, "limits") == 0) {
-        // 用量限额。两个窗口都缺的行没有任何信息量, 直接丢弃; 只缺一个也接受 ——
+        // 用量限额。三个字段全缺的行没有任何信息量, 直接丢弃; 只缺一部分也接受 ——
         // 桥接的语义就是"缺哪个藏哪个"。
         const bool has_primary = json_get_pct(line, "primary",
                                               &msg.limits_primary_used);
         const bool has_weekly = json_get_pct(line, "weekly",
                                              &msg.limits_weekly_used);
-        if (!has_primary && !has_weekly) return false;
+        // 档位单独算"这一行没白来": 换档(plus -> pro)时两个窗口可能恰好都没读到
+        // 值, 而徽标仍然该跟着变。空串不算 —— "plan":"" 什么都没说, 与整个键不发是
+        // 一回事(界面那边只会把徽标藏起来)。
+        msg.has_limits_plan = json_get_string(line, "plan", msg.limits_plan,
+                                              sizeof(msg.limits_plan), NULL) &&
+                              msg.limits_plan[0] != '\0';
+        if (!has_primary && !has_weekly && !msg.has_limits_plan) return false;
         if (!has_primary) msg.limits_primary_used = -1;
         if (!has_weekly) msg.limits_weekly_used = -1;
         msg.type = PET_MSG_LIMITS;
@@ -437,4 +443,40 @@ bool pet_protocol_escape(const char *input, char *output, size_t output_size)
 
     output[written] = '\0';
     return complete;
+}
+
+bool pet_plan_label(const char *plan, char *output, size_t output_size)
+{
+    if (output == NULL || output_size == 0) return false;
+
+    // 先挑出可打印 ASCII。桥接的白名单(Python 的 isalnum())对非 ASCII 是放行的,
+    // 而徽标字体只有拉丁字形 —— 与其画一片缺字方框, 不如那些字节根本不进来。
+    size_t written = 0;
+    if (plan != NULL) {
+        for (const char *p = plan; *p != '\0' && written + 1 < output_size; p++) {
+            const unsigned char c = (unsigned char)*p;
+            if (c < 0x20 || c > 0x7E) continue;
+            output[written++] = (char)c;
+        }
+    }
+    output[written] = '\0';
+
+    // 去掉首尾空白: 桥接 strip 过一次, 这里兜住手工构造或测试直接喂进来的数据。
+    size_t start = 0;
+    while (start < written && is_space(output[start])) start++;
+    size_t end = written;
+    while (end > start && is_space(output[end - 1])) end--;
+    if (end == start) {
+        output[0] = '\0';
+        return false;   // 全是空白: 与"没读到档位"同义, 让调用方藏起徽标
+    }
+    if (start > 0) memmove(output, output + start, end - start);
+    output[end - start] = '\0';
+
+    // 首字母大写, 其余原样。只认 ASCII 字母 —— 其余字符(数字、'-'、'_')原样留着,
+    // 值本身是 OpenAI 的档位标识, 我们不做翻译也不做猜测。
+    if (output[0] >= 'a' && output[0] <= 'z') {
+        output[0] = (char)(output[0] - 'a' + 'A');
+    }
+    return true;
 }

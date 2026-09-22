@@ -60,12 +60,14 @@ def device_parse(exe: str, raw: bytes) -> list[dict]:
         if not line:
             continue
         if line.startswith("limits "):
-            # 限额消息是纯数字字段, 挂具单独成行输出: limits <primary> <weekly>
-            _, primary, weekly = line.split(" ", 2)
+            # 挂具单独成行输出: limits <primary> <weekly> <plan|->
+            # plan 用 maxsplit 留在最后一段(档位名可能含空格), "-" 表示未提供。
+            _, primary, weekly, plan = line.split(" ", 3)
             messages.append({
                 "type": "limits",
                 "primary": int(primary),
                 "weekly": int(weekly),
+                "plan": None if plan == "-" else plan,
             })
             continue
         mtype, has_state, state, has_text, text = line.split(" ", 4)
@@ -185,7 +187,7 @@ def test_ping_and_poke_roundtrip(exe: str) -> None:
 
 
 def test_limits_roundtrip(exe: str) -> None:
-    """限额报文走完整链路: Bridge 发的字节必须被设备解析器读成同样的百分比。"""
+    """限额报文走完整链路: Bridge 发的字节必须被设备解析器读成同样的百分比与档位。"""
     local, peer = socket.socketpair()
     try:
         link = pet_bridge.DeviceLink()
@@ -193,22 +195,29 @@ def test_limits_roundtrip(exe: str) -> None:
             link.attach(local, "test")
             snap = pet_bridge.LimitSnapshot
             assert link.send_limits(snap(98, 31, "plus"))
-            # 缺哪个窗口就不发哪个字段; 两个都缺仍然是一条合法(但会被设备丢弃)的行。
+            # 缺哪个窗口就不发哪个字段; 档位照发。
             assert link.send_limits(snap(100, None, "plus"))
+            # 三样全缺: 报文合法但没有任何信息量, 设备侧整行丢弃。
             assert link.send_limits(snap(None, None, None))
+            # 只有档位: 同样有信息量, 设备侧要收下 —— 换档(plus -> pro)时两个窗口
+            # 可能恰好都还没读到值, 而顶栏的徽标仍然该跟着变。
+            assert link.send_limits(snap(None, None, "pro"))
         raw = capture(peer)
     finally:
         local.close()
         peer.close()
 
-    assert raw.count(b"\n") == 3, raw
+    assert raw.count(b"\n") == 4, raw
     parsed = device_parse(exe, raw)
-    # 第三行(两个窗口都没有)没有信息量, 设备侧整行丢弃。
-    assert [m["type"] for m in parsed] == ["limits", "limits"], parsed
-    assert parsed[0]["primary"] == 98 and parsed[0]["weekly"] == 31, parsed
-    assert parsed[1]["primary"] == 100 and parsed[1]["weekly"] == -1, parsed
-    # 订阅类型**不下发设备**(固件协议没动), 报文里不该出现它。
-    assert "plan" not in parsed[0] and "plan" not in parsed[1], parsed
+    # 四个报文里只有"三样全缺"那条被丢弃, 其余三条都成消息。
+    assert [m["type"] for m in parsed] == ["limits", "limits", "limits"], parsed
+    assert (parsed[0]["primary"], parsed[0]["weekly"], parsed[0]["plan"]) \
+        == (98, 31, "plus"), parsed
+    assert (parsed[1]["primary"], parsed[1]["weekly"], parsed[1]["plan"]) \
+        == (100, -1, "plus"), parsed
+    # 只有档位那一条: 两个窗口按"未提供"(-1)落下来, 档位原样送到。
+    assert (parsed[2]["primary"], parsed[2]["weekly"], parsed[2]["plan"]) \
+        == (-1, -1, "pro"), parsed
 
 
 def test_send_without_device_is_safe() -> None:
@@ -1044,8 +1053,7 @@ def test_limits_flow_from_record_to_device() -> None:
         watcher._handle_record(record)
     assert watcher._limits == pet_bridge.LimitSnapshot(98, 31, "plus"), \
         watcher._limits
-    # 订阅类型只走控制通道(菜单栏那一行), 不下发设备 —— 所以下面设备报文里
-    # 不该出现 plan 字段。
+    # 控制通道那条: 菜单栏的订阅徽章就是从它取值的。
     assert {"event": "limits", "primary": 98, "weekly": 31,
             "plan": "plus"} in events, events
 
@@ -1060,8 +1068,9 @@ def test_limits_flow_from_record_to_device() -> None:
             link.attach(local, "test")
             watcher._flush_limits()
         wire = json.loads(capture(peer).decode("utf-8").strip())
-        assert wire == {"type": "limits", "primary": 98, "weekly": 31}, wire
-        # 设备侧只认两个窗口; plan 不在报文里(固件协议没动)。
+        assert wire == {"type": "limits", "primary": 98, "weekly": 31,
+                        "plan": "plus"}, wire
+        # 设备报文与控制通道事件字段逐字一致 —— 两条发布路径共用同一个快照值。
         assert watcher._limits_on_device == pet_bridge.LimitSnapshot(
             98, 31, "plus")
 
@@ -1082,7 +1091,8 @@ def test_limits_flow_from_record_to_device() -> None:
                 link.attach(local2, "test-reboot")
                 watcher._flush_limits()
             wire = json.loads(capture(peer2).decode("utf-8").strip())
-            assert wire == {"type": "limits", "primary": 98, "weekly": 31}, wire
+            assert wire == {"type": "limits", "primary": 98, "weekly": 31,
+                            "plan": "plus"}, wire
             assert watcher._limits_on_device == pet_bridge.LimitSnapshot(
                 98, 31, "plus")
         finally:

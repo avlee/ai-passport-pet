@@ -54,10 +54,20 @@ static const char *TAG = "pet_ui";
 #define ROW_DOT_Y   16
 #define ROW_DOT_D    8
 #define STATUS_X    32
-#define STATUS_Y     5
+// 状态文字走 title 档(20 px, 行高 29)。行框顶**不是**让两侧行框等高, 而是让**墨迹的
+// 垂直中心**落在顶栏的中线上: 电池图形的中心是 y=20(外框 15..25), 而 pet_font_20 的
+// 汉字墨迹中心在行框顶下约 14 px(18 行的字形) —— 所以 6 是让状态文字与电池图形同轴的
+// 那个值。改字号必须重算, 别照抄旧值。
+// 墨迹最深到 y=29(汉字字面下不出头), 而舞台顶边不早于 PET_LAYOUT_STAGE_TOP_MIN=30,
+// 所以行框(6..34)虽然探进舞台区, 可见笔画不会被压住。
+#define STATUS_Y     6
 
 #define BAT_TEXT_X   130
-#define BAT_TEXT_Y     7
+// 电量数字(pet_font_16)的墨迹是 12 行(box_h=12, ofs_y=0), 中心在行框顶下 10.5 px;
+// 电池图形三项几何(外框 15..25 / 正极 18..22 / 填充 17..23)的中心都是 20。9 是最接近的
+// 整数解(墨迹 14..25, 中心 19.5, 余差 0.5 px) —— 12 行的墨迹配 11 行的外框本来就差着
+// 半行, 20.5 那一侧(10)会把数字压到比左侧状态文字低 1 px 以上, 顶栏整条线就歪了。
+#define BAT_TEXT_Y     9
 #define BAT_TEXT_W    74
 #define BAT_BODY_X   208
 #define BAT_BODY_Y    15
@@ -78,13 +88,36 @@ static const char *TAG = "pet_ui";
 #define INFO_H      250
 
 _Static_assert(STATUS_X + 88 <= BAT_TEXT_X,
-               "状态文字要给右边的电量让出位置(最长那条 4 个汉字 = 80 px)");
+               "状态文字要给右边的电量让出位置(最长那条「等待确认」4 个汉字 @20 px = 80 px,"
+               " 留 8 px 余量)");
 _Static_assert(BAT_BODY_X + BAT_BODY_W + BAT_CAP_W <= PET_LAYOUT_SCR_W,
                "电池图形不能超出屏幕右边");
 _Static_assert(BAT_CAP_X == BAT_BODY_X + BAT_BODY_W,
                "电池正极要贴在电池体右侧");
 _Static_assert(BAT_FILL_X > BAT_BODY_X && BAT_FILL_X + BAT_FILL_MAX_W < BAT_CAP_X,
                "电量填充必须落在电池体内");
+
+// 订阅徽标: 紧贴电量下方那一行, 右对齐到电池图形右边缘。档位名(plus/pro/…)来自
+// Codex 的限额快照, 由桥接随 limits 消息下发, 设备侧原样显示、不做翻译。
+//
+// 位置是**右对齐 + 顶部锚定**: 档位名变长时只向左生长, 不会顶出屏幕右边。
+// 宽度**不写死** —— 它得避开舞台(舞台水平居中、宽度随宠物变), 所以实际宽度在
+// refresh_plan_locked() 里按运行时舞台几何算。
+#define PLAN_BADGE_RIGHT   234  // 右边缘, 与电池图形右边缘(233)齐平
+#define PLAN_BADGE_Y        30  // 顶栏(y 6..28)之下的第一行
+#define PLAN_BADGE_H        20  // 12 px 档位名的行高是 15, 20 让上下各留 2~3 px
+#define PLAN_BADGE_PAD       5  // 文字左右各留的内边距
+#define PLAN_BADGE_MIN_W    22  // 窄于此就整块藏起来, 不给一个读不出来的胶囊
+
+_Static_assert(PLAN_BADGE_Y >= BAT_BODY_Y + BAT_BODY_H,
+               "订阅徽标要落在电量下面, 不能跟电池图形挤在一起");
+_Static_assert(PLAN_BADGE_RIGHT + 6 <= PET_LAYOUT_SCR_W,
+               "徽标要给屏幕右侧的圆角留出余量");
+_Static_assert(PLAN_BADGE_Y >= PET_LAYOUT_STAGE_TOP_MIN,
+               "徽标与舞台顶边同一条线起算, 不能压进顶栏");
+// montserrat_12 的行高是 15(真值在 managed_components 的 lv_font_montserrat_12.c),
+// 胶囊内高必须容得下这一行, 否则文字会被裁。
+_Static_assert(PLAN_BADGE_H > 15, "徽标高度要塞得下 12 px 档位名的行高(15)");
 
 // Codex 用量能量槽: 站台台身(文字框)内左右两条竖槽 —— 左 = 5 小时窗(红),
 // 右 = 周窗(蓝)。颜色 + 位置 + 小标签三重编码, 新观众也能对上号。
@@ -96,7 +129,8 @@ _Static_assert(BAT_FILL_X > BAT_BODY_X && BAT_FILL_X + BAT_FILL_MAX_W < BAT_CAP_
 #define GAUGE_INSET        4   // 距台身左右边框的水平内缩
 #define GAUGE_VPAD         8   // 距台身顶的竖直内缩, 避开 14px 圆角弧
 #define GAUGE_MIN_H        3   // 有剩余时的最小可见高度, 否则 1% 看起来像空的
-#define GAUGE_LABEL_H     16   // 槽底小标签("5h"/"7d")的行高, 从槽底高度里扣
+#define GAUGE_LABEL_H     15   // 槽底小标签("5h"/"7d")占的行高, 从槽底高度里扣。
+                               // 12 px 档(montserrat_12)的行高真值就是 15
 #define GAUGE_LABEL_GAP    1   // 标签与槽底贴近, 把竖直空间尽量留给槽体
 #define GAUGE_LABEL_W     26   // 标签行框宽(左标签左对齐/右标签右对齐于槽)
 #define GAUGE_BOTTOM_CLEAR 4   // 标签底与台身底边的净空。压线但不出弧: 标签最底
@@ -183,6 +217,8 @@ static lv_obj_t *s_bat_fill;
 static lv_obj_t *s_gauge_track[2];  // [0]=左槽(5 小时窗) [1]=右槽(周窗)
 static lv_obj_t *s_gauge_fill[2];
 static lv_obj_t *s_gauge_label[2];
+static lv_obj_t *s_plan_badge;       // 电量下方的订阅徽标(圆角胶囊)
+static lv_obj_t *s_plan_badge_text;
 static lv_obj_t *s_plat_body;
 static lv_obj_t *s_plat_text;
 static lv_obj_t *s_stage;
@@ -232,6 +268,8 @@ static int               s_battery;
 // 与电量一样: build/destroy 只管对象, 数值留在模块里, 重建界面后立刻恢复。
 static int s_limit_primary = -1;
 static int s_limit_weekly  = -1;
+// 订阅档位(如 "plus")。空串 = 还没读到, 徽标整个隐藏 —— 与百分比同一个规矩。
+static char s_limit_plan[PET_PROTOCOL_PLAN_MAX];
 
 static char     s_prov_device[24];
 static char     s_prov_pin_text[8];
@@ -392,6 +430,49 @@ static void refresh_battery_locked(void)
     int width = (s_battery * BAT_FILL_MAX_W) / 100;
     if (width < 1) width = 1;
     lv_obj_set_size(s_bat_fill, width, BAT_FILL_H);
+}
+
+// 订阅徽标: 电量下方那个圆角胶囊。没读到档位就整块藏起来 —— 与电量显示 "--" 是
+// 同一个规矩: 不给一个猜出来的值。
+//
+// 宽度按**运行时**舞台几何算, 不写死: 舞台水平居中而宽度随宠物变(裁剪区并集),
+// 徽标左边界一旦越过舞台右边缘就会压在宠物身上。档位名比可用宽度还长时缩到可用
+// 宽度, 文字交给 label 的 DOT 模式省略 —— 屏幕只有 240 px, 与其压着宠物显示,
+// 不如老老实实截断。
+static void refresh_plan_locked(void)
+{
+    if (s_plan_badge == NULL) return;
+
+    // 展示名: 存着的是线路上的原样值("plus"), 画之前整成 "Plus" —— 与菜单栏那一侧
+    // 同一条规则(见 pet_protocol.h 的 pet_plan_label)。整不出可显示的字符时整块藏,
+    // 与"没读到档位"同样的表现。
+    char label[PET_PROTOCOL_PLAN_MAX];
+    if (!pet_plan_label(s_limit_plan, label, sizeof(label))) {
+        lv_obj_add_flag(s_plan_badge, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    const int avail = PLAN_BADGE_RIGHT - (s_layout.stage_x + s_layout.stage_w);
+    if (avail < PLAN_BADGE_MIN_W) {
+        // 这只宠物太宽, 右上角没地方了。宁可整块不显示, 也不画一个压在它身上的
+        // 半截胶囊。
+        lv_obj_add_flag(s_plan_badge, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    lv_label_set_text(s_plan_badge_text, label);
+    // 先按内容自适应再强制算一次布局, 才能拿到真实字形宽度(含字距调整)。
+    lv_obj_set_width(s_plan_badge_text, LV_SIZE_CONTENT);
+    lv_obj_update_layout(s_plan_badge_text);
+
+    int w = lv_obj_get_width(s_plan_badge_text) + 2 * PLAN_BADGE_PAD;
+    if (w > avail) w = avail;
+
+    lv_obj_set_size(s_plan_badge, w, PLAN_BADGE_H);
+    lv_obj_set_pos(s_plan_badge, PLAN_BADGE_RIGHT - w, PLAN_BADGE_Y);
+    lv_obj_set_width(s_plan_badge_text, w - 2 * PLAN_BADGE_PAD);
+    lv_obj_center(s_plan_badge_text);
+    lv_obj_remove_flag(s_plan_badge, LV_OBJ_FLAG_HIDDEN);
 }
 
 // 能量槽: 按剩余百分比把填充从槽底顶上来。掉线时不显示 —— 那时的快照是旧的,
@@ -615,6 +696,9 @@ static void build_top_row(void)
     // 状态圆点: 一眼看出链路/任务状态, 比读文字快。
     s_dot = make_box(s_screen, ROW_DOT_X, ROW_DOT_Y, ROW_DOT_D, ROW_DOT_D,
                      COL_MUTED, ROW_DOT_D / 2);
+    // 状态文字走 title 档(pet_font_20): 顶栏左边的主角, 比右侧电量数字大一档是有意的
+    // ——层级上"现在在干什么"比"还剩多少电"更该先被读到。竖直位置靠 STATUS_Y 与电池
+    // 图形同轴(见常量处的推导), 不靠"两侧行框等高"。
     s_status = make_label(s_screen, "", pet_font_title(), COL_INK);
     lv_obj_set_pos(s_status, STATUS_X, STATUS_Y);
 
@@ -634,6 +718,27 @@ static void build_top_row(void)
     s_bat_fill = make_box(s_screen, BAT_FILL_X, BAT_FILL_Y, 1, BAT_FILL_H,
                           COL_GOOD, 1);
     lv_obj_set_style_bg_opa(s_bat_fill, LV_OPA_TRANSP, 0);
+}
+
+// 订阅徽标: 圆角胶囊。边框用与电量同一个绿(COL_GOOD), 底色是同一个绿的低透明度
+// —— 屏幕底色本来就深, 半透明绿叠上去就是"浅绿底 + 亮绿边"的观感。
+static void build_plan_badge(void)
+{
+    s_plan_badge = make_box(s_screen, 0, 0, 1, PLAN_BADGE_H, COL_GOOD,
+                            PLAN_BADGE_H / 2);
+    lv_obj_set_style_bg_opa(s_plan_badge, LV_OPA_30, 0);
+    lv_obj_set_style_border_width(s_plan_badge, 1, 0);
+    lv_obj_set_style_border_color(s_plan_badge, lv_color_hex(COL_GOOD), 0);
+    lv_obj_add_flag(s_plan_badge, LV_OBJ_FLAG_HIDDEN);
+
+    // 用内置的 montserrat_12(行高 15, sdkconfig 已启用) —— 与能量槽小标签同档, 都是
+    // 辅助信息, 不抢主内容。20 px 的胶囊里上下各余 2~3 px。
+    // 档位名是 ASCII(桥接侧已按白名单过滤过), 内置字体够用, 不必动用中文字库。
+    s_plan_badge_text = make_label(s_plan_badge, "", &lv_font_montserrat_12,
+                                   COL_GOOD);
+    // 文字比胶囊宽时省略而不是换行 —— 换行会把 label 撑高, 溢出 20 px 的胶囊。
+    lv_label_set_long_mode(s_plan_badge_text, LV_LABEL_LONG_DOT);
+    lv_obj_center(s_plan_badge_text);
 }
 
 static void build_gauges(void)
@@ -657,10 +762,10 @@ static void build_gauges(void)
         lv_obj_add_flag(s_gauge_fill[i], LV_OBJ_FLAG_HIDDEN);
 
         // 行框宽是固定的, 对齐方式决定文字贴槽的哪一侧。
-        // 行框只钉宽不钉高: 高度钉死会把字库真实行高(>16)裁出"下半截缺失"。
-        // montserrat_14 是 LVGL 内置字体(sdkconfig 已启用), 行高恰好 16,
-        // 与 GAUGE_LABEL_H 的几何预留吻合; ASCII 覆盖足够两条小标签。
-        s_gauge_label[i] = make_label(s_screen, labels[i], &lv_font_montserrat_14,
+        // 行框只钉宽不钉高: 高度钉死会把字库真实行高裁出"下半截缺失"。
+        // montserrat_12 是 LVGL 内置字体(sdkconfig 已启用, 与订阅徽标同档),
+        // 行高恰好 15, 与 GAUGE_LABEL_H 的几何预留吻合; ASCII 覆盖足够两条小标签。
+        s_gauge_label[i] = make_label(s_screen, labels[i], &lv_font_montserrat_12,
                                       COL_MUTED);
         lv_obj_set_width(s_gauge_label[i], GAUGE_LABEL_W);
         lv_obj_set_style_text_align(s_gauge_label[i],
@@ -949,11 +1054,13 @@ void pet_ui_build(void)
     // 能量槽最后建(信息面板之前): 它画在台身正面, 必须压在站台之上 —— LVGL
     // 后建的兄弟对象盖先建的, 摆在 build_platform() 之前会被台身整个盖住。
     build_gauges();
+    build_plan_badge();
     build_info();
     build_provision();   // 最后建: 配网页要盖在信息面板之上
     refresh_status_locked();
     refresh_battery_locked();
     refresh_gauges_locked();
+    refresh_plan_locked();
     refresh_provision_locked();
     set_info_visible_locked(s_info_visible);  // 重建时恢复面板显隐
 
@@ -961,6 +1068,12 @@ void pet_ui_build(void)
     s_anim_timer = lv_timer_create(anim_tick, 1, NULL);
     // 放在定时器之后: 里面要按显隐调定时器周期。
     set_provision_visible_locked(s_prov_visible);
+
+    // 订阅徽标显式置顶(index 层级)。它画在顶栏之下、舞台右侧那块空白上, 而舞台/
+    // 站台/能量槽都是后建的兄弟对象 —— 靠"最后建"来保证不被盖住太脆弱, 以后往
+    // build 里加任何元素都会压掉它。信息面板与配网页是模态覆盖层, 显示时各自会
+    // move_foreground, 仍然盖在徽标之上; 隐藏的对象不参与绘制, 徽标自然露回来。
+    lv_obj_move_foreground(s_plan_badge);
 
     ESP_LOGI(TAG, "界面就绪: 宠物 %s, 舞台 %dx%d @ (%d,%d) 脚底 y=%d, "
                   "站台 %d..%d, 行高 %d",
@@ -1017,6 +1130,8 @@ void pet_ui_destroy(void)
         s_gauge_track[i] = NULL;
         s_gauge_label[i] = NULL;
     }
+    s_plan_badge = NULL;
+    s_plan_badge_text = NULL;
     s_sleep = NULL;
     s_info_scrim = NULL;
     s_info_panel = NULL;
@@ -1107,7 +1222,7 @@ void pet_ui_set_battery(int soc_percent)
     bsp_lvgl_unlock();
 }
 
-void pet_ui_set_limits(int primary_used, int weekly_used)
+void pet_ui_set_limits(int primary_used, int weekly_used, const char *plan)
 {
     // 越界值按"没有快照"处理: 协议层拦过一道, 这里只兜内部不一致。
     if (primary_used < 0 || primary_used > 100) primary_used = -1;
@@ -1116,7 +1231,15 @@ void pet_ui_set_limits(int primary_used, int weekly_used)
     if (!bsp_lvgl_lock(1000)) return;
     s_limit_primary = primary_used;
     s_limit_weekly = weekly_used;
+    // 档位名空串或超长一律当"没读到": 协议层已经限过一道长度(见 PET_PROTOCOL_PLAN_MAX),
+    // 这里只兜内部不一致, 免得一个畸形值把顶栏那一行撑变形。
+    if (plan != NULL && plan[0] != '\0' && strlen(plan) < sizeof(s_limit_plan)) {
+        snprintf(s_limit_plan, sizeof(s_limit_plan), "%s", plan);
+    } else {
+        s_limit_plan[0] = '\0';
+    }
     refresh_gauges_locked();
+    refresh_plan_locked();
     bsp_lvgl_unlock();
 }
 
@@ -1294,6 +1417,8 @@ void pet_ui_begin_transfer(const char *pet_id, uint32_t total_bytes)
         s_gauge_track[i] = NULL;
         s_gauge_label[i] = NULL;
     }
+    s_plan_badge = NULL;
+    s_plan_badge_text = NULL;
     s_sleep = NULL;
     s_info_scrim = NULL;
     s_info_panel = NULL;

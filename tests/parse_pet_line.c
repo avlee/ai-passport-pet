@@ -1,6 +1,7 @@
 // tests/parse_pet_line.c
 // 把 stdin 上的字节喂给设备侧的协议解析器, 每解析出一条消息打一行:
 //     <type> <has_state> <state> <has_text> <text>
+//     limits <primary> <weekly> <plan|->     (限额消息用这一种行式)
 //
 // 用途: tests/test_pet_bridge.py 把 Mac 侧 Pet Bridge 真正发出去的字节灌进来,
 // 用设备自己的解析器读一遍再比对。这样协议的两端是互相校验的, 不靠人工对文档。
@@ -13,9 +14,12 @@ static void report(const pet_message_t *msg, void *user)
 {
     (void)user;
     if (msg->type == PET_MSG_LIMITS) {
-        // 限额是纯数字字段, 单独一行打出来, 供桥接侧测试逐字段比对。
-        printf("limits %d %d\n", (int)msg->limits_primary_used,
-               (int)msg->limits_weekly_used);
+        // 限额字段单独一行打出来, 供桥接侧测试逐字段比对。
+        // plan 放在**最后**、调用方按 split(" ", 3) 切: 档位名理论上可能含空格
+        // (桥接侧的白名单允许), 摆在后面就不会被切碎。
+        printf("limits %d %d %s\n", (int)msg->limits_primary_used,
+               (int)msg->limits_weekly_used,
+               msg->has_limits_plan ? msg->limits_plan : "-");
         fflush(stdout);
         return;
     }

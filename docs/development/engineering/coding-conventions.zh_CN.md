@@ -23,7 +23,7 @@
 
 配置项、转换命令、CMake 接入、安全 fallback 代码和缺字检查示例见 [LVGL 中文显示详细指南](lvgl-chinese-fonts.zh_CN.md)。
 
-基线在 [`sdkconfig.defaults`](../../../sdkconfig.defaults) 中启用 Montserrat 14 和 20，两者都不包含中文字形。因此，即使字符串是正确的 UTF-8，中文仍可能显示为方框或空白。串口能打印中文、电脑安装了中文字体、固件编译成功，都不能证明 LVGL 能显示这些文字。
+基线在 [`sdkconfig.defaults`](../../../sdkconfig.defaults) 中启用 Montserrat 12、14 和 20，这些都不包含中文字形。因此，即使字符串是正确的 UTF-8，中文仍可能显示为方框或空白。串口能打印中文、电脑安装了中文字体、固件编译成功，都不能证明 LVGL 能显示这些文字。
 
 ### 开发或修改中文 UI 前
 

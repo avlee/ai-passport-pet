@@ -36,6 +36,16 @@ UI_C = REPO_ROOT / "main" / "pet_ui.c"
 LAYOUT_C = REPO_ROOT / "main" / "pet_layout.c"
 LAYOUT_H = REPO_ROOT / "main" / "pet_layout.h"
 DUMPER = REPO_ROOT / "tests" / "dump_pet_strings.c"
+# 订阅徽标与站台上的能量槽小标签都走 LVGL **内建** Montserrat 12(自备字库只有 16/20
+# 两档, 而且它是中文字库, 给几个拉丁字母不值得再开一档字模)。宠物界面不再使用 14 档,
+# 所以这里只量 12。内建字库的真值在 managed_components 里。
+MONT_DIR = (REPO_ROOT / "managed_components" / "lvgl__lvgl" / "src" / "font")
+MONT_C = {12: MONT_DIR / "lv_font_montserrat_12.c"}
+
+# 订阅档位名。plus 是当前这台机器上的档位, 必须**完整**显示; 后面几个是官方存在的
+# 其它档位, 只报宽度 —— 放不下时设计就是截断(见 pet_ui.c 的 refresh_plan_locked),
+# 不是缺陷, 所以不给它们设门槛。
+PLAN_TIERS = ("plus", "pro", "team", "business", "enterprise")
 
 # 布局常量分散在三个文件里: 屏幕尺寸与舞台的上下限在 pet_layout.h, 站台坐标在
 # pet_layout.c(那边有主机测试); 顶栏/信息面板/配网页/传输页与宠物无关, 在 pet_ui.c。
@@ -69,13 +79,13 @@ def dump_strings() -> dict[str, tuple[int, str]]:
     return rows
 
 
-def load_font(name: str):
-    """从生成的字体 C 文件里读出步进表与码点映射。
+def load_font_file(path: Path):
+    """从一份 lv_font_conv 生成的字体 C 文件里读出步进表与码点映射。
 
     lv_font_conv 把 unicode_list 写成**相对 range_start 的偏移**(不是绝对码点),
     这一点很容易看错 —— 按绝对值解会得到"所有汉字都缺字形"的假结论。
     """
-    src = (REPO_ROOT / "assets" / "fonts" / f"{name}.c").read_text(encoding="utf-8")
+    src = path.read_text(encoding="utf-8")
 
     strides: list[int] = []
     for entry in re.findall(r"\{[^{}]*\.adv_w = \d+[^{}]*\}", src):
@@ -98,6 +108,20 @@ def load_font(name: str):
         cmaps.append((int(entry[0]), int(entry[1]), int(entry[2]),
                       entry[3], entry[4]))
     return strides, cmaps, tables
+
+
+def load_font(name: str):
+    """自备字库: assets/fonts/<name>.c。"""
+    return load_font_file(REPO_ROOT / "assets" / "fonts" / f"{name}.c")
+
+
+def load_builtin(size: int):
+    """LVGL 内建的 Montserrat —— 订阅徽标与能量槽小标签共用 12 档。
+
+    它对 32..126(可打印 ASCII)那一段是 FORMAT0_TINY: 没有 unicode_list,
+    字形 id 就是 glyph_id_start + 偏移, 所以 glyph_index() 不用改就能测。
+    """
+    return load_font_file(MONT_C[size])
 
 
 def glyph_index(cp: int, cmaps, tables) -> int | None:
@@ -142,6 +166,7 @@ def ui_constant(name: str) -> int:
 def main() -> int:
     strings = dump_strings()
     fonts = {px: load_font(name) for px, name in FONT_BY_PX.items()}
+    mont = {size: load_builtin(size) for size in MONT_C}
 
     status_w = ui_constant("PROV_STATUS_W")
     card_w = ui_constant("PROV_CARD_W")
@@ -189,6 +214,35 @@ def main() -> int:
         if used > box:
             failures.append((label, box, used, text))
 
+    # 订阅徽标: 内建 Montserrat 12, 右对齐到 PLAN_BADGE_RIGHT, 宽度按文字自适应但被
+    # "舞台右边缘"卡住 —— 舞台水平居中, 宠物越宽它越靠右, 留给徽标的越少。这里按
+    # **基准宠物**算可用宽度(PET_LAYOUT_STAGE_W_REF), 与真机默认那只一致。
+    badge_right = ui_constant("PLAN_BADGE_RIGHT")
+    badge_pad = ui_constant("PLAN_BADGE_PAD")
+    badge_min = ui_constant("PLAN_BADGE_MIN_W")
+    stage_x_ref = (scr_w - stage_w_ref) // 2
+    badge_avail = badge_right - (stage_x_ref + stage_w_ref)
+
+    print(f"\n订阅徽标(内建 12px 字体, 基准舞台 {stage_w_ref}px 宽 → 可用 "
+          f"{badge_avail}px, 下限 {badge_min}px):")
+    tier_width = max(len(t) for t in PLAN_TIERS)
+    for tier in PLAN_TIERS:
+        text = tier[:1].upper() + tier[1:]
+        used = measure(text, mont[12])
+        need = used + 2 * badge_pad   # 与 refresh_plan_locked() 同一式
+        if need <= badge_avail:
+            mark, verdict = "ok", "完整"
+        elif badge_avail >= badge_min:
+            mark, verdict = "截断", "按可用宽度截断(设计如此)"
+        else:
+            mark, verdict = "隐藏", "右上角没地方, 整块隐藏"
+        print(f"  [{mark:>4}] {text:<{tier_width}}  {need:>4}px / {badge_avail}px"
+              f"  {verdict}")
+        # plus 是当前档位, 必须完整显示; 更长的档位被截断是设计选择, 不设门槛。
+        # 但"连 plus 都放不下"说明要么档位名变长了, 要么舞台/徽标几何被改窄了。
+        if tier == "plus" and need > badge_avail:
+            failures.append(("订阅档位 Plus", badge_avail, need, text))
+
     if failures:
         print("\nFAIL: 以下文案会被折行(先减字或换短词, 别去调框宽):",
               file=sys.stderr)
@@ -196,7 +250,8 @@ def main() -> int:
             print(f"  {label}: {used}px > {box}px  {text}", file=sys.stderr)
         return 1
 
-    print(f"\n配网界面文案: PASS ({len(checks)} 条都在单行内)")
+    print(f"\n界面文案: PASS (配网/传输/占位 {len(checks)} 条都在单行内; "
+          f"订阅徽标在基准舞台上放得下 Plus)")
     return 0
 
 

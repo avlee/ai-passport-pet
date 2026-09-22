@@ -11,7 +11,8 @@ This is the application delivered on the `feature/codex-pet` branch. It does not
 ## What it looks like
 
 - A pet stage, drawn 1:1 from the atlas pixels with no scaling. The stage has no backdrop: the pet stands directly on the page background, with the platform and a contact shadow providing the ground line.
-- Top row: a status dot plus status text (offline / connecting / idle / working / waiting / ready / failed) on the left, battery on the right.
+- Top row: a status dot plus status text (offline / connecting / idle / working / waiting / ready / failed) on the left, battery on the right. The status text uses the 20 px title face and the battery number the 16 px body face — a deliberate size step, so "what is it doing" reads before "how much charge is left". The two are not aligned by equal line boxes (different faces can never share one); `STATUS_Y` and `BAT_TEXT_Y` instead place each face's *ink centre* on the battery graphic's centre line (y=20).
+- Under the battery, a rounded badge carrying the subscription tier (`Plus`) whenever the bridge has read one: light-green fill, border in the same green as the battery. It hides entirely while no tier is known, or on a pet whose stage is wide enough to own that corner.
 - A platform at the bottom, carrying the text Codex pushed as its front face; when there is no text it shows a placeholder for the current state. Its floor edge is pinned to the pet's feet (stage bottom row), so the pet reads as standing on it.
 - Sleep (link down): the pet is dimmed to 40%, frame timing slows to 250%, backlight drops to 45%, and `Zzz` appears in the top-right of the stage.
 - Screen power: idle for `PET_SCREEN_IDLE_MS` and the backlight goes off; a Bridge message, a key press, or the link coming back turns it on again. See [Screen power](#screen-power).
@@ -149,7 +150,7 @@ Mac → device:
 {"type":"state","state":"working","text":"refactoring the login module"}
 {"type":"text","text":"update the text only, leave the state alone"}
 {"type":"ping"}
-{"type":"limits","primary":98,"weekly":31}
+{"type":"limits","primary":98,"weekly":31,"plan":"plus"}
 {"type":"pet","id":"sophie-portrait","size":2551684,"crc32":2181165281}
 ```
 
@@ -171,7 +172,7 @@ Device → Mac:
 
 Codex has no local command to query subscription usage, but every server response carries a rate-limit snapshot, and Codex writes those snapshots into its session rollouts (`event_msg/token_count` records). The bridge reads them and forwards `{"type":"limits","primary":<0-100>,"weekly":<0-100>}` — the **used** percentage of the 5-hour window (`primary`, 300 minutes) and the weekly window (`secondary`, 10080 minutes). A window without a usable snapshot is omitted from the message; a line with no window at all is dropped by the parser.
 
-The same record also carries `plan_type` (`plus`, `pro`, …). The bridge publishes it as an extra field on the **control channel only** — `{"event":"limits",…,"plan":"plus"}` — and the menu bar renders it as a subscription badge showing `Plus`. It is deliberately not sent to the device: the two gauges have no room for it, and leaving the device protocol untouched means no firmware change. The value is passed through verbatim (stripped, length- and character-checked); capitalisation and the localised label belong to the menu bar, so a tier OpenAI adds later shows up without a code change.
+The same record also carries `plan_type` (`plus`, `pro`, …). The bridge passes it through verbatim (stripped, length- and character-checked) and publishes it on both surfaces: on the control channel as `{"event":"limits",…,"plan":"plus"}`, and in the device message as `{"type":"limits",…,"plan":"plus"}`, where the firmware draws it as a rounded badge under the battery. Capitalisation is not the bridge's job — each display surface formats the value itself, `pet_plan_label()` on the device and `codexPlanLabel` in the menu bar, so a tier OpenAI adds later shows up without a code change. The badge is hidden while no tier has been read and on a pet whose stage is wide enough that the top-right corner belongs to it (geometry in `main/pet_ui.c`); its font is ASCII-only Montserrat 12, so non-ASCII bytes are dropped rather than rendered as missing-glyph boxes.
 
 Both paths that publish `limits` — the live follow stream and the 30-second re-scan — must put the **same fields** on the event. They share a single slot in the control channel, so a thinner payload silently overwrites a richer one; that is why `send_limits()` takes a whole snapshot rather than loose numbers.
 
@@ -180,7 +181,7 @@ Staleness is handled on both sides:
 - The bridge re-scans the most recent rollouts every 30 seconds and treats an expired `resets_at` as 0% used — the window has rolled over, and any request after that would have produced a newer snapshot.
 - The device hides a window that has no value and hides both gauges while the link is offline (a stale gauge would be a lie). Values are cached, so a rebuild (demo menu, pet swap) restores them, and the bridge re-sends after a device reconnect.
 
-On screen the two windows are vertical gauges hugging the left (`5h`) and right (`7d`) screen edges, filled bottom-up by **remaining** percentage and color-graded green/yellow/red as remaining drops below 50%/20%. `tools/preview_pet_screen.py --limits 98/31` renders them without a device.
+On screen the two windows are vertical gauges hugging the left (`5h`) and right (`7d`) screen edges, filled bottom-up by **remaining** percentage. Each gauge keeps a fixed colour (5-hour red, weekly blue) rather than grading with the value — colour, label and position together are what tell the two apart. (The graded green/yellow/red behaviour belongs to the battery, not the gauges.) `tools/preview_pet_screen.py --limits 98/31` renders them without a device.
 
 Parsing is **bounded and forgiving**: a per-line limit of `PET_PROTOCOL_LINE_MAX` (512 bytes) and a text-field limit of `PET_PROTOCOL_TEXT_MAX` (192 bytes), overlong lines are dropped and resynchronised at the next newline, unknown fields are ignored, and UTF-8 is only truncated on character boundaries. The device is the TCP client and the Mac is the server, so the device never needs to accept inbound connections and does not depend on mDNS discovery.
 

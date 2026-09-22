@@ -56,9 +56,11 @@ void pet_ui_set_text(const char *utf8);
 // 电量百分比, 0..100;-1 表示读不到。
 void pet_ui_set_battery(int soc_percent);
 
-// Codex 用量限额(屏幕两侧的竖形能量槽)。两个参数都是**已用**百分比, 0..100;
-// 小于 0 表示该窗口没有快照, 对应的槽隐藏。左侧 = 5 小时窗, 右侧 = 周窗。
-void pet_ui_set_limits(int primary_used, int weekly_used);
+// Codex 用量限额(站台上两条竖形能量槽)与订阅档位(顶栏下方的徽标)。
+// 两个百分比都是**已用**, 0..100; 小于 0 表示该窗口没有快照, 对应的槽隐藏。
+// 左侧 = 5 小时窗, 右侧 = 周窗。plan 为 NULL 或空串表示还没读到档位, 徽标整个藏
+// 起来 —— 档位名原样显示(读到的 "plus" 就显示 Plus), 设备侧不做翻译。
+void pet_ui_set_limits(int primary_used, int weekly_used, const char *plan);
 
 // 信息面板要展示的连接参数。
 void pet_ui_set_settings(const pet_settings_t *settings);

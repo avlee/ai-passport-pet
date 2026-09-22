@@ -27,6 +27,7 @@
     python3 tools/preview_pet_screen.py --anim working      # 只画指定动作的屏
     python3 tools/preview_pet_screen.py --frame 3           # 画该动作的第 3 帧
     python3 tools/preview_pet_screen.py --battery 95%       # 指定顶栏电量
+    python3 tools/preview_pet_screen.py --plan pro          # 指定订阅徽标档位
     python3 tools/preview_pet_screen.py --out-dir /tmp/preview
 """
 
@@ -57,9 +58,14 @@ UI_C = REPO_ROOT / "main" / "pet_ui.c"
 STRINGS_H = REPO_ROOT / "main" / "pet_strings.h"
 FONT_C = {16: REPO_ROOT / "assets" / "fonts" / "pet_font_16.c",
           20: REPO_ROOT / "assets" / "fonts" / "pet_font_20.c"}
-# LVGL 内置 montserrat_14 的 (行高, 基线) —— sdkconfig 启用 LV_FONT_MONTSERRAT_14,
-# 设备侧能量槽小标签用它; 没有对应的生成字体文件, 度量取 LVGL 源码常量。
-M14_METRICS = (16, 11)
+# LVGL 内置 montserrat 的 (行高, 基线) —— 宠物界面只用 12 一档(订阅徽标 + 能量槽
+# 小标签各一处), 它没有对应的生成字体文件, 度量取 LVGL 源码常量
+# (managed_components/lvgl__lvgl/src/font/lv_font_montserrat_12.c):
+#   .line_height = 15, .base_line = 3
+# base_line 是"从行框底边往上量"/*Baseline measured from the bottom of the line*/;
+# 这一档曾错写成 (16, 11) —— 把 base_line 当成"从顶边量起", 文字整体被顶出框外。
+# 这类手写常量最容易跟源码脱钩, 改动前先去那份源码里核一眼。
+M12_METRICS = (15, 3)
 
 # 布局常量分散在三个文件里: 屏幕尺寸与舞台上下限在 pet_layout.h, 站台坐标在
 # pet_layout.c(那边有主机测试), 顶栏/配网页/传输页与宠物无关, 在 pet_ui.c。
@@ -384,6 +390,9 @@ def draw_top_row(board: Image.Image, draw: ImageDraw.ImageDraw, c: dict[str, int
     draw.ellipse((c["ROW_DOT_X"], c["ROW_DOT_Y"],
                   c["ROW_DOT_X"] + c["ROW_DOT_D"] - 1,
                   c["ROW_DOT_Y"] + c["ROW_DOT_D"] - 1), fill=colors[dot])
+    # 状态文字走 title 档(20 px/行高 29), 比右侧电量数字大一档是有意的: 顶栏左半边是
+    # 主角。竖直对齐靠 STATUS_Y 让**墨迹中心**与电池图形(y=20)同轴, 不靠行框等高 ——
+    # 两侧字号不同, 行框永远等不了高。改任一侧的字号都要重算 STATUS_Y/BAT_TEXT_Y。
     draw_line(draw, status, fonts[20], metrics[20], c["STATUS_X"], c["STATUS_Y"],
               colors["COL_INK"])
 
@@ -413,6 +422,63 @@ def draw_top_row(board: Image.Image, draw: ImageDraw.ImageDraw, c: dict[str, int
              c["BAT_FILL_X"] + width - 1,
              c["BAT_FILL_Y"] + c["BAT_FILL_H"] - 1),
             radius=1, fill=colors[battery_color])
+
+
+def plan_label(plan: str | None) -> str | None:
+    """订阅档位的展示名 —— main/pet_protocol.c 的 pet_plan_label() 的 Python 镜像。
+
+    规则(与菜单栏 tools/menubar/Sources/BridgeSupervisor.swift 的 codexPlanLabel
+    同一条): 去掉首尾空白, 首字母大写, 其余原样。非可打印 ASCII 丢掉 —— 徽标用的
+    是内建 Montserrat 12, 只有拉丁字形, 画不出来只会变成缺字方框。
+
+    整不出可显示的内容时返回 None, 调用方据此整块藏起徽标。真值在 C 那边(由
+    tests/test_pet_protocol.c 钉住), 这里是同一套算术的第二份实现, 别让两边跑偏。
+    """
+    if not plan:
+        return None
+    text = "".join(ch for ch in plan if 0x20 <= ord(ch) <= 0x7E).strip()
+    if not text:
+        return None
+    return text[:1].upper() + text[1:]
+
+
+def draw_plan_badge(draw: ImageDraw.ImageDraw, c: dict[str, int],
+                    colors: dict[str, tuple[int, int, int]],
+                    fonts: dict[int, object], layout: dict[str, int],
+                    plan: str | None) -> None:
+    """顶栏下方的订阅徽标。位置与宽度跟固件的 refresh_plan_locked() 逐式对应:
+    右对齐到 PLAN_BADGE_RIGHT, 宽度按文字自适应但避开舞台右边缘 —— 舞台水平居中
+    而宽度随宠物变, 越过去就会压在宠物身上。
+
+    填充取"半透明绿叠在背景色上"的**预混合**值: 徽标刻意落在舞台右侧那块空白
+    上, 底下必然是背景色, 所以预混合与真机上的 alpha 合成是同一个结果。
+    """
+    text = plan_label(plan)
+    if text is None:
+        return   # 没读到档位 / 整不出可显示的字符: 不画, 与固件把胶囊藏起来一致
+
+    avail = c["PLAN_BADGE_RIGHT"] - (layout["stage_x"] + layout["stage_w"])
+    if avail < c["PLAN_BADGE_MIN_W"]:
+        return   # 这只宠物太宽, 右上角没地方了 —— 固件同样整块藏起来
+
+    width = min(round(draw.textlength(text, font=fonts[12]))
+                + 2 * c["PLAN_BADGE_PAD"], avail)
+    x = c["PLAN_BADGE_RIGHT"] - width
+    top = c["PLAN_BADGE_Y"]
+    height = c["PLAN_BADGE_H"]
+
+    green = colors["COL_GOOD"]
+    # LV_OPA_30 = 76/255, 取 0.3 就够画图用。
+    fill = tuple(round(bg + (g - bg) * 0.3)
+                 for bg, g in zip(colors["COL_BG"], green))
+    draw.rounded_rectangle((x, top, x + width - 1, top + height - 1),
+                           radius=height // 2, fill=fill,
+                           outline=green, width=1)
+    draw_line(draw, text, fonts[12], M12_METRICS,
+              x + c["PLAN_BADGE_PAD"],
+              top + (height - M12_METRICS[0]) // 2,
+              green, align="center",
+              box_w=width - 2 * c["PLAN_BADGE_PAD"])
 
 
 def finish(board: Image.Image, key: str) -> Image.Image:
@@ -458,10 +524,10 @@ def draw_gauges(draw: ImageDraw.ImageDraw, layout: dict[str, int],
             radius=2, fill=colors[bar_colors[i]])
 
         # 小标签钉在槽底正下方: 左标签左对齐、右标签右对齐于各自的槽。
-        # 用的 montserrat_14, 度量取内置常量(见文件头 M14_METRICS)。
+        # 用的 montserrat_12, 度量取内置常量(见文件头 M12_METRICS)。
         label_x = (track_x[0] if i == 0
                    else track_x[1] + c["GAUGE_W"] - c["GAUGE_LABEL_W"])
-        draw_line(draw, labels[i], fonts[14], M14_METRICS, label_x,
+        draw_line(draw, labels[i], fonts[12], M12_METRICS, label_x,
                   track_top + track_h + c["GAUGE_LABEL_GAP"],
                   colors["COL_MUTED"])
 
@@ -479,7 +545,9 @@ class Renderer:
         self.metrics = metrics
         self.colors = {name: rgb(value) for name, value in consts.items()
                        if name.startswith("COL_")}
-        self.fonts = {size: load_font(size) for size in (14, 16, 20)}
+        # 只有 12/16/20: 12 = 内置 montserrat(徽标与能量槽标签), 16/20 = 自备中文字库。
+        # 14 档已从界面上退场, 不加载。
+        self.fonts = {size: load_font(size) for size in (12, 16, 20)}
 
     def new_board(self) -> tuple[Image.Image, ImageDraw.ImageDraw]:
         size = (self.c["PET_LAYOUT_SCR_W"], self.c["PET_LAYOUT_SCR_H"])
@@ -498,7 +566,8 @@ class Renderer:
     # ---- 宠物界面 -----------------------------------------------------
     def pet_screen(self, scene: tuple, package: dict, frame_index: int | None,
                    battery_text: str,
-                   limits: tuple[int | None, int | None] = (None, None)) -> Image.Image:
+                   limits: tuple[int | None, int | None] = (None, None),
+                   plan: str | None = None) -> Image.Image:
         key, status_key, dot, plate_key, anim, asleep = scene
         board, draw = self.new_board()
         layout = layout_for_stage(package["stage"][2], package["stage"][3], self.c)
@@ -541,6 +610,7 @@ class Renderer:
 
         draw_top_row(board, draw, self.c, self.colors, self.s[status_key], dot,
                      battery_text, self.fonts, self.metrics)
+        draw_plan_badge(draw, self.c, self.colors, self.fonts, layout, plan)
         draw_gauges(draw, layout, self.c, self.colors, self.s, self.fonts,
                     self.metrics, limits)
         self.draw_plat_text(draw, self.s[plate_key], layout)
@@ -557,7 +627,8 @@ class Renderer:
                    layout["plat_text_x"], layout["plat_text_w"],
                    layout["plat_text_y"], self.colors["COL_MUTED"])
 
-    def no_pet_screen(self, battery_text: str) -> Image.Image:
+    def no_pet_screen(self, battery_text: str,
+                      plan: str | None = None) -> Image.Image:
         """空槽: 舞台区一句占位(lv_obj_center), 站台上告诉用户去哪儿装。
 
         恒为离线状态 —— 不画能量槽, 与设备侧"掉线整组隐藏"的语义一致。"""
@@ -575,6 +646,8 @@ class Renderer:
         draw_top_row(board, draw, self.c, self.colors,
                      self.s["PET_STR_STATUS_OFFLINE"], "COL_MUTED", battery_text,
                      self.fonts, self.metrics)
+        # 空槽也画徽标: 档位是桥接报的, 与槽里有没有宠物无关。
+        draw_plan_badge(draw, self.c, self.colors, self.fonts, layout, plan)
         self.draw_plat_text(draw, self.s["PET_STR_PH_NO_PET"], layout)
         return finish(board, "nopet")
 
@@ -704,6 +777,9 @@ def main() -> int:
     parser.add_argument("--limits", default="98/31",
                         help="能量槽, 格式 <5h窗已用>/<周窗已用>, 如 98/31; "
                              "某格用 -- 表示未读到")
+    parser.add_argument("--plan", default="plus",
+                        help="订阅徽标上的档位名(如 plus / pro); "
+                             "传空串表示未读到, 徽标不画")
     parser.add_argument("--pin", default="1234", help="配网页上的配对码")
     parser.add_argument("--device", default="CodexPet-75B4",
                         help="配网页上的设备名(CodexPet-MAC 后两字节)")
@@ -763,10 +839,10 @@ def main() -> int:
             if args.anim and scene[4] != args.anim:
                 continue
             images.append((scene[0], renderer.pet_screen(
-                scene, package, args.frame, args.battery, limits)))
+                scene, package, args.frame, args.battery, limits, args.plan)))
 
     if "nopet" in want_static:
-        images.append(("nopet", renderer.no_pet_screen(args.battery)))
+        images.append(("nopet", renderer.no_pet_screen(args.battery, args.plan)))
     if "transfer" in want_static:
         if args.transfer_failed:
             images.append(("transfer-failed", renderer.transfer_screen(

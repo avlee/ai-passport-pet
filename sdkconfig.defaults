@@ -19,6 +19,10 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # --- LVGL ---
 CONFIG_LV_COLOR_DEPTH_16=y
+# 三档各有专责, 都别删: 12 给电量下方的订阅徽标与站台上的 "5h"/"7d" 小标签(都是拉丁
+# 字母的小字), 20 既做应用字库的拉丁兜底(pet_fonts.c 的 fallback, 汉字缺字形时才会
+# 用到)也给 demo 页, 14 只剩 demo 页在用 —— 宠物界面已经不含 14 档。
+CONFIG_LV_FONT_MONTSERRAT_12=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
 # LVGL 内置 malloc 池大小(KB)。它是独立静态区、不与系统堆共享,配大了会白白占用 RAM。

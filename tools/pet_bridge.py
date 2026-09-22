@@ -53,7 +53,7 @@ Codex 会把每一轮对话写成 rollout JSONL: ~/.codex/sessions/YYYY/MM/DD/ro
     limits   Codex 用量限额      primary(5 小时窗已用%), weekly(周窗已用%),
                                  plan(订阅类型 plus/pro/…, 拿不到是 null),
                                  delivered; 没读到过快照时是 null
-                                 plan 只走这条通道, **不下发设备**
+                                 primary/weekly/plan 同样发给设备(画能量槽与订阅徽标)
     pets     可选宠物列表        pets_dir, cache_dir, slot_bytes, packer, items[],
                                  busy, last
                                  packer.available 为假表示这台桥接缺 Pillow,
@@ -298,7 +298,8 @@ class DeviceLink:
         """把 Codex 用量限额推给设备。
 
         两个百分比都是"已用", 设备自己换算成剩余量去画能量槽; None 表示这个窗口
-        没读到过快照, 字段整个不下发 —— 设备侧的语义是"缺哪个就藏哪个"。
+        没读到过快照, 字段整个不下发 —— 设备侧的语义是"缺哪个就藏哪个"。plan 同理:
+        没读到就不带这个键, 设备把订阅徽标整个藏起来。
 
         收整份快照而不是两个裸数字: 这条路径同时要往控制通道发一条 limits, 而它与
         `_update_limits()` 发的那条**共用 ControlHub 里同一个槽位** —— 字段必须逐字
@@ -309,6 +310,8 @@ class DeviceLink:
             payload["primary"] = limits.primary
         if limits.weekly is not None:
             payload["weekly"] = limits.weekly
+        if limits.plan is not None:
+            payload["plan"] = limits.plan
         ok = self.send(payload)
         print(f"[limits] 5h={limits.primary}% 周={limits.weekly}%"
               f" plan={limits.plan}"
@@ -1092,9 +1095,8 @@ class CodexWatcher(threading.Thread):
 
         if self._limits is None or self._limits == self._limits_on_device:
             return
-        # send_limits 只往设备报文里放两个窗口 —— 那两块能量槽的语义就是"两个窗口
-        # 的剩余量", 订阅类型是菜单栏那一侧的信息, 固件协议因此完全不变。
-        # 副作用: 只有 plan 变化时也会重发一条内容相同的限额给设备(40 字节, 无害)。
+        # 整份快照一起推: 两个窗口画站台上的能量槽, plan 画顶栏的订阅徽标。
+        # 副作用: 只有 plan 变化时也会重发一次内容相同的窗口值(几十字节, 无害)。
         # 改成"只比两个窗口"会让 _limits_on_device 的语义分叉, 不值当。
         if self.link.send_limits(self._limits):
             self._limits_on_device = self._limits

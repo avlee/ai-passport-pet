@@ -138,6 +138,8 @@ static void test_limits_message(void)
     assert(capture.messages[0].type == PET_MSG_LIMITS);
     assert(capture.messages[0].limits_primary_used == 98);
     assert(capture.messages[0].limits_weekly_used == 31);
+    // 没带 plan 的旧行照收 —— 徽标那一侧据此把整块藏起来。
+    assert(!capture.messages[0].has_limits_plan);
 
     // 只有一个窗口: 缺的那个是 -1。
     assert(feed(&capture, &protocol, "{\"type\":\"limits\",\"primary\":100}\n") == 1);
@@ -165,6 +167,25 @@ static void test_limits_message(void)
     assert(feed(&capture, &protocol,
                 "{\"type\":\"limits\",\"primary\":1e2,\"weekly\":31}\n") == 1);
     assert(capture.messages[0].limits_primary_used == -1);
+    // 档位(plan): 桥接原样透传(不做中文映射也不做首字母大写), 解析器原样存下 ——
+    // 展示格式化落在各自显示面上(见 test_plan_label_display_name)。
+    assert(feed(&capture, &protocol,
+                "{\"type\":\"limits\",\"primary\":98,\"weekly\":31,"
+                "\"plan\":\"plus\"}\n") == 1);
+    assert(capture.messages[0].has_limits_plan);
+    assert(strcmp(capture.messages[0].limits_plan, "plus") == 0);
+
+    // 只带 plan: 换档(plus -> pro)而两个窗口恰好都没读到值, 这一行仍然有信息量,
+    // 不能让"两个窗口都缺"把换档一起丢掉。
+    assert(feed(&capture, &protocol, "{\"type\":\"limits\",\"plan\":\"pro\"}\n") == 1);
+    assert(capture.messages[0].has_limits_plan);
+    assert(strcmp(capture.messages[0].limits_plan, "pro") == 0);
+    assert(capture.messages[0].limits_primary_used == -1);
+    assert(capture.messages[0].limits_weekly_used == -1);
+
+    // 空档位值等于什么都没说: 既不算"有档位", 也撑不起一整行。
+    assert(feed(&capture, &protocol, "{\"type\":\"limits\",\"plan\":\"\"}\n") == 0);
+
     // 两个窗口都非法: 等于什么都没说, 丢弃。
     assert(feed(&capture, &protocol,
                 "{\"type\":\"limits\",\"primary\":1e2,\"weekly\":x}\n") == 0);
@@ -327,6 +348,56 @@ static void test_utf8_boundary_helper(void)
     assert(!pet_protocol_utf8_boundary(NULL, 0));
 }
 
+// 订阅档位的展示名: 首字母大写, 其余原样, 非可打印 ASCII 丢掉。大小写规则与菜单栏
+// 那一侧同一条(tools/menubar/Sources/BridgeSupervisor.swift 的 codexPlanLabel), 预览
+// 工具里是同一规则的 Python 镜像 —— 三处必须表现一致, 否则同一个档位在屏幕和菜单里
+// 会长得不一样。
+static void test_plan_label_display_name(void)
+{
+    char out[PET_PROTOCOL_PLAN_MAX];
+
+    // 线路上的原样值是小写的, 界面要的是首字母大写。
+    assert(pet_plan_label("plus", out, sizeof(out)));
+    assert(strcmp(out, "Plus") == 0);
+    assert(pet_plan_label("pro", out, sizeof(out)));
+    assert(strcmp(out, "Pro") == 0);
+
+    // 已经是大写的原样返回(幂等)。
+    assert(pet_plan_label("Plus", out, sizeof(out)));
+    assert(strcmp(out, "Plus") == 0);
+
+    // 首尾空白去掉: 桥接 strip 过一次, 这里兜住手工构造或测试直接喂进来的数据。
+    assert(pet_plan_label("  team  ", out, sizeof(out)));
+    assert(strcmp(out, "Team") == 0);
+
+    // 非字母字符原样留着 —— 档位标识不是只有字母一种形状。
+    assert(pet_plan_label("business-2", out, sizeof(out)));
+    assert(strcmp(out, "Business-2") == 0);
+
+    // 非 ASCII 直接丢: 徽标用的是内建 Montserrat 12, 只有拉丁字形, 画不出来只会
+    // 渲染成缺字方框。桥接的白名单是 Python 的 isalnum(), 对非 ASCII 放行, 所以
+    // 这条兜底不是假想。
+    assert(pet_plan_label("plus\xE2\x9C\x93", out, sizeof(out)));  // plus✓
+    assert(strcmp(out, "Plus") == 0);
+    assert(!pet_plan_label("\xE4\xB8\xAD\xE6\x96\x87", out, sizeof(out)));  // 中文
+    assert(out[0] == '\0');
+
+    // 空 / 全空白 / NULL: 都表示"没有可显示的档位", 调用方据此整块藏徽标。
+    assert(!pet_plan_label("", out, sizeof(out)));
+    assert(!pet_plan_label(" \t ", out, sizeof(out)));
+    assert(!pet_plan_label(NULL, out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    // 缓冲区不够: 截断, 但仍然 NUL 结尾(徽标那边还会按可用宽度再省略一次)。
+    char tight[4];
+    assert(pet_plan_label("enterprise", tight, sizeof(tight)));
+    assert(strcmp(tight, "Ent") == 0);
+
+    // 非法参数返回 false, 不越界写。
+    assert(!pet_plan_label("plus", NULL, sizeof(out)));
+    assert(!pet_plan_label("plus", out, 0));
+}
+
 int main(void)
 {
     test_state_message();
@@ -344,5 +415,6 @@ int main(void)
     test_long_text_truncates_on_character_boundary();
     test_escape_helper();
     test_utf8_boundary_helper();
+    test_plan_label_display_name();
     return 0;
 }

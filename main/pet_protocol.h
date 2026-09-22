@@ -7,9 +7,11 @@
 //     {"type":"state","state":"working","text":"正在重构登录模块"}
 //     {"type":"text","text":"只更新文本, 不改状态"}
 //     {"type":"ping"}
-//     {"type":"limits","primary":98,"weekly":31}
+//     {"type":"limits","primary":98,"weekly":31,"plan":"plus"}
 //       Codex 用量限额: primary = 5 小时窗、weekly = 周窗的**已用**百分比(0..100)。
 //       某个窗口没有可用快照时对应的字段整个不下发 —— 设备把缺的窗口藏起来。
+//       plan 是订阅档位(plus/pro/…), 由桥接从同一条限额快照里取 plan_type 原样透传,
+//       顶栏在电量下面显示成一个徽标。档位名是 OpenAI 的标识符, 设备侧不做翻译。
 //     {"type":"pet","id":"sophie-portrait","size":1234567,"crc32":3735928559}
 //       宣告"接下来 size 个字节就是这只宠物包"。这一行之后**不再是文本**,
 //       而是紧跟 size 个裸字节; 收满之后链路自动回到行模式。
@@ -37,6 +39,9 @@
 #define PET_PROTOCOL_LINE_MAX 512
 // 文本字段最大字节数(含结尾 NUL)。
 #define PET_PROTOCOL_TEXT_MAX 192
+// 订阅档位最大字节数(含结尾 NUL)。桥接侧已把 plan 限长到 LIMITS_PLAN_MAX_LEN
+// (24 个字符)并做过字符白名单, 这里只留余量兜底。
+#define PET_PROTOCOL_PLAN_MAX 32
 
 typedef enum {
     PET_MSG_NONE = 0,
@@ -58,6 +63,10 @@ typedef struct {
     // 仅 PET_MSG_LIMITS: 各窗口的已用百分比, 0..100; -1 = 该窗口未提供。
     int8_t            limits_primary_used;
     int8_t            limits_weekly_used;
+    // 仅 PET_MSG_LIMITS: 订阅档位(如 "plus")。has_limits_plan 为假时该字段无意义,
+    // 界面据此把徽标整个藏起来 —— 与"缺哪个窗口藏哪个"同样的处理。
+    bool              has_limits_plan;
+    char              limits_plan[PET_PROTOCOL_PLAN_MAX];
     // 仅 PET_MSG_PET: 包的字节数与整包 CRC32, 以及 id(放在 text 里, 最长 31 字节)。
     uint32_t          pet_size;
     uint32_t          pet_crc32;
@@ -87,3 +96,17 @@ bool pet_protocol_escape(const char *input, char *output, size_t output_size);
 
 // 判断字节是否为 UTF-8 序列的起始字节(用于外部截断前自检)。
 bool pet_protocol_utf8_boundary(const char *text, size_t offset);
+
+// 把线路上的订阅档位(如 "plus")整成界面上的展示名(如 "Plus")。
+//
+// 大小写规则与菜单栏那一侧**同一条**(见 tools/menubar/Sources/BridgeSupervisor.swift
+// 的 codexPlanLabel): 去掉首尾空白, 首字母大写, 其余原样。桥接只做限长与字符白名单、
+// 原样透传, 展示格式化落在各自显示面上 —— 设备这一份由 tests/test_pet_protocol.c 钉住,
+// 预览工具(tools/preview_pet_screen.py)是同一规则的 Python 镜像。
+//
+// 另外丢掉非可打印 ASCII 字节: 徽标用的是内建 Montserrat 12, 字库只有拉丁字形, 画不
+// 出来的字符只会渲染成缺字方框。桥接的白名单用的是 Python 的 isalnum(), 对非 ASCII
+// 是放行的, 所以这条兜底不是假想。
+//
+// 返回 true 表示产出了非空展示名(写进 output); 返回 false 时调用方应把徽标整个藏起来。
+bool pet_plan_label(const char *plan, char *output, size_t output_size);
