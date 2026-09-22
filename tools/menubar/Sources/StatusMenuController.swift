@@ -17,6 +17,7 @@ final class StatusMenuController: NSObject {
     private let deviceItem = NSMenuItem()
     private let batteryItem = NSMenuItem()
     private let codexItem = NSMenuItem()
+    private let planItem = NSMenuItem()
     private let bubbleItem = NSMenuItem()
     private let sessionItem = NSMenuItem()
     private let errorItem = NSMenuItem()
@@ -62,11 +63,12 @@ final class StatusMenuController: NSObject {
     private func buildMenu() {
         menu.autoenablesItems = false
 
-        for item in [bridgeItem, deviceItem, batteryItem, codexItem,
+        for item in [bridgeItem, deviceItem, batteryItem, codexItem, planItem,
                      bubbleItem, sessionItem, errorItem] {
             item.isEnabled = false
         }
         batteryItem.isHidden = true
+        planItem.isHidden = true
         bubbleItem.isHidden = true
         sessionItem.isHidden = true
         errorItem.isHidden = true
@@ -75,6 +77,7 @@ final class StatusMenuController: NSObject {
         menu.addItem(deviceItem)
         menu.addItem(batteryItem)
         menu.addItem(codexItem)
+        menu.addItem(planItem)
         menu.addItem(bubbleItem)
         menu.addItem(sessionItem)
         menu.addItem(errorItem)
@@ -190,6 +193,15 @@ final class StatusMenuController: NSObject {
             codex += "（\(snapshot.stateSource == "manual" ? "手工" : "日志")）"
         }
         codexItem.title = codex
+
+        // 订阅类型只有 Codex 报过才有(桥接从限额快照里取 plan_type), 读不到就把这一行
+        // 藏掉 —— 与电量那一行同样的处理, 而不是显示一个猜出来的档位。
+        if let plan = snapshot.codexPlanLabel {
+            planItem.title = "订阅：\(plan)"
+            planItem.isHidden = false
+        } else {
+            planItem.isHidden = true
+        }
 
         bubbleItem.title = "气泡：\(snapshot.bubbleText)"
         bubbleItem.isHidden = snapshot.bubbleText.isEmpty
@@ -449,6 +461,7 @@ final class StatusMenuController: NSObject {
             "控制通道已连: \(snapshot.controlConnected)",
             "设备: \(snapshot.deviceConnected ? snapshot.devicePeer : "未连接")",
             "Codex 状态: \(snapshot.codexState) (\(snapshot.stateSource))",
+            "订阅: \(snapshot.codexPlanLabel ?? "-")",
             "气泡: \(snapshot.bubbleText)",
             "跟随会话: \(snapshot.sessionName.isEmpty ? "-" : snapshot.sessionName)",
             "固件: \(snapshot.firmware.isEmpty ? "-" : snapshot.firmware)",

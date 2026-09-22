@@ -171,6 +171,10 @@ Device → Mac:
 
 Codex has no local command to query subscription usage, but every server response carries a rate-limit snapshot, and Codex writes those snapshots into its session rollouts (`event_msg/token_count` records). The bridge reads them and forwards `{"type":"limits","primary":<0-100>,"weekly":<0-100>}` — the **used** percentage of the 5-hour window (`primary`, 300 minutes) and the weekly window (`secondary`, 10080 minutes). A window without a usable snapshot is omitted from the message; a line with no window at all is dropped by the parser.
 
+The same record also carries `plan_type` (`plus`, `pro`, …). The bridge publishes it as an extra field on the **control channel only** — `{"event":"limits",…,"plan":"plus"}` — and the menu bar renders it as a subscription badge showing `Plus`. It is deliberately not sent to the device: the two gauges have no room for it, and leaving the device protocol untouched means no firmware change. The value is passed through verbatim (stripped, length- and character-checked); capitalisation and the localised label belong to the menu bar, so a tier OpenAI adds later shows up without a code change.
+
+Both paths that publish `limits` — the live follow stream and the 30-second re-scan — must put the **same fields** on the event. They share a single slot in the control channel, so a thinner payload silently overwrites a richer one; that is why `send_limits()` takes a whole snapshot rather than loose numbers.
+
 Staleness is handled on both sides:
 
 - The bridge re-scans the most recent rollouts every 30 seconds and treats an expired `resets_at` as 0% used — the window has rolled over, and any request after that would have produced a newer snapshot.

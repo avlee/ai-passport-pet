@@ -75,6 +75,8 @@ struct BridgeSnapshot {
     var petPackage = ""
     var batterySoc: Int?
     var codexState = "idle"
+    /// Codex 订阅类型(plus/pro/…), 原样来自桥接的 limits 事件; 空串表示还没读到。
+    var codexPlan = ""
     var bubbleText = ""
     var stateSource = ""
     var sessionName = ""
@@ -115,6 +117,16 @@ struct BridgeSnapshot {
         case "idle": return "空闲"
         default: return codexState
         }
+    }
+
+    /// 订阅徽章的说法。没读到就返回 nil(菜单里那一行直接藏起来)。
+    ///
+    /// 只做首字母大写: 值本身是 OpenAI 的档位标识(plus/pro/…), 档位随时会增加 ——
+    /// 在这边维护一张中文映射表, 只会多出一个要跟着官方改的地方。
+    var codexPlanLabel: String? {
+        let name = codexPlan.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+        return name.prefix(1).uppercased() + name.dropFirst()
     }
 }
 
@@ -348,6 +360,14 @@ final class BridgeSupervisor {
                 // soc 为 null 表示设备读不到电量; JSONSerialization 给的也是 NSNull,
                 // 转 Int 失败, 正好落到 nil。
                 snapshot.batterySoc = event["soc"] as? Int
+
+            case "limits":
+                // Codex 限额快照。菜单栏目前只用到订阅类型 —— primary/weekly
+                // (两个窗口的已用%) 在同一条事件里, 但那是设备能量槽的输入,
+                // 菜单栏还没有要显示它们的地方。
+                // plan 为 null 时 JSONSerialization 给的是 NSNull, 转 String 失败,
+                // 正好落回空串 → 菜单里那一行藏起来。
+                snapshot.codexPlan = (event["plan"] as? String) ?? ""
 
             case "session":
                 snapshot.sessionName = (event["name"] as? String) ?? ""
